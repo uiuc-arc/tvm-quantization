@@ -73,6 +73,13 @@ namespace runtime {
 void CleanDir(const std::string& dirname);
 
 /*!
+ * \brief ListDir get the list of files in a directory
+ * \param dirname The root directory name
+ * \return vector Files in directory.
+ */
+std::vector<std::string> ListDir(const std::string& dirname);
+
+/*!
  * \brief buld a shared library if necessary
  *
  *        This function will automatically call
@@ -123,6 +130,15 @@ RPCEnv::RPCEnv(const std::string& wd) {
     *rv = this->GetPath(args[0]);
   });
 
+  TVM_REGISTER_GLOBAL("tvm.rpc.server.listdir").set_body([this](TVMArgs args, TVMRetValue* rv) {
+    std::string dir = this->GetPath(args[0]);
+    std::ostringstream os;
+    for (auto d : ListDir(dir)) {
+      os << d << ",";
+    }
+    *rv = os.str();
+  });
+
   TVM_REGISTER_GLOBAL("tvm.rpc.server.load_module").set_body([this](TVMArgs args, TVMRetValue* rv) {
     std::string file_name = this->GetPath(args[0]);
     file_name = BuildSharedLibrary(file_name);
@@ -157,9 +173,9 @@ RPCEnv::RPCEnv(const std::string& wd) {
  * \return The full path of file.
  */
 std::string RPCEnv::GetPath(const std::string& file_name) const {
-  // we assume file_name has "/" means file_name is the exact path
+  // we assume file_name starts with "/" means file_name is the exact path
   // and does not create /.rpc/
-  return file_name.find('/') != std::string::npos ? file_name : base_ + "/" + file_name;
+  return !file_name.empty() && file_name[0] == '/' ? file_name : base_ + "/" + file_name;
 }
 /*!
  * \brief Remove The RPC Environment cleanup function

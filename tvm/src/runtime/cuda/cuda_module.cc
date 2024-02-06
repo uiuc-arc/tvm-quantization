@@ -65,9 +65,14 @@ class CUDAModuleNode : public runtime::ModuleNode {
 
   const char* type_key() const final { return "cuda"; }
 
-  PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self) final;
+  /*! \brief Get the property of the runtime module .*/
+  int GetPropertyMask() const final {
+    return ModulePropertyMask::kBinarySerializable | ModulePropertyMask::kRunnable;
+  }
 
-  void SaveToFile(const std::string& file_name, const std::string& format) final {
+  PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self) final;
+
+  void SaveToFile(const String& file_name, const String& format) final {
     std::string fmt = GetFileFormat(file_name, format);
     std::string meta_file = GetMetaFilePath(file_name);
     if (fmt == "cu") {
@@ -87,7 +92,7 @@ class CUDAModuleNode : public runtime::ModuleNode {
     stream->Write(data_);
   }
 
-  std::string GetSource(const std::string& format) final {
+  String GetSource(const String& format) final {
     if (format == fmt_) return data_;
     if (cuda_source_.length() != 0) {
       return cuda_source_;
@@ -164,11 +169,22 @@ class CUDAWrappedFunc {
   void operator()(TVMArgs args, TVMRetValue* rv, void** void_args) const {
     int device_id;
     CUDA_CALL(cudaGetDevice(&device_id));
+    ThreadWorkLoad wl = launch_param_config_.Extract(args);
+
     if (fcache_[device_id] == nullptr) {
       fcache_[device_id] = m_->GetFunc(device_id, func_name_);
+      if (wl.dyn_shmem_size >= (48 << 10)) {
+        // Assumption: dyn_shmem_size doesn't change across different invocations of
+        // fcache_[device_id]
+        CUresult result = cuFuncSetAttribute(
+            fcache_[device_id], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, wl.dyn_shmem_size);
+        if (result != CUDA_SUCCESS) {
+          LOG(FATAL) << "Failed to set the allowed dynamic shared memory size to "
+                     << wl.dyn_shmem_size;
+        }
+      }
     }
     CUstream strm = static_cast<CUstream>(CUDAThreadEntry::ThreadLocal()->stream);
-    ThreadWorkLoad wl = launch_param_config_.Extract(args);
     CUresult result = cuLaunchKernel(fcache_[device_id], wl.grid_dim(0), wl.grid_dim(1),
                                      wl.grid_dim(2), wl.block_dim(0), wl.block_dim(1),
                                      wl.block_dim(2), wl.dyn_shmem_size, strm, void_args, nullptr);
@@ -230,8 +246,7 @@ class CUDAPrepGlobalBarrier {
   mutable std::array<CUdeviceptr, kMaxNumGPUs> pcache_;
 };
 
-PackedFunc CUDAModuleNode::GetFunction(const std::string& name,
-                                       const ObjectPtr<Object>& sptr_to_self) {
+PackedFunc CUDAModuleNode::GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self) {
   ICHECK_EQ(sptr_to_self.get(), this);
   ICHECK_NE(name, symbol::tvm_module_main) << "Device function do not have main";
   if (name == symbol::tvm_prepare_global_barrier) {
@@ -253,7 +268,7 @@ Module CUDAModuleCreate(std::string data, std::string fmt,
 }
 
 // Load module from module.
-Module CUDAModuleLoadFile(const std::string& file_name, const std::string& format) {
+Module CUDAModuleLoadFile(const std::string& file_name, const String& format) {
   std::string data;
   std::unordered_map<std::string, FunctionInfo> fmap;
   std::string fmt = GetFileFormat(file_name, format);

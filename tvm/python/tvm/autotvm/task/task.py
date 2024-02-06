@@ -70,8 +70,8 @@ def serialize_args(args):
         if x is None:
             return None
         raise RuntimeError(
-            'Do not support type "%s" in argument. Consider to use'
-            "primitive types or tvm.tir.Var only" % type(x)
+            f'Do not support type "{type(x)}" in argument. Consider to use'
+            f"primitive types or tvm.tir.Var only"
         )
 
     ret = []
@@ -177,9 +177,7 @@ class Task(object):
         # and restore the function by name when unpickling it.
         import cloudpickle  # pylint: disable=import-outside-toplevel
 
-        self.target, self.target_host = Target.check_and_update_host_consist(
-            self.target, self.target_host
-        )
+        self.target, self.target_host = Target.canon_target_and_host(self.target, self.target_host)
         return {
             "name": self.name,
             "args": self.args,
@@ -200,7 +198,7 @@ class Task(object):
         self.config_space = state["config_space"]
         self.func = cloudpickle.loads(state["func"])
         self.flop = state["flop"]
-        self.target, self.target_host = Target.check_and_update_host_consist(
+        self.target, self.target_host = Target.canon_target_and_host(
             state["target"], state["target_host"]
         )
 
@@ -306,7 +304,7 @@ def _register_task_compute(name, func=None):
             TASK_TABLE[name] = TaskTemplate()
         tmpl = TASK_TABLE[name]
         if tmpl.fcompute is not None:
-            raise ValueError("Compute is already registered in autoTVM task %s" % name)
+            raise ValueError(f"Compute is already registered in autoTVM task {name}")
         tmpl.fcompute = f
         return f
 
@@ -338,7 +336,7 @@ def _register_task_schedule(name, func=None):
             TASK_TABLE[name] = TaskTemplate()
         tmpl = TASK_TABLE[name]
         if tmpl.fschedule is not None:
-            raise ValueError("Schedule is already registered in autoTVM task %s" % name)
+            raise ValueError(f"Schedule is already registered in autoTVM task {name}")
         tmpl.fschedule = f
         return f
 
@@ -370,7 +368,7 @@ def _register_customized_task(name, func=None):
             TASK_TABLE[name] = TaskTemplate()
         tmpl = TASK_TABLE[name]
         if tmpl.fcustomized is not None:
-            raise ValueError("Customized func is already registered in autoTVM task %s" % name)
+            raise ValueError(f"Customized func is already registered in autoTVM task {name}")
         tmpl.fcustomized = f
         return f
 
@@ -471,10 +469,7 @@ def create(task_name, args, target, target_host=None):
     args = serialize_args(args)
     ret = Task(task_name, args)
 
-    if isinstance(target, str):
-        target = Target(target)
-
-    target, target_host = Target.check_and_update_host_consist(target, target_host)
+    target, target_host = Target.canon_target_and_host(target, target_host)
 
     # init config space
     ret.config_space = ConfigSpace()

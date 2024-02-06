@@ -22,11 +22,10 @@
  * \brief Used by TVM Script parser to expand incomplete TIR input
  */
 
+#include "./script_complete.h"
+
 #include <tvm/arith/int_set.h>
-#include <tvm/runtime/registry.h>
 #include <tvm/tir/analysis.h>
-#include <tvm/tir/stmt.h>
-#include <tvm/tir/stmt_functor.h>
 
 #include <utility>
 
@@ -37,13 +36,10 @@ namespace tir {
 class ScriptCompleter : public StmtMutator {
  public:
   explicit ScriptCompleter(Map<Var, Buffer>* buffer_var_map) : buffer_var_map_(buffer_var_map) {}
-  /*! \brief Whether the stmt contains at least one block. */
-  bool contains_block = false;
 
  private:
   Map<Var, Buffer>* buffer_var_map_;
-  Stmt VisitStmt_(const BlockRealizeNode* op) override {
-    contains_block = true;
+  Stmt VisitStmt_(const BlockRealizeNode* op) final {
     for (const PrimExpr& value : op->iter_values) {
       CHECK(value.dtype().is_int())
           << "BlockRealize iter_value expected a IntImm, but got " << value.dtype();
@@ -51,7 +47,7 @@ class ScriptCompleter : public StmtMutator {
     return StmtMutator::VisitStmt_(op);
   }
 
-  Stmt VisitStmt_(const BlockNode* op) override {
+  Stmt VisitStmt_(const BlockNode* op) final {
     // Buffers allocated in the block can be accessed by its body.
     for (const auto& alloc_buffer : op->alloc_buffers) {
       buffer_var_map_->Set(alloc_buffer->data, alloc_buffer);
@@ -60,7 +56,12 @@ class ScriptCompleter : public StmtMutator {
       const Buffer& target_buffer = match_buffer->buffer;
       buffer_var_map_->Set(target_buffer->data, target_buffer);
     }
+
+    bool is_root_block = this->is_root_block_;
+    this->is_root_block_ = false;
     Block block = Downcast<Block>(StmtMutator::VisitStmt_(op));
+    this->is_root_block_ = is_root_block;
+
     // Remove buffers allocated inside block to detect its access region
     for (const auto& alloc_buffer : op->alloc_buffers) {
       buffer_var_map_->erase(alloc_buffer->data);
@@ -86,8 +87,10 @@ class ScriptCompleter : public StmtMutator {
           << "ValueError: Can not auto detect buffer access region from tir.Load, tir.Store or "
              "direct access by buffer data. Please annotation the access region manually";
       auto n = CopyOnWrite(block.operator->());
-      if (mask & 1) n->reads = reads;
-      if (mask & 2) n->writes = writes;
+      if (!is_root_block) {
+        if (mask & 1) n->reads = reads;
+        if (mask & 2) n->writes = writes;
+      }
       n->annotations = op->annotations;
       n->annotations.erase(attr::script_parsing_detect_access);
       return Block(n);
@@ -95,6 +98,8 @@ class ScriptCompleter : public StmtMutator {
       return std::move(block);
     }
   }
+
+  bool is_root_block_ = true;
 };
 
 PrimFunc ScriptComplete(PrimFunc func, const Array<Buffer>& root_allocates) {
@@ -106,16 +111,35 @@ PrimFunc ScriptComplete(PrimFunc func, const Array<Buffer>& root_allocates) {
   for (const auto& alloc : root_allocates) {
     buffer_var_map.Set(alloc->data, alloc);
   }
-  bool contain_root = root_allocates.empty() && func->body->IsInstance<BlockRealizeNode>() &&
-                      Downcast<BlockRealize>(func->body)->block->iter_vars.empty();
-  ScriptCompleter script_completer(&buffer_var_map);
-  // generate surrounding loops automatically
-  Stmt res = script_completer(func->body);
-  // generate root block automatically
-  if ((script_completer.contains_block || root_allocates.size()) && !contain_root) {
-    res = Block({}, {}, {}, "root", res, NullOpt, root_allocates);
-    res = BlockRealize({}, Bool(true), Downcast<Block>(res));
+
+  Stmt res = func->body;
+
+  // Generate root block automatically.  This is done before
+  // ScriptCompleter, in order to fill the root block's T.reads() and
+  // T.writes() annotations, as if it had been explicitly written.
+  bool should_insert_root = [&]() -> bool {
+    if (root_allocates.size()) {
+      return true;
+    }
+    auto* block_realize = func->body.as<BlockRealizeNode>();
+    if (block_realize && block_realize->block->iter_vars.size()) {
+      return true;
+    }
+    if (!block_realize && ContainsNode<BlockRealizeNode>(func->body)) {
+      return true;
+    }
+    return false;
+  }();
+
+  if (should_insert_root) {
+    Block root_block({}, {}, {}, "root", std::move(res), NullOpt, root_allocates);
+    res = BlockRealize({}, Bool(true), std::move(root_block));
   }
+
+  // generate surrounding loops automatically
+  ScriptCompleter script_completer(&buffer_var_map);
+  res = script_completer(std::move(res));
+
   if (func->body.same_as(res)) {
     return func;
   } else {

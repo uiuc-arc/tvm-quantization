@@ -55,8 +55,14 @@ void MetalWorkspace::GetAttr(Device dev, DeviceAttrKind kind, TVMRetValue* rv) {
         break;
       }
       case kWarpSize: {
-        // Set warp size to be 1 for safty reason.
+#if defined(__x86_64__)
         *rv = 1;
+#elif defined(__aarch64__)
+        *rv = 32;
+#else
+        LOG(WARNING) << "The CPU architecture is neither x86 nor aarch64. Fallback to warp size 1.";
+        *rv = 1;
+#endif
         break;
       }
       case kMaxSharedMemoryPerBlock:
@@ -80,6 +86,8 @@ void MetalWorkspace::GetAttr(Device dev, DeviceAttrKind kind, TVMRetValue* rv) {
       case kApiVersion:
         return;
       case kDriverVersion:
+        return;
+      case kL2CacheSizeBytes:
         return;
     }
   };
@@ -162,7 +170,7 @@ void MetalWorkspace::Init() {
   for (size_t i = 0; i < devs.count; ++i) {
     id<MTLDevice> d = [devs objectAtIndex:i];
     devices.push_back(d);
-    LOG(INFO) << "Intializing Metal device " << i << ", name=" << [d.name UTF8String];
+    DLOG(INFO) << "Intializing Metal device " << i << ", name=" << [d.name UTF8String];
     warp_size.push_back(GetWarpSize(d));
   }
 #endif
@@ -196,6 +204,10 @@ void* MetalWorkspace::AllocDataSpace(Device device, size_t nbytes, size_t alignm
 
 void MetalWorkspace::FreeDataSpace(Device dev, void* ptr) {
   AUTORELEASEPOOL {
+    // need to make sure buffer is not in use in command buffer
+    // before set the purgeable state to empty
+    // otherwise can cause issues sometimes
+    this->StreamSync(dev, nullptr);
     // MTLBuffer PurgeableState should be set to empty before manual
     // release in order to prevent memory leak
     [(id<MTLBuffer>)ptr setPurgeableState:MTLPurgeableStateEmpty];
@@ -336,6 +348,10 @@ id<MTLBuffer> MetalThreadEntry::GetTempBuffer(Device dev, size_t size) {
   if (temp_buffer_[dev.device_id] == nil || temp_buffer_[dev.device_id].length < size) {
     id<MTLDevice> mtl_dev = MetalWorkspace::Global()->GetDevice(dev);
     if (temp_buffer_[dev.device_id] != nil) {
+      // need to make sure buffer is not in use in command buffer
+      // before set the purgeable state to empty
+      // otherwise can cause issues sometimes
+      MetalWorkspace::Global()->StreamSync(dev, nullptr);
       [temp_buffer_[dev.device_id] setPurgeableState:MTLPurgeableStateEmpty];
       [temp_buffer_[dev.device_id] release];
     }

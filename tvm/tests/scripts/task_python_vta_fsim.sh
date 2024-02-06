@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,8 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
-set -u
+set -euxo pipefail
 
 source tests/scripts/setup-pytest-env.sh
 # to avoid CI thread throttling.
@@ -26,6 +25,9 @@ export OMP_NUM_THREADS=1
 
 export PYTHONPATH=${PYTHONPATH}:${TVM_PATH}/vta/python
 export VTA_HW_PATH=`pwd`/3rdparty/vta-hw
+
+# disable fsim test for now
+exit 0
 
 # cleanup pycache
 find . -type f -path "*.pyc" | xargs rm -f

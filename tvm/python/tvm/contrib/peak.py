@@ -87,7 +87,7 @@ def measure_bandwidth_sum(
     GBPS: float
          gigabyte per second
     """
-    target, target_host = Target.check_and_update_host_consist(target, target_host)
+    target, target_host = Target.canon_target_and_host(target, target_host)
 
     n, m = total_item, item_per_thread
     n //= lanes
@@ -154,7 +154,7 @@ def measure_bandwidth_all_types(
     result: list
         a list of (type_name, GBPS) pairs
     """
-    target, target_host = Target.check_and_update_host_consist(target, target_host)
+    target, target_host = Target.canon_target_and_host(target, target_host)
     max_threads = target.max_num_threads
 
     result = []
@@ -179,7 +179,7 @@ def measure_bandwidth_all_types(
                     )
                     max_speed = max(max_speed, speed)
                 type_name = base_type + str(bits)
-                result.append(["%sx%d" % (type_name, lanes), max_speed])
+                result.append([f"{type_name}x{lanes}", max_speed])
                 if verbose:
                     logging.info("\t%-10s %.2f GBPS", result[-1][0], result[-1][1])
     return result
@@ -225,7 +225,7 @@ def measure_compute_mad(
     GOPS: float
          giga operation per second
     """
-    target, target_host = Target.check_and_update_host_consist(target, target_host)
+    target, target_host = Target.canon_target_and_host(target, target_host)
 
     n = total_item
 
@@ -318,7 +318,7 @@ def measure_compute_all_types(
     result: list
         a list of (type_name, GFLOPS/GIOPS) pairs
     """
-    target, target_host = Target.check_and_update_host_consist(target, target_host)
+    target, target_host = Target.canon_target_and_host(target, target_host)
 
     result = []
     for base_type in ["float", "int"]:
@@ -343,7 +343,7 @@ def measure_compute_all_types(
                     )
                     max_speed = max(max_speed, speed)
                 type_name = base_type + str(bits)
-                result.append(["%sx%d" % (type_name, lanes), max_speed])
+                result.append([f"{type_name}x{lanes}", max_speed])
 
                 unit = "GFLOPS" if base_type == "float" else "GIOPS"
 
@@ -364,7 +364,7 @@ def measure_peak_all(target, target_host, host, port):
     port: int
     """
 
-    target, target_host = Target.check_and_update_host_consist(target, target_host)
+    target, target_host = Target.canon_target_and_host(target, target_host)
     remote = rpc.connect(host, port)
     n_times = 20
 

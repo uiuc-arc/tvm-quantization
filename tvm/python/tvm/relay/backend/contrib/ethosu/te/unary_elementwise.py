@@ -21,6 +21,7 @@ import numpy as np
 from tvm import te
 from tvm.contrib.ethosu.cascader import TESubgraph, EthosuPart, Propagator, register_matcher
 from .dma import dma_ofm_compute, dma_ifm_compute
+from .common import get_layout_transform_matrices
 
 
 def unary_elementwise_compute(
@@ -93,7 +94,8 @@ def unary_elementwise_compute(
     assert ofm_layout in {"NHWC", "NHCWB16"}
 
     # Changing the ifm and ofm scale to conform with that expected by Vela API
-    ofm_scale = ifm_scale / ofm_scale
+    if ofm_scale != 0:
+        ofm_scale = ifm_scale / ofm_scale
     ifm_scale = 1.0
 
     # Compute operation for the IFM DMA pipeline
@@ -129,21 +131,8 @@ def unary_elementwise_compute(
         attrs=unary_elementwise_attrs,
     )
 
-    nhwc_to_nhcwb16 = [
-        [1, 0, 0, 0, 0],
-        [0, 1, 0, 0, 0],
-        [0, 0, 0, 1 / 16, 0],
-        [0, 0, 1, 0, 0],
-        [0, 0, 0, 0, 16],
-        [0, 0, 0, 0, 1],
-    ]
-    nhcwb16_to_nhwc = [
-        [1, 0, 0, 0, 0, 0],
-        [0, 1, 0, 0, 0, 0],
-        [0, 0, 0, 1, 0, 0],
-        [0, 0, 16, 0, 1, -16],
-        [0, 0, 0, 0, 0, 1],
-    ]
+    nhwc_to_nhcwb16, nhcwb16_to_nhwc = get_layout_transform_matrices(int(ofm_channels))
+
     ifm_matrix = [
         [1, 0, 0, 0, 0],
         [0, 1, 0, 0, 0],

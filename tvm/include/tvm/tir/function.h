@@ -88,6 +88,14 @@ class PrimFuncNode : public BaseFuncNode {
    *  While we could have express parameter unpacking and constraint using
    *  normal statements, making buffer_map as first class citizen of PrimFunc
    *  will make program analysis much easier.
+   *
+   *  Prior to buffer flattening, which is performed either in
+   *  StorageFlatten for TE-based schedules or in FlattenBuffer for
+   *  TIR-based schedules, these buffer objects are used directly in
+   *  the body of the function.  After buffer flattening, these buffer
+   *  objects remain unflattened for use in argument validation, but
+   *  all usage in the body of the function is done through a
+   *  flattened alias of the buffer.
    */
   Map<tir::Var, Buffer> buffer_map;
 
@@ -124,6 +132,8 @@ class PrimFuncNode : public BaseFuncNode {
    */
   TVM_DLL FuncType func_type_annotation() const;
 
+  TVM_OBJECT_ENABLE_SCRIPT_PRINTER();
+
   static constexpr const char* _type_key = "tir.PrimFunc";
   TVM_DECLARE_FINAL_OBJECT_INFO(PrimFuncNode, BaseFuncNode);
 };
@@ -136,11 +146,20 @@ class PrimFunc : public BaseFunc {
  public:
   /*!
    * \brief Constructor
+   *
    * \param params The parameters of the function.
+   *
    * \param body The body of the function.
+   *
    * \param ret_type The return type of the function.
+   *
    * \param buffer_map The buffer map for parameter buffer unpacking.
+   * This contains buffer objects as they appear in the body of the
+   * PrimFunc.  (e.g. a buffer of shape ``[1024]`` originally
+   * generated as a tensor of shape ``[32, 32]``)
+   *
    * \param attrs Additional function attributes.
+   *
    * \param span The location of this object in the source code.
    */
   TVM_DLL PrimFunc(Array<tir::Var> params, Stmt body, Type ret_type = VoidType(),
@@ -149,42 +168,6 @@ class PrimFunc : public BaseFunc {
 
   TVM_DEFINE_OBJECT_REF_METHODS(PrimFunc, BaseFunc, PrimFuncNode);
   TVM_DEFINE_OBJECT_REF_COW_METHOD(PrimFuncNode);
-};
-
-/*!
- * \brief Describes one parameter that should be linked into the generated module.
- *
- * When parameters are to be linked in with generated code (i.e. on target_host-compatible
- * backends), Relay attaches instances of this object to a global TIR function. Code-generators
- * use the information contained in this node to include the parameter data in the generated
- * module.
- */
-class LinkedParamNode : public Object {
- public:
-  /*! \brief Unique numeric identifier used by runtimes to lookup this parameter. */
-  int64_t id;
-
-  /*! \brief Parameter data which should get linked into the final module. */
-  ::tvm::runtime::NDArray param;
-
-  void VisitAttrs(tvm::AttrVisitor* v) {
-    v->Visit("id", &id);
-    v->Visit("param", &param);
-  }
-
-  static constexpr const char* _type_key = "tir.LinkedParam";
-  TVM_DECLARE_FINAL_OBJECT_INFO(LinkedParamNode, Object);
-};
-
-/*!
- * \brief Managed reference to LinkedParamNode.
- */
-class LinkedParam : public ObjectRef {
- public:
-  TVM_DLL LinkedParam(int64_t id, ::tvm::runtime::NDArray param);
-
-  TVM_DEFINE_OBJECT_REF_METHODS(LinkedParam, ObjectRef, LinkedParamNode);
-  TVM_DEFINE_OBJECT_REF_COW_METHOD(LinkedParamNode);
 };
 
 /*!
@@ -223,18 +206,22 @@ class TensorIntrin : public ObjectRef {
    * up with its name.
    * \param name The name of the TensorIntrin to register
    * \param intrin The TensorIntrin to register.
+   * \param override Whether override existing intrinsic.
    * \throws This method throws an exception if the TensorIntrin with the specified name already
    *         exists.
    */
-  TVM_DLL static void Register(String name, TensorIntrin intrin);
+  TVM_DLL static void Register(String name, TensorIntrin intrin, bool override = false);
 
   /*!
    * \brief Look up TensorIntrin by name. Raises an exception if not found.
    * \param name The name of the TensorIntrin.
+   * \param allow_missing Whether to allow missing tensor intrin. If false, an exception is raised
+   *    if the tensor intrin is not found.
    * \return The TensorIntrin with the specified name.
-   * \throws This method throws an exception if the TensorIntrin does not exist.
+   * \throws This method throws an exception if the TensorIntrin does not exist and allow_missing is
+   * false.
    */
-  TVM_DLL static TensorIntrin Get(String name);
+  TVM_DLL static Optional<TensorIntrin> Get(String name, bool allow_missing = false);
 
   TVM_DEFINE_OBJECT_REF_METHODS(TensorIntrin, ObjectRef, TensorIntrinNode)
 };
@@ -246,7 +233,7 @@ class TensorIntrin : public ObjectRef {
  * \return The new function with parameter specialized.
  * \note We can define a Meta TIR function with symbolic shape:
  *
- * \code
+ * \code{.py}
  *  @T.prim_func
  *  def mem_copy(a: T.handle, b: T.handle, m: T.int32, n: T.int32) -> None:
  *      A = T.match_buffer(a, (m, n), "float32")
@@ -259,14 +246,14 @@ class TensorIntrin : public ObjectRef {
  *
  * Then we can make it specialized with given shapes or buffers.
  *
- * \code
+ * \code{.py}
  *  a, _, m, n = mem_copy.params
  *  func = mem_copy.specialize({a: tir.decl_buffer((16, 16))})
  *  # or
  *  func = mem_copy.specialize({n: 16, m: 16})
  * \endcode
  *
- * \code {.language-id}
+ * \code{.py}
  *  @T.prim_func
  *  def mem_copy_16_16(a: T.handle, b: T.handle) -> None:
  *      A = T.match_buffer(a, (16, 16), "float32")
@@ -285,10 +272,11 @@ PrimFunc Specialize(PrimFunc func, const Map<Var, ObjectRef>& param_map);
  * \sa tvm::attr
  */
 namespace attr {
+
 /*!
  * \brief List of thread IterVar that a DeviceLaunch function corresponds to.
  *
- * Type: Array<tir::IterVar>
+ * Type: Array<String>
  *
  * We call a device kernel launch function f using the following convention:
  *
@@ -296,23 +284,42 @@ namespace attr {
  *      [arg1, arg2, ..., arg_n,
  *       work_size_1, work_size_2, ... work_size_m, dyn_shmem_size])
  *
- * Here n = len(arg), m = len(work_size) = len(device_thread_axis).
+ * Here n = len(arg), m = len(work_size) = len(launch_params)-1.
  *
- * When kDeviceUseDynSharedMemory is not set, dyn_shmem_size argument is omitted.
+ * The list of kernel launch params indicates which additional
+ * parameters will be provided to the PackedFunc by the calling
+ * scope.
  *
- * The list of device_thread_axis indicates how can be bind the
- * work_size arguments to the corresponding threads.
+ * - "threadIdx.x", "threadIdx.y", "threadIdx.z"
+ *
+ *   The extent of the thread count in x/y/z, to be used when
+ *   launching the compute kernel on the device.  For example, the
+ *   gridDimX/Y/Z parameters passed to cuLaunchKernel when launching a
+ *   CUDA kernel, or the groupCountX/Y/Z parameters passed to
+ *   vkCmdDispatch when dispatching a compute pipeline to Vulkan.
+ *
+ * - "blockIdx.x", "blockIdx.y", "blockIdx.z"
+ *
+ *   The extent of the block iterators, to be used when launching the
+ *   compute kernel on the device.  For example, the blockDimX/Y/Z
+ *   parameters passed to cuLaunchKernel when launching a CUDA kernel.
+ *   For runtimes that do not require the block to be provided
+ *   externally, this parameter is ignored.  For example, the
+ *   spv::ExecutionModeLocalSize for SPIR-V shaders on Vulkan, where
+ *   this parameter is defined in the shader.
+ *
+ * - tvm::runtime::launch_param::kUseDynamicSharedMemoryTag
+ *
+ *   The size of the shared memory that may be allocated internally by
+ *   the kernel.  For example, exposed as the
+ *   CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES attribute in
+ *   cuda.
+ *
+ *   Defined as "tir.use_dyn_shared_memory".
  *
  * \sa tvm::CallingConv::kDeviceKernelLaunch
  */
-constexpr const char* kDeviceThreadAxis = "tir.device_thread_axis";
-
-/*!
- * \brief Whether or not use dynamic shared memory.
- *
- * Type: Integer
- */
-constexpr const char* kDeviceUseDynSharedMemory = "tir.device_use_dyn_shared_memory";
+constexpr const char* kKernelLaunchParams = "tir.kernel_launch_params";
 
 /*!
  * \brief Whether to set noalias rule on the function arguments.
@@ -332,21 +339,18 @@ constexpr const char* kNoAlias = "tir.noalias";
 constexpr const char* kIsEntryFunc = "tir.is_entry_func";
 
 /*!
- * \brief Parameters used in the module that should be linked by the codegen.
- *
- * Type: Map<String, LinkableParam>
- *
- * \note This should be present only on a function named
- *     tvm::target::packed_func::kLookupLinkedParam.
- */
-constexpr const char* kLinkedParams = "tir.linked_params";
-
-/*!
  * \brief Mark the function as the global function called from the host.
  *
  * Type: Integer
  */
 constexpr const char* kIsGlobalFunc = "tir.is_global_func";
+
+/*!
+ * \brief Mark the function as run on the host, mutually exclusive with kTarget.
+ *
+ * Type: Integer
+ */
+constexpr const char* kIsHostFunc = "tir.is_host_func";
 
 }  // namespace attr
 }  // namespace tir

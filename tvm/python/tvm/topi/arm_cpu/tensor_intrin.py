@@ -428,7 +428,7 @@ def gemm_4x4_int8_int8_int32(M, N, K, unroll, in_type):
     )
 
 
-def dot_int8_int8_int32(int32_lanes, dtype="uint"):
+def dot_int8_int8_int32_neon_82(int32_lanes, dtype="uint"):
     """
     Int8 dot product by every 4 elements using ARM v8.2 udot.
     This function takes two arrays of int8 datatype -- data[4] and
@@ -466,42 +466,36 @@ def dot_int8_int8_int32(int32_lanes, dtype="uint"):
     """
     num_int8_elements = 4  # 4 int8 elements in int32
 
-    data = te.placeholder((num_int8_elements,), dtype="%s8" % dtype, name="data")
-    kernel = te.placeholder((int32_lanes, num_int8_elements), dtype="%s8" % dtype, name="kernel")
+    data = te.placeholder((num_int8_elements,), dtype=f"{dtype}8", name="data")
+    kernel = te.placeholder((int32_lanes, num_int8_elements), dtype=f"{dtype}8", name="kernel")
 
     k = te.reduce_axis((0, num_int8_elements), name="k")
     C = te.compute(
         (int32_lanes,),
-        lambda i: te.sum(
-            data[k].astype("%s32" % dtype) * kernel[i, k].astype("%s32" % dtype), axis=k
-        ),
+        lambda i: te.sum(data[k].astype(f"{dtype}32") * kernel[i, k].astype(f"{dtype}32"), axis=k),
         name="C",
     )
 
     a_buffer = tvm.tir.decl_buffer(
-        data.shape, dtype="%s8" % dtype, name="a_buffer", offset_factor=1, strides=[1]
+        data.shape, dtype=f"{dtype}8", name="a_buffer", offset_factor=1, strides=[1]
     )
     b_buffer = tvm.tir.decl_buffer(
-        kernel.shape,
-        dtype="%s8" % dtype,
-        name="b_buffer",
-        offset_factor=1,
-        strides=[te.var("s"), 1],
+        kernel.shape, dtype=f"{dtype}8", name="b_buffer", offset_factor=1, strides=[te.var("s"), 1]
     )
 
     def _intrin_func(ins, outs):
         def _instr(index):
             ib = tvm.tir.ir_builder.create()
             if index == 1:
-                ib.emit(outs[0].vstore(0, tvm.tir.const(0, "%s32x%d" % (dtype, int32_lanes))))
+                ib.emit(outs[0].vstore(0, tvm.tir.const(0, f"{dtype}32x{int32_lanes}")))
                 return ib.get()
 
-            dtype_a = "%s8x%d" % (dtype, num_int8_elements)
-            dtype_b = "%s8x%d" % (dtype, int32_lanes * num_int8_elements)
-            dtype_c = "%s32x%d" % (dtype, int32_lanes)
+            dtype_a = f"{dtype}8x{num_int8_elements}"
+            dtype_b = f"{dtype}8x{int32_lanes * num_int8_elements}"
+            dtype_c = f"{dtype}32x{int32_lanes}"
 
             a_int8 = ins[0].vload([0], dtype_a)
-            re_int32 = tvm.tir.call_intrin("%s32" % dtype, "tir.reinterpret", a_int8)
+            re_int32 = tvm.tir.call_intrin(f"{dtype}32", "tir.reinterpret", a_int8)
             # broadcast a
             vec_ai32 = re_int32.astype(dtype_c)
 
@@ -516,9 +510,142 @@ def dot_int8_int8_int32(int32_lanes, dtype="uint"):
                 int32_lanes * num_int8_elements,
             )
             vdot = tvm.tir.call_llvm_pure_intrin(
-                dtype_c, inst, tvm.tir.const(2, "uint32"), vec_c, vec_a, vec_b
+                dtype_c, inst, tvm.tir.const(3, "uint32"), vec_c, vec_a, vec_b
             )
             ib.emit(outs[0].vstore(0, vdot))
+            return ib.get()
+
+        # body, reset, update
+        return _instr(0), _instr(1), _instr(2)
+
+    buffer_params = {"offset_factor": 1}
+    return te.decl_tensor_intrin(
+        C.op,
+        _intrin_func,
+        binds={data: a_buffer, kernel: b_buffer},
+        default_buffer_params=buffer_params,
+    )
+
+
+def dot_int8_int8_int32_neon():
+    """
+    Int8 dot product using vmlal instructions
+
+    .. code-block:: c
+
+        void dot_int8_int8_int32(int8 data[4], int8 kernel[4][4], int32 output[4]){
+            for (int i = 0; i < 4; i++){
+                out[i] = 0;
+                for (int k = 0; k < 4; k++){
+                    out[i] += data[k] * kernel[i][k]
+                }
+            }
+        }
+
+    We use the smull and saddlp instructions to compute the dot product.
+    smull : int8x16 -> int8x16 -> int16x8 elementwise multiplication
+    saddlp: int16x8 -> int32x4 pairwise addition of elements
+
+    Data is broadcast across the register
+    int8 elements
+    |         data      |         data      |
+    |  0 |  1 |  2 |  3 |  4 |  5 |  6 |  7 |
+
+                      smull
+
+    int8 elements
+    |     kernel[i]     |     kernel[i+1]   |
+    |  0 |  1 |  2 |  3 |  4 |  5 |  6 |  7 |
+
+                        =
+
+    int16 elements
+    |               data * kernel[i]        |         data * kernel[i+1]            |
+    |    0    |    1    |    2    |    3    |    4    |    5    |    6    |    7    |
+
+                                          saddlp =
+
+    int32 elements
+    |    partial sum(data * kernel[i])      |  partial sum(data * kernel[i+1])      |
+    |         0         |         1         |         2         |         3         |
+
+
+    We apply the above kernel twice and use addp to compute the second set of pairwise additions
+
+    int32 elements (narrowed for so they fit on a line)
+    |    psum d*k[i]    |   psum d*k[i+1]   |           |   psum d*k[i+2]   |   psum d*k[i+3]   |
+    |    0    |    1    |    2    |    3    |   addp    |    4    |    5    |    6    |    7    |
+                                                 =
+    |sum d*ki |sum d*ki1|sum d*ki2|sum d*ki3|
+    |    0    |    1    |    2    |    3    |
+
+
+    """
+    int32_lanes = 4  # 4 int32 lanes = 128
+    num_int8_elements = 4  # 4 int8 elements in int32
+    data = te.placeholder((num_int8_elements,), dtype="int8", name="data")
+    kernel = te.placeholder((int32_lanes, num_int8_elements), dtype="int8", name="kernel")
+    k = te.reduce_axis((0, num_int8_elements), name="k")
+    C = te.compute(
+        (int32_lanes,),
+        lambda i: te.sum(data[k].astype("int32") * kernel[i, k].astype("int32"), axis=k),
+        name="C",
+    )
+
+    a_buffer = tvm.tir.decl_buffer(
+        data.shape, dtype="int8", name="a_buffer", offset_factor=1, strides=[1]
+    )
+    b_buffer = tvm.tir.decl_buffer(
+        kernel.shape, dtype="int8", name="b_buffer", offset_factor=1, strides=[te.var("ldw"), 1]
+    )
+
+    def _intrin_func(ins, outs):
+        def _instr(index):
+            int_8xl = "int8x8"
+            int_32xl = "int32x4"
+            ib = tvm.tir.ir_builder.create()
+            if index == 1:
+                ib.emit(outs[0].vstore(0, tvm.tir.const(0, int_32xl)))
+                return ib.get()
+
+            # this broadcasts data to the vector size
+            a_int8 = ins[0].vload([0], "int8x4")
+            re_int32 = tvm.tir.call_intrin("int32", "tir.reinterpret", a_int8)
+            vec_ai32 = re_int32.astype("int32x2")
+            vec_a = tvm.tir.call_intrin(int_8xl, "tir.reinterpret", vec_ai32)
+
+            vec_b = ins[1].vload([0, 0], "int8x16")
+
+            def pairwise_add_mul(extract_half):
+                vec_b_half = tvm.tir.call_intrin("int8x8", extract_half, vec_b)
+                multiply = tvm.tir.call_llvm_pure_intrin(
+                    "int16x8",
+                    "llvm.aarch64.neon.smull.v8i16",  # saturating pairwise multiplication
+                    tvm.tir.const(2, "uint32"),
+                    vec_a,
+                    vec_b_half,
+                )
+                pairwise_reduction = tvm.tir.call_llvm_pure_intrin(
+                    "int32x4",
+                    "llvm.aarch64.neon.saddlp.v4i32.v8i16",
+                    tvm.tir.const(1, "uint32"),
+                    multiply,
+                )
+                return pairwise_reduction
+
+            pair_1 = pairwise_add_mul("tir.vectorlow")
+            pair_2 = pairwise_add_mul("tir.vectorhigh")
+            quad_reduction = tvm.tir.call_llvm_pure_intrin(
+                "int32x4",
+                "llvm.aarch64.neon.addp.v4i32",
+                tvm.tir.const(2, "uint32"),
+                pair_1,
+                pair_2,
+            )
+            if index == 0:
+                ib.emit(outs[0].vstore(0, quad_reduction))
+            else:
+                ib.emit(outs[0].vstore(0, quad_reduction + outs[0].vload([0], int_32xl)))
             return ib.get()
 
         # body, reset, update
@@ -581,7 +708,7 @@ def gemm_acc_4x4_int8_int8_int32(dtype):
 
         void gemm_acc_4x4_int8_int8_int32(int8 A[4][4], int8 B[4][4], int32 C[4][4]){
             for (int i = 0; i < 4; i++){
-                for (int j = 0; i < 4; i++){
+                for (int j = 0; j < 4; j++){
                     for (int k = 0; k < 4; k++){
                         C[i][j] += A[i][k] * B[j][k]
                     }
@@ -672,12 +799,7 @@ def gemm_acc_4x4_int8_int8_int32(dtype):
                 #                           a*2+b*6+c*10+d*14,
                 #                           a*3+b*7+c*11+d*15]
                 vdot = tvm.tir.call_llvm_intrin(
-                    "int32x4",
-                    llvm_intrin,
-                    tvm.tir.const(3, "uint32"),
-                    vec_c,
-                    vec_b,
-                    vec_aa[i],
+                    "int32x4", llvm_intrin, tvm.tir.const(3, "uint32"), vec_c, vec_b, vec_aa[i]
                 )
 
                 # Store the result
@@ -708,7 +830,7 @@ def gemm_acc_nx16_int8_int8_int32(dtype, rows):
 
         void mmla_nx16_int8_int8_int32(int8 A[n][16], int8 B[4][16][4], int32 output[n][16]){
             for (int i = 0; i < n; i++){
-                for (int j = 0; i < 16; i++){
+                for (int j = 0; j < 16; j++){
                     for (int k = 0; k < 16; k++){
                         out[i][j] += A[i][k] * B[k//4][j][k%4]
                     }
@@ -727,7 +849,7 @@ def gemm_acc_nx16_int8_int8_int32(dtype, rows):
     dtype : str, {"uint8", "int8"}
         Whether it works on unsigned int or signed int
     rows : int
-        Number of of the output rows "n"
+        Number of the output rows "n"
 
     Returns
     -------
@@ -752,11 +874,7 @@ def gemm_acc_nx16_int8_int8_int32(dtype, rows):
         A.shape, dtype, name="aa_buffer", offset_factor=1, strides=[te.var("sa"), 1]
     )
     bb_buffer = tvm.tir.decl_buffer(
-        B.shape,
-        dtype,
-        name="bb_buffer",
-        offset_factor=1,
-        strides=[te.var("sb0"), te.var("sb1"), 1],
+        B.shape, dtype, name="bb_buffer", offset_factor=1, strides=[te.var("sb0"), te.var("sb1"), 1]
     )
     cc_buffer = tvm.tir.decl_buffer(
         C.shape, dtype="int32", name="cc_buffer", offset_factor=1, strides=[te.var("sc"), 1]
@@ -803,12 +921,7 @@ def gemm_acc_nx16_int8_int8_int32(dtype, rows):
                         #                           a*2+b*18+c*34+d*50,
                         #                           a*3+b*19+c*35+d*51]
                         vdot = tvm.tir.call_llvm_intrin(
-                            "int32x4",
-                            llvm_intrin,
-                            tvm.tir.const(3, "uint32"),
-                            vec_c,
-                            vec_b,
-                            vec_aa,
+                            "int32x4", llvm_intrin, tvm.tir.const(3, "uint32"), vec_c, vec_b, vec_aa
                         )
                         ib.emit(outs[0].vstore([k, 4 * j], vdot))
             return ib.get()
@@ -844,27 +957,17 @@ def smlal_int16_int32():
     A = te.placeholder((int16_lanes,), dtype="int16", name="A")
     B = te.placeholder((int16_lanes, 1), dtype="int16", name="B")
     C = te.compute(
-        (int16_lanes,),
-        lambda i: A[i].astype("int32") * B[i, 0].astype("int32"),
-        name="C",
+        (int16_lanes,), lambda i: A[i].astype("int32") * B[i, 0].astype("int32"), name="C"
     )
 
     a_buffer = tvm.tir.decl_buffer(
         A.shape, dtype="int16", name="a_buffer", offset_factor=1, strides=[1]
     )
     b_buffer = tvm.tir.decl_buffer(
-        B.shape,
-        dtype="int16",
-        name="b_buffer",
-        offset_factor=1,
-        strides=[te.var("sb"), 1],
+        B.shape, dtype="int16", name="b_buffer", offset_factor=1, strides=[te.var("sb"), 1]
     )
     c_buffer = tvm.tir.decl_buffer(
-        C.shape,
-        dtype="int32",
-        name="c_buffer",
-        offset_factor=1,
-        strides=[1],
+        C.shape, dtype="int32", name="c_buffer", offset_factor=1, strides=[1]
     )
 
     def _intrin_func(ins, outs):
@@ -926,7 +1029,7 @@ def gemm_acc_2x2_int8_int8_int32(dtype):
 
         void mmla_2x2_int8_int8_int32(int8 A[2][8], int8 B[2][8], int32 C[2][2]){
             for (int i = 0; i < 2; i++){
-                for (int j = 0; i < 2; i++){
+                for (int j = 0; j < 2; j++){
                     for (int k = 0; k < 8; k++){
                         C[i][j] += A[i][k] * B[j][k]
                     }
@@ -989,12 +1092,7 @@ def gemm_acc_2x2_int8_int8_int32(dtype):
             #          i*1 + j*3 + k*5 + l*7 +m*9 + n*11 + o*13 + p*15]
             vec_c = outs[0].vload([0, 0], "int32x4")
             vmmla = tvm.tir.call_llvm_intrin(
-                "int32x4",
-                llvm_intrin,
-                tvm.tir.const(3, "uint32"),
-                vec_c,
-                vec_a,
-                vec_b,
+                "int32x4", llvm_intrin, tvm.tir.const(3, "uint32"), vec_c, vec_a, vec_b
             )
             # Store the result
             ib.emit(outs[0].vstore([0, 0], vmmla))

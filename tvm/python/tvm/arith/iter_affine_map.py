@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 """ Iterator (quasi)affine mapping patterns."""
+from enum import IntEnum
 import tvm._ffi
 from tvm.runtime import Object
 from tvm.ir import PrimExpr
@@ -88,7 +89,37 @@ class IterSumExpr(IterMapExpr):
         self.__init_handle_by_constructor__(_ffi_api.IterSumExpr, args, base)
 
 
-def detect_iter_map(indices, input_iters, predicate=True, require_bijective=False):
+class IterMapLevel(IntEnum):
+    """Possible kinds of iter mapping check level."""
+
+    Bijective = 0
+    Surjective = 1
+    NoCheck = 3
+
+    @staticmethod
+    def from_str(name: str):
+        """Helper to create level enum from string"""
+        if name is None:
+            return IterMapLevel.NoCheck
+        name = name.lower()
+        if name == "bijective":
+            check_level = IterMapLevel.Bijective
+        elif name == "surjective":
+            check_level = IterMapLevel.Surjective
+        elif name == "nocheck":
+            check_level = IterMapLevel.NoCheck
+        else:
+            raise ValueError(f"Unknown check level {name}")
+        return check_level
+
+
+def detect_iter_map(
+    indices,
+    input_iters,
+    predicate=True,
+    check_level=IterMapLevel.Surjective,
+    simplify_trivial_iterators=True,
+):
     """Detect if indices can be written as mapped iters from input iters
 
     Parameters
@@ -102,16 +133,101 @@ def detect_iter_map(indices, input_iters, predicate=True, require_bijective=Fals
     predicate : PrimExpr
         The predicate constraints on the input iterators
 
-    require_bijective : bool
-        A boolean flag that indicates whether the mapping should be bijective
+    check_level : Union[str, IterMapLevel]
+        Checking level of iteration mapping
+
+    simplify_trivial_iterators: bool
+        If true, iterators with extent of 1 will be replaced with a
+        constant value.
 
     Returns
     -------
-    results : List[IterSumExpr]
+    results : IterMapResult
         The iter map matching result.
-        Empty array if no match can be found.
+        The result's .indices is empty array if no match can be found.
+
     """
-    return _ffi_api.DetectIterMap(indices, input_iters, predicate, require_bijective)
+    if isinstance(check_level, str):
+        check_level = IterMapLevel.from_str(check_level)
+    elif check_level is None:
+        check_level = IterMapLevel.NoCheck
+    return _ffi_api.DetectIterMap(
+        indices, input_iters, predicate, check_level, simplify_trivial_iterators
+    )
+
+
+def normalize_to_iter_sum(index, input_iters):
+    """Normalize expr to iter sum.
+
+    The normalized result ensures that
+    each scale is in the form of (symbol_prod) * cscale
+    It will also sort in desc order by cscale then len(symbol_prod).
+
+    Parameters
+    ----------
+    index : PrimExpr
+        The input index
+
+    input_iters : Map[Var, Range]
+        The domain of each input iterators.
+
+    Returns
+    -------
+    iter_sum: IterSumExpr
+        The result iter sum
+
+    Note
+    ----
+    This function does best effort detection, so some undetected
+    part can go into iter_sum.base
+
+    This function is useful to decide the stride multiplier and
+    division factor in buffer access patterns.
+    """
+    return _ffi_api.NormalizeToIterSum(index, input_iters)
+
+
+def iter_map_simplify(
+    indices,
+    input_iters,
+    predicate=True,
+    check_level=IterMapLevel.Surjective,
+    simplify_trivial_iterators=True,
+):
+    """Simplify the indices using iter map detection.
+
+    Parameters
+    ----------
+    indices : List[PrimExpr]
+        The input indices
+
+    input_iters : Map[Var, Range]
+        The domain of each input iterators.
+
+    predicate : PrimExpr
+        The predicate constraints on the input iterators
+
+    check_level : Union[str, IterMapLevel]
+        Checking level of iteration mapping
+
+    simplify_trivial_iterators: bool
+        If true, iterators with extent of 1 will be replaced with a
+        constant value.
+
+    Returns
+    -------
+    results : IterMapResult
+        The iter map matching result.
+        The result's .indices is empty array if no match can be found.
+
+    """
+    if isinstance(check_level, str):
+        check_level = IterMapLevel.from_str(check_level)
+    elif check_level is None:
+        check_level = IterMapLevel.NoCheck
+    return _ffi_api.IterMapSimplify(
+        indices, input_iters, predicate, check_level, simplify_trivial_iterators
+    )
 
 
 def normalize_iter_map_to_expr(expr):
@@ -130,7 +246,14 @@ def normalize_iter_map_to_expr(expr):
     return _ffi_api.NormalizeIterMapToExpr(expr)
 
 
-def subspace_divide(bindings, input_iters, sub_iters, predicate=True, require_bijective=False):
+def subspace_divide(
+    bindings,
+    input_iters,
+    sub_iters,
+    predicate=True,
+    check_level=IterMapLevel.Surjective,
+    simplify_trivial_iterators=True,
+):
     """Detect if bindings can be written as
     [a_0*e_0 + b_0 + c_0, a_1*e_1 + b_1, ..., a_n*e_n + b_n]
     where a = some-quasi-affine-iter-map(input_iters set_minus sub_iters)
@@ -159,8 +282,12 @@ def subspace_divide(bindings, input_iters, sub_iters, predicate=True, require_bi
     predicate : PrimExpr
         The predicate constraints on the input iterators
 
-    require_bijective : bool
-        A boolean flag that indicates whether the bindings should be bijective
+    check_level : Union[str, IterMapLevel]
+        Checking level of iteration mapping
+
+    simplify_trivial_iterators: bool
+        If true, iterators with extent of 1 will be replaced with a
+        constant value.
 
     Returns
     -------
@@ -172,7 +299,11 @@ def subspace_divide(bindings, input_iters, sub_iters, predicate=True, require_bi
         len(bindings): the predicate of outer space and inner space
         Empty array if no match can be found.
     """
-    return _ffi_api.SubspaceDivide(bindings, input_iters, sub_iters, predicate, require_bijective)
+    if isinstance(check_level, str):
+        check_level = IterMapLevel.from_str(check_level)
+    return _ffi_api.SubspaceDivide(
+        bindings, input_iters, sub_iters, predicate, check_level, simplify_trivial_iterators
+    )
 
 
 def inverse_affine_iter_map(iter_map, outputs):

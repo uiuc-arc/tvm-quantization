@@ -27,19 +27,21 @@ For example, you can use addexp.a to get the left operand of an Add node.
   assert(isinstance(y, tvm.tir.Add))
   assert(y.a == x)
 """
-from typing import Optional, Union
-from tvm import ir
+from typing import List, Optional, Union
+
 import tvm._ffi
-from tvm.ir.base import Span
-
-from tvm.runtime import Object, ObjectGeneric, DataType, DataTypeCode, const
-from tvm.ir import PrimExpr, Op
 import tvm.ir._ffi_api
-from . import generic as _generic
+from tvm import ir
+from tvm.ir import Op, PrimExpr
+from tvm.ir.base import Span
+from tvm.runtime import DataType, DataTypeCode, Object, ObjectGeneric, Scriptable, const
+
 from . import _ffi_api
+from . import generic as _generic
+from .buffer import Buffer, DataProducer
 
 
-def div_ambiguity_error():
+def div_ambiguity_error() -> RuntimeError:
     return RuntimeError(
         "TVM supports multiple types of integer divisions, "
         + "please call div, indexdiv/indexmod, floordiv/floormod "
@@ -68,111 +70,111 @@ class ExprOp(object):
 
     # TODO(tkonolige): use inspect to add source information to these objects
 
-    def __add__(self, other):
+    def __add__(self, other: PrimExpr) -> PrimExpr:
         return _generic.add(self, other)
 
-    def __radd__(self, other):
+    def __radd__(self, other: PrimExpr) -> PrimExpr:
         return _generic.add(other, self)
 
-    def __sub__(self, other):
+    def __sub__(self, other: PrimExpr) -> PrimExpr:
         return _generic.subtract(self, other)
 
-    def __rsub__(self, other):
+    def __rsub__(self, other: PrimExpr) -> PrimExpr:
         return _generic.subtract(other, self)
 
-    def __mul__(self, other):
+    def __mul__(self, other: PrimExpr) -> PrimExpr:
         return _generic.multiply(self, other)
 
-    def __rmul__(self, other):
+    def __rmul__(self, other: PrimExpr) -> PrimExpr:
         return _generic.multiply(other, self)
 
-    def __div__(self, other):
+    def __div__(self, other: PrimExpr) -> PrimExpr:
         if _dtype_is_int(self) and _dtype_is_int(other):
             raise div_ambiguity_error()
         return _generic.divide(self, other)
 
-    def __rdiv__(self, other):
+    def __rdiv__(self, other: PrimExpr) -> PrimExpr:
         if _dtype_is_int(self) and _dtype_is_int(other):
             raise div_ambiguity_error()
         return _generic.divide(other, self)
 
-    def __truediv__(self, other):
+    def __truediv__(self, other: PrimExpr) -> PrimExpr:
         if _dtype_is_int(self) and _dtype_is_int(other):
             raise div_ambiguity_error()
         return _generic.divide(self, other)
 
-    def __rtruediv__(self, other):
+    def __rtruediv__(self, other: PrimExpr) -> PrimExpr:
         if _dtype_is_int(self) and _dtype_is_int(other):
             raise div_ambiguity_error()
         return _generic.divide(other, self)
 
-    def __floordiv__(self, other):
+    def __floordiv__(self, other: PrimExpr) -> PrimExpr:
         return _generic.floordiv(self, other)
 
-    def __rfloordiv__(self, other):
+    def __rfloordiv__(self, other: PrimExpr) -> PrimExpr:
         return _generic.floordiv(other, self, None)
 
-    def __mod__(self, other):
+    def __mod__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api._OpFloorMod(self, other, None)  # type: ignore
 
-    def __rmod__(self, other):
+    def __rmod__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api._OpFloorMod(other, self, None)  # type: ignore
 
-    def __neg__(self):
+    def __neg__(self) -> PrimExpr:
         neg_one = const(-1, self.dtype)  # type: ignore
         return self.__mul__(neg_one)
 
-    def __lshift__(self, other):
+    def __lshift__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api.left_shift(self, other, None)  # type: ignore
 
-    def __rlshift__(self, other):
+    def __rlshift__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api.left_shift(other, self, None)  # type: ignore
 
-    def __rshift__(self, other):
+    def __rshift__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api.right_shift(self, other, None)  # type: ignore
 
-    def __rrshift__(self, other):
+    def __rrshift__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api.right_shift(other, self, None)  # type: ignore
 
-    def __and__(self, other):
+    def __and__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api.bitwise_and(self, other, None)  # type: ignore
 
-    def __rand__(self, other):
+    def __rand__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api.bitwise_and(other, self, None)  # type: ignore
 
-    def __or__(self, other):
+    def __or__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api.bitwise_or(self, other, None)  # type: ignore
 
-    def __ror__(self, other):
+    def __ror__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api.bitwise_or(other, self, None)  # type: ignore
 
-    def __xor__(self, other):
+    def __xor__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api.bitwise_xor(self, other, None)  # type: ignore
 
-    def __rxor__(self, other):
+    def __rxor__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api.bitwise_xor(other, self, None)  # type: ignore
 
-    def __invert__(self):
+    def __invert__(self) -> PrimExpr:
         if _dtype_is_float(self):
             raise RuntimeError("Cannot use ~ operator on float type Expr.")
         return _ffi_api.bitwise_not(self, None)  # type: ignore
 
-    def __lt__(self, other):
+    def __lt__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api._OpLT(self, other, None)  # type: ignore
 
-    def __le__(self, other):
+    def __le__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api._OpLE(self, other, None)  # type: ignore
 
-    def __eq__(self, other):
+    def __eq__(self, other: PrimExpr) -> PrimExpr:
         return EqualOp(self, other)
 
-    def __ne__(self, other):
+    def __ne__(self, other: PrimExpr) -> PrimExpr:
         return NotEqualOp(self, other)
 
-    def __gt__(self, other):
+    def __gt__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api._OpGT(self, other, None)  # type: ignore
 
-    def __ge__(self, other):
+    def __ge__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api._OpGE(self, other, None)  # type: ignore
 
     def __nonzero__(self):
@@ -181,10 +183,10 @@ class ExprOp(object):
             + "use tvm.tir.all / tvm.tir.any instead"
         )
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return self.__nonzero__()
 
-    def equal(self, other, span=None):
+    def equal(self, other: PrimExpr, span: Optional[Span] = None) -> bool:
         """Build an equal check expression with other expr.
 
         Parameters
@@ -202,7 +204,7 @@ class ExprOp(object):
         """
         return _ffi_api._OpEQ(self, other, span)  # type: ignore
 
-    def astype(self, dtype: str, span: Optional[Span] = None):
+    def astype(self, dtype: str, span: Optional[Span] = None) -> PrimExpr:
         """Cast the expression to other type.
 
         Parameters
@@ -242,18 +244,18 @@ class EqualOp(ObjectGeneric, ExprOp):
     # This class is not manipulated by C++. So use python's identity check function is sufficient
     same_as = object.__eq__
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None):
         self.a = a
         self.b = b
         self.span = span
 
-    def __nonzero__(self):
+    def __nonzero__(self) -> bool:
         return self.a.same_as(self.b)
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return self.__nonzero__()
 
-    def asobject(self):
+    def asobject(self) -> PrimExpr:
         """Convert object."""
         return _ffi_api._OpEQ(self.a, self.b, self.span)  # type: ignore
 
@@ -279,18 +281,18 @@ class NotEqualOp(ObjectGeneric, ExprOp):
     # This class is not manipulated by C++. So use python's identity check function is sufficient
     same_as = object.__eq__
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.a = a
         self.b = b
         self.span = span
 
-    def __nonzero__(self):
+    def __nonzero__(self) -> bool:
         return not self.a.same_as(self.b)
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return self.__nonzero__()
 
-    def asobject(self):
+    def asobject(self) -> PrimExpr:
         """Convert object."""
         return _ffi_api._OpNE(self.a, self.b, self.span)  # type: ignore
 
@@ -308,16 +310,16 @@ class IntImmEnum(ObjectGeneric):
         The location of the cast in the source.
     """
 
-    def __init__(self, value, span=None):
+    def __init__(self, value: int, span: Optional[Span] = None) -> None:
         self.value = value
         self.span = span
 
-    def asobject(self):
+    def asobject(self) -> "IntImm":
         """Convert object."""
         return IntImm("int32", self.value, self.span)  # type: ignore
 
 
-class PrimExprWithOp(ExprOp, PrimExpr):
+class PrimExprWithOp(ExprOp, PrimExpr, Scriptable):
     """Helper base class to inherit from PrimExpr."""
 
     # In Python3, We have to explicitly tell interpreter to retain __hash__ if we overide __eq__
@@ -330,11 +332,13 @@ class ConstExpr(PrimExprWithOp):
 
 
 class BinaryOpExpr(PrimExprWithOp):
-    pass
+    a: PrimExpr
+    b: PrimExpr
 
 
 class CmpExpr(PrimExprWithOp):
-    pass
+    a: PrimExpr
+    b: PrimExpr
 
 
 class LogicalExpr(PrimExprWithOp):
@@ -350,14 +354,17 @@ class Var(PrimExprWithOp):
     name : str
         The name
 
-    dtype : Union[str, tvm.irType]
+    dtype : Union[str, ir.Type]
         The data type
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, name: str, dtype: Union[str, ir.Type], span: Optional[Span] = None):
+    name_hint: str
+    type_annotation: ir.Type
+
+    def __init__(self, name: str, dtype: Union[str, ir.Type], span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Var, name, dtype, span)  # type: ignore
 
 
@@ -371,20 +378,20 @@ class SizeVar(Var):
     name : str
         The name
 
-    dtype : int
+    dtype : Union[str, ir.Type]
         The data type
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
     # pylint: disable=super-init-not-called
-    def __init__(self, name, dtype, span=None):
+    def __init__(self, name: str, dtype: Union[str, ir.Type], span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.SizeVar, name, dtype, span)  # type: ignore
 
 
 @tvm._ffi.register_object("tir.IterVar")
-class IterVar(Object, ExprOp):
+class IterVar(Object, ExprOp, Scriptable):
     """Represent iteration variable.
 
     IterVar represents axis iterations in the computation.
@@ -404,7 +411,7 @@ class IterVar(Object, ExprOp):
         The thread type tag.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
 
     See Also
     --------
@@ -416,13 +423,25 @@ class IterVar(Object, ExprOp):
     ThreadIndex = 1
     CommReduce = 2
     Ordered = 3
-    DimInfo = 4
+    Opaque = 4
     Unrolled = 5
     Vectorized = 6
     Parallelized = 7
     Tensorized = 8
 
-    def __init__(self, dom, var, iter_type, thread_tag="", span=None):
+    dom: ir.Range
+    var: Var
+    iter_type: int
+    thread_tag: str
+
+    def __init__(
+        self,
+        dom: ir.Range,
+        var: Union[Var, str],
+        iter_type: int,
+        thread_tag: str = "",
+        span: Optional[Span] = None,
+    ) -> None:
         if dom is not None:
             if isinstance(dom, (list, tuple)):
                 if len(dom) != 2:
@@ -435,13 +454,17 @@ class IterVar(Object, ExprOp):
         name = var if var is not None else "iter"
         dtype = "int32" if dom is None else dom.extent.dtype
         var = Var(name, dtype=dtype, span=span) if not isinstance(var, Var) else var
+        if dom is not None:
+            assert (
+                var.dtype == dom.extent.dtype
+            ), "IterVar's Var dtype must match its domain's extent's dtype"
         self.__init_handle_by_constructor__(
             _ffi_api.IterVar, dom, var, iter_type, thread_tag, span  # type: ignore
         )
 
 
 @tvm._ffi.register_object("tir.CommReducer")
-class CommReducer(Object):
+class CommReducer(Object, Scriptable):
     """Commutative reduce operator
 
     Parameters
@@ -459,10 +482,22 @@ class CommReducer(Object):
        The identity elements.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, lhs, rhs, result, identity_element, span=None):
+    lhs: List[Var]
+    rhs: List[Var]
+    result: List[PrimExpr]
+    identity_element: List[PrimExpr]
+
+    def __init__(
+        self,
+        lhs: List[Var],
+        rhs: List[Var],
+        result: List[PrimExpr],
+        identity_element: List[PrimExpr],
+        span: Optional[Span] = None,
+    ) -> None:
         self.__init_handle_by_constructor__(
             _ffi_api.CommReducer, lhs, rhs, result, identity_element, span  # type: ignore
         )
@@ -493,10 +528,27 @@ class Reduce(PrimExprWithOp):
         The initial value for output. This can be an int, float or ProducerLoad
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, combiner, src, rdom, condition, value_index, init=None, span=None):
+    combiner: CommReducer
+    source: List[PrimExpr]
+    init: List[PrimExpr]
+    axis: List[IterVar]
+    condition: PrimExpr
+    value_index: int
+
+    def __init__(
+        self,
+        combiner: CommReducer,
+        src: List[PrimExpr],
+        rdom: List[IterVar],
+        condition: PrimExpr,
+        value_index: int,
+        init: Optional[List[PrimExpr]] = None,
+        span: Optional[Span] = None,
+    ) -> None:
+        init = [] if init is None else init
         self.__init_handle_by_constructor__(
             _ffi_api.Reduce, combiner, src, rdom, condition, value_index, init, span  # type: ignore
         )
@@ -515,15 +567,17 @@ class FloatImm(ConstExpr):
         The constant value.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, dtype, value, span=None):
+    value: float
+
+    def __init__(self, dtype: str, value: float, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(
             tvm.ir._ffi_api.FloatImm, dtype, value, span  # type: ignore
         )
 
-    def __float__(self):
+    def __float__(self) -> float:
         return self.value
 
 
@@ -540,30 +594,32 @@ class IntImm(ConstExpr):
         The constant value.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, dtype, value, span=None):
+    value: int
+
+    def __init__(self, dtype: str, value: int, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(
             tvm.ir._ffi_api.IntImm, dtype, value, span  # type: ignore
         )
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return self.value
 
-    def __int__(self):
+    def __int__(self) -> int:
         return self.value
 
-    def __nonzero__(self):
+    def __nonzero__(self) -> bool:
         return self.value != 0
 
-    def __eq__(self, other):
+    def __eq__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api._OpEQ(self, other, None)  # type: ignore
 
-    def __ne__(self, other):
+    def __ne__(self, other: PrimExpr) -> PrimExpr:
         return _ffi_api._OpNE(self, other, None)  # type: ignore
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return self.__nonzero__()
 
 
@@ -577,23 +633,25 @@ class StringImm(ConstExpr):
         The value of the function.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, value, span=None):
+    value: str
+
+    def __init__(self, value: str, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.StringImm, value, span)  # type: ignore
 
-    def __eq__(self, other):
+    def __eq__(self, other: PrimExpr) -> bool:
         if isinstance(other, ConstExpr):
             return self.value == other.value
         return self.value == other
 
-    def __ne__(self, other):
+    def __ne__(self, other: PrimExpr) -> bool:
         if isinstance(other, ConstExpr):
             return self.value != other.value
         return self.value != other
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return PrimExpr.__hash__(self)
 
 
@@ -610,10 +668,12 @@ class Cast(PrimExprWithOp):
         The value of the function.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, dtype, value, span=None):
+    value: PrimExpr
+
+    def __init__(self, dtype, value, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Cast, dtype, value, span)  # type: ignore
 
 
@@ -630,10 +690,10 @@ class Add(BinaryOpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Add, a, b, span)  # type: ignore
 
 
@@ -650,10 +710,10 @@ class Sub(BinaryOpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Sub, a, b, span)  # type: ignore
 
 
@@ -670,10 +730,10 @@ class Mul(BinaryOpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Mul, a, b, span)  # type: ignore
 
 
@@ -690,10 +750,10 @@ class Div(BinaryOpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Div, a, b, span)  # type: ignore
 
 
@@ -710,10 +770,10 @@ class Mod(BinaryOpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Mod, a, b, span)  # type: ignore
 
 
@@ -730,10 +790,10 @@ class FloorDiv(BinaryOpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.FloorDiv, a, b, span)  # type: ignore
 
 
@@ -750,10 +810,10 @@ class FloorMod(BinaryOpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.FloorMod, a, b, span)  # type: ignore
 
 
@@ -770,10 +830,10 @@ class Min(BinaryOpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Min, a, b, span)  # type: ignore
 
 
@@ -790,10 +850,10 @@ class Max(BinaryOpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Max, a, b, span)  # type: ignore
 
 
@@ -810,10 +870,10 @@ class EQ(CmpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.EQ, a, b, span)  # type: ignore
 
 
@@ -830,10 +890,10 @@ class NE(CmpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.NE, a, b, span)  # type: ignore
 
 
@@ -850,10 +910,10 @@ class LT(CmpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.LT, a, b, span)  # type: ignore
 
 
@@ -870,10 +930,10 @@ class LE(CmpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.LE, a, b, span)  # type: ignore
 
 
@@ -890,10 +950,10 @@ class GT(CmpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.GT, a, b, span)  # type: ignore
 
 
@@ -910,10 +970,10 @@ class GE(CmpExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.GE, a, b, span)  # type: ignore
 
 
@@ -930,10 +990,10 @@ class And(LogicalExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.And, a, b, span)  # type: ignore
 
 
@@ -950,10 +1010,13 @@ class Or(LogicalExpr):
         The right hand operand.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, b, span=None):
+    a: PrimExpr
+    b: PrimExpr
+
+    def __init__(self, a: PrimExpr, b: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Or, a, b, span)  # type: ignore
 
 
@@ -967,10 +1030,12 @@ class Not(LogicalExpr):
         The input value
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, a, span=None):
+    a: PrimExpr
+
+    def __init__(self, a: PrimExpr, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Not, a, span)  # type: ignore
 
 
@@ -997,42 +1062,24 @@ class Select(PrimExprWithOp):
         The value to take when condition is false.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, condition, true_value, false_value, span=None):
+    condition: PrimExpr
+    true_value: PrimExpr
+    false_value: PrimExpr
+
+    def __init__(
+        self,
+        condition: PrimExpr,
+        true_value: PrimExpr,
+        false_value: PrimExpr,
+        span: Optional[Span] = None,
+    ) -> None:
+        if isinstance(condition, bool):
+            condition = IntImm("bool", condition)
         self.__init_handle_by_constructor__(
             _ffi_api.Select, condition, true_value, false_value, span  # type: ignore
-        )
-
-
-@tvm._ffi.register_object("tir.Load")
-class Load(PrimExprWithOp):
-    """Load node.
-
-    Parameters
-    ----------
-    dtype : str
-        The data type.
-
-    buffer_var : Var
-        The buffer variable in the load expression.
-
-    index : PrimExpr
-        The index in the load.
-
-    predicate : PrimExpr
-        The load predicate.
-
-    span : Optional[Span]
-        The location of this itervar in the source code.
-    """
-
-    def __init__(self, dtype, buffer_var, index, predicate=None, span=None):
-        if predicate is None:
-            predicate = _ffi_api.const_true(dtype, span)  # type: ignore
-        self.__init_handle_by_constructor__(
-            _ffi_api.Load, dtype, buffer_var, index, predicate, span  # type: ignore
         )
 
 
@@ -1049,10 +1096,15 @@ class BufferLoad(PrimExprWithOp):
         The buffer indices.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, buffer, indices, span=None):
+    buffer: Buffer
+    indices: List[PrimExpr]
+
+    def __init__(
+        self, buffer: Buffer, indices: List[PrimExpr], span: Optional[Span] = None
+    ) -> None:
         self.__init_handle_by_constructor__(
             _ffi_api.BufferLoad, buffer, indices, span  # type: ignore
         )
@@ -1071,10 +1123,15 @@ class ProducerLoad(PrimExprWithOp):
         The buffer indices.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, producer, indices, span=None):
+    producer: DataProducer
+    indices: List[PrimExpr]
+
+    def __init__(
+        self, producer: DataProducer, indices: List[PrimExpr], span: Optional[Span] = None
+    ) -> None:
         self.__init_handle_by_constructor__(
             _ffi_api.ProducerLoad, producer, indices, span  # type: ignore
         )
@@ -1096,10 +1153,16 @@ class Ramp(PrimExprWithOp):
         The lanes of the expression.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, base, stride, lanes, span=None):
+    base: PrimExpr
+    stride: PrimExpr
+    lanes: int
+
+    def __init__(
+        self, base: PrimExpr, stride: PrimExpr, lanes: int, span: Optional[Span] = None
+    ) -> None:
         self.__init_handle_by_constructor__(
             _ffi_api.Ramp, base, stride, lanes, span  # type: ignore
         )
@@ -1118,10 +1181,13 @@ class Broadcast(PrimExprWithOp):
         The lanes of the expression.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, value, lanes, span=None):
+    value: PrimExpr
+    lanes: int
+
+    def __init__(self, value: PrimExpr, lanes: int, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Broadcast, value, lanes, span)  # type: ignore
 
 
@@ -1131,17 +1197,22 @@ class Shuffle(PrimExprWithOp):
 
     Parameters
     ----------
-    vectors : Array of Expr
+    vectors : List[PrimExpr]
         The vectors
 
-    indices : Array of indices
+    indices : List[PrimExpr]
         The indices
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, vectors, indices, span=None):
+    vectors: List[PrimExpr]
+    indices: List[PrimExpr]
+
+    def __init__(
+        self, vectors: List[PrimExpr], indices: List[PrimExpr], span: Optional[Span] = None
+    ) -> None:
         self.__init_handle_by_constructor__(
             _ffi_api.Shuffle, vectors, indices, span  # type: ignore
         )
@@ -1167,7 +1238,7 @@ class Call(PrimExprWithOp):
     dtype : str
         The return data type
 
-    op : Union[RelayExpr, str]
+    op : Union[Op, str]
         The function to be called, or the name
         to the global tvm.Op
 
@@ -1175,10 +1246,15 @@ class Call(PrimExprWithOp):
         The input arguments to the call
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, dtype, op, args, span=None):
+    op: Op
+    args: List[PrimExpr]
+
+    def __init__(
+        self, dtype: str, op: Union[Op, str], args: List[PrimExpr], span: Optional[Span] = None
+    ) -> None:
         if isinstance(op, str):
             if not op.startswith("tir."):
                 raise ValueError(
@@ -1203,16 +1279,22 @@ class Let(PrimExprWithOp):
         The variable in the binding.
 
     value : PrimExpr
-        The value in to be binded.
+        The value in to be bound.
 
     body : PrimExpr
         The body expression.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, var, value, body, span=None):
+    var: Var
+    value: PrimExpr
+    body: PrimExpr
+
+    def __init__(
+        self, var: Var, value: PrimExpr, body: PrimExpr, span: Optional[Span] = None
+    ) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Let, var, value, body, span)  # type: ignore
 
 
@@ -1221,8 +1303,8 @@ class Any(PrimExprWithOp):
     """Any node.
 
     span : Optional[Span]
-        The location of this itervar in the source code.
+        The location of this expression in the source code.
     """
 
-    def __init__(self, span=None):
+    def __init__(self, span: Optional[Span] = None) -> None:
         self.__init_handle_by_constructor__(_ffi_api.Any, span)  # type: ignore

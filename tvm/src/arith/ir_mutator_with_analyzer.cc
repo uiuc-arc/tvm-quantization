@@ -22,6 +22,7 @@
  */
 #include "ir_mutator_with_analyzer.h"
 
+#include <tvm/arith/iter_affine_map.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/op.h>
 
@@ -30,8 +31,47 @@ namespace arith {
 
 using namespace tir;
 
+void IRMutatorWithAnalyzer::MarkBufferMapShapes(const tir::PrimFunc& func) {
+  // Mark the all the symbolic buffer shape values in the buffer map as positive value.
+  for (auto kv : func->buffer_map) {
+    for (PrimExpr shape : kv.second->shape) {
+      analyzer_->MarkGlobalNonNegValue(shape);
+    }
+  }
+}
+
+Array<PrimExpr> IRMutatorWithAnalyzer::IterMapSimplifyWithContext(const Array<PrimExpr>& indices,
+                                                                  bool non_trivial_only) {
+  PrimExpr pred = const_true();
+  for (PrimExpr val : iter_predicates_) {
+    pred = pred && val;
+  }
+  int n = indices.size();
+  Array<PrimExpr> simplified = arith::IterMapSimplify(
+      indices, this->iter_vars_, pred, arith::IterMapLevel::Surjective, this->analyzer_);
+  if (non_trivial_only) {
+    for (int i = 0; i < n; ++i) {
+      if (simplified[i]->IsInstance<IntImmNode>() && indices[i]->IsInstance<VarNode>()) {
+        simplified.Set(i, indices[i]);
+      }
+    }
+  }
+  return simplified;
+}
+
 Stmt IRMutatorWithAnalyzer::VisitStmt_(const ForNode* op) {
-  analyzer_->Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
+  // record the loop variable as iterators
+  Range dom = Range::FromMinExtent(op->min, op->extent);
+  analyzer_->Bind(op->loop_var, dom);
+  iter_vars_.Set(op->loop_var, dom);
+  return StmtExprMutator::VisitStmt_(op);
+}
+
+Stmt IRMutatorWithAnalyzer::VisitStmt_(const BlockNode* op) {
+  for (const auto& iter_var : op->iter_vars) {
+    analyzer_->Bind(iter_var->var, iter_var->dom);
+    iter_vars_.Set(iter_var->var, iter_var->dom);
+  }
   return StmtExprMutator::VisitStmt_(op);
 }
 
@@ -64,21 +104,19 @@ Stmt IRMutatorWithAnalyzer::VisitStmt_(const IfThenElseNode* op) {
     }
   }
 
-  Stmt then_case, else_case;
+  Stmt then_case;
+  Optional<Stmt> else_case;
   {
     With<ConstraintContext> ctx(analyzer_, real_condition);
-    then_case = this->VisitStmt(op->then_case);
+    WithRecordIterPredicate(real_condition, [&] { then_case = this->VisitStmt(op->then_case); });
   }
-  if (op->else_case.defined()) {
+  if (op->else_case) {
     With<ConstraintContext> ctx(analyzer_, analyzer_->rewrite_simplify(Not(real_condition)));
-    else_case = this->VisitStmt(op->else_case);
+    else_case = this->VisitStmt(op->else_case.value());
   }
   if (is_one(real_condition)) return then_case;
   if (is_zero(real_condition)) {
-    if (else_case.defined()) {
-      return else_case;
-    }
-    return Evaluate(0);
+    return else_case.value_or(Evaluate(0));
   }
 
   if (condition.same_as(op->condition) && then_case.same_as(op->then_case) &&
@@ -97,7 +135,9 @@ Stmt IRMutatorWithAnalyzer::VisitStmt_(const AttrStmtNode* op) {
   if (op->attr_key == tir::attr::thread_extent || op->attr_key == tir::attr::virtual_thread) {
     IterVar iv = Downcast<IterVar>(op->node);
     ICHECK_NE(iv->thread_tag.length(), 0U);
-    analyzer_->Bind(iv->var, Range::FromMinExtent(0, op->value));
+    Range dom = Range::FromMinExtent(make_zero(op->value.dtype()), op->value);
+    analyzer_->Bind(iv->var, dom);
+    iter_vars_.Set(iv->var, dom);
     Stmt stmt = StmtExprMutator::VisitStmt_(op);
     return stmt;
   } else {
@@ -130,11 +170,12 @@ PrimExpr IRMutatorWithAnalyzer::VisitExpr_(const CallNode* op) {
     PrimExpr true_value, false_value;
     {
       With<ConstraintContext> constraint(analyzer_, cond);
-      true_value = this->VisitExpr(op->args[1]);
+      WithRecordIterPredicate(cond, [&] { true_value = this->VisitExpr(op->args[1]); });
     }
     {
-      With<ConstraintContext> constraint(analyzer_, analyzer_->rewrite_simplify(Not(cond)));
-      false_value = this->VisitExpr(op->args[2]);
+      PrimExpr not_cond = Not(cond);
+      With<ConstraintContext> constraint(analyzer_, not_cond);
+      WithRecordIterPredicate(not_cond, [&] { false_value = this->VisitExpr(op->args[2]); });
     }
     if (is_zero(cond)) {
       return false_value;

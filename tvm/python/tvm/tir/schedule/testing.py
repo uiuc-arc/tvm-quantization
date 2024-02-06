@@ -14,12 +14,33 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# pylint: disable=dangerous-default-value
 """Testing utilities for the TensorIR schedule API"""
-from typing import Union
+from typing import Any, Sequence, Union
 
-from tvm.ir import IRModule, structural_equal
+import tvm
+from tvm.ir import IRModule, assert_structural_equal
 from tvm.tir import PrimFunc
-from tvm.tir.schedule import Trace, Schedule
+from tvm.tir.schedule import Schedule, Trace
+
+
+def assert_structural_equal_ignore_global_symbol(
+    func1: PrimFunc,
+    func2: PrimFunc,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    """
+    Asserts that PrimFuncs func1 and func2 are structurally equal, setting both
+    their global symbol attributes to main so that the global symbol
+    will not be a point of comparison.
+    """
+    assert_structural_equal(
+        func1.with_attr("global_symbol", "main"),
+        func2.with_attr("global_symbol", "main"),
+        *args,
+        **kwargs,
+    )
 
 
 def verify_trace_roundtrip(
@@ -27,6 +48,7 @@ def verify_trace_roundtrip(
     mod: Union[PrimFunc, IRModule],
     *,
     debug_mask: Union[str, int] = "all",
+    text_format: Union[str, Sequence[str]] = ["python", "json"],
 ) -> Schedule:
     """Serialize a traced schedule to JSON, then replay the JSON trace by applying to
     a fresh new schedule, verifying the reproducibility of scheduling.
@@ -44,18 +66,40 @@ def verify_trace_roundtrip(
         1) "all" - Turn on all the checks
         2) "none" - Turn off all the checks
         3) An integer - Turn on checks according to the bitmasks provided in ScheduleDebugMask
+    text_format: Union[str, Sequence[str]]
+        The text format or formats whose round-trip behavior should be
+        validated.  If a single string, validate round-trips through
     """
-    # Step 1. Serialize the trace to JSON
+    from tvm.script import tir as T  # pylint: disable=import-outside-toplevel
+
+    if not isinstance(text_format, str):
+        for opt in text_format:
+            new_sch = verify_trace_roundtrip(sch, mod, debug_mask=debug_mask, text_format=opt)
+        return new_sch
+
     trace = sch.trace
     assert trace is not None
-    json_obj = trace.as_json()
-    # Step 2. Apply the JSON trace to a new schedule, then check if it reproduces the scheduling
+
+    # Step 1. Perform a round-trip through the text-format
     new_sch = Schedule(mod=mod, debug_mask=debug_mask)
-    Trace.apply_json_to_schedule(json_obj=json_obj, sch=new_sch)
-    assert structural_equal(new_sch.mod, sch.mod)
+    if text_format == "json":
+        json_obj = trace.as_json()
+        Trace.apply_json_to_schedule(json_obj=json_obj, sch=new_sch)
+    elif text_format == "python":
+        py_trace = "\n".join(trace.as_python())
+        vars_dict = {"T": T}
+        vars_dict.update(tvm.tir.__dict__)
+        exec(py_trace, vars_dict, {"sch": new_sch})  # pylint: disable=exec-used
+    else:
+        assert text_format in ("json", "python"), f"Unknown text format: {text_format}"
+
+    # Step 2. Verify that the round-trip produced the same scheduling
+    assert_structural_equal(new_sch.mod, sch.mod)
+
     # Step 3. Check the consistency of the text format between the old and new traces
     py_repr = "\n".join(trace.as_python())
     new_py_repr = "\n".join(new_sch.trace.as_python())
     assert py_repr == new_py_repr
+
     # Step 4. Return the new schedule in case it could be useful
     return new_sch

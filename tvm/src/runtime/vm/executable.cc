@@ -55,81 +55,26 @@ VMInstructionSerializer SerializeInstruction(const Instruction& instr);
 // Helper to deserialize a serialized vm instruction.
 Instruction DeserializeInstruction(const VMInstructionSerializer& instr);
 
-PackedFunc Executable::GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self) {
-  if (name == "get_lib") {
-    return PackedFunc(
-        [sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->GetLib(); });
-  } else if (name == "get_bytecode") {
-    return PackedFunc(
-        [sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->GetBytecode(); });
-  } else if (name == "get_constants") {
-    return PackedFunc([this](TVMArgs args, TVMRetValue* rv) { *rv = this->GetConstants(); });
-  } else if (name == "get_virtual_devices") {
-    return PackedFunc([this](TVMArgs args, TVMRetValue* rv) { *rv = this->GetVirtualDevices(); });
-  } else if (name == "get_primitives") {
-    return PackedFunc([this](TVMArgs args, TVMRetValue* rv) { *rv = this->GetPrimitives(); });
-  } else if (name == "get_stats") {
-    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->Stats(); });
-  } else if (name == "save") {
-    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->Save(); });
-  } else if (name == "get_function_arity") {
-    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
-      std::string func_name = args[0];
-      *rv = this->GetFunctionArity(func_name);
-    });
-  } else if (name == "get_function_param_name") {
-    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
-      std::string func_name = args[0];
-      int index = args[1];
-      *rv = this->GetFunctionParameterName(func_name, index);
-    });
-  } else if (name == "vm_load_executable") {
-    return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
-      auto vm = make_object<VirtualMachine>();
-      ICHECK(sptr_to_self.get() == this);
-      vm->LoadExecutable(GetObjectPtr<Executable>(this));
-      *rv = Module(vm);
-    });
-  } else if (name == "move_late_bound_consts") {
-    return PackedFunc([this](TVMArgs args, TVMRetValue* rv) {
-      CHECK_EQ(args.size(), 2);
-      std::string path = args[0];
-      uint64_t byte_limit = args[1];
-      MoveLateBoundConstantsToFile(path, static_cast<size_t>(byte_limit));
-    });
-  } else if (name == "load_late_bound_consts") {
-    return PackedFunc([this](TVMArgs args, TVMRetValue* rv) {
-      CHECK_EQ(args.size(), 1);
-      std::string path = args[0];
-      LoadLateBoundConstantsFromFile(path);
-    });
-  } else {
-    LOG(FATAL) << "Unknown packed function: " << name;
-    return PackedFunc(nullptr);
-  }
+const VMFunction& Executable::GetVMFunctionWithName(const std::string& func_name) const {
+  auto it = global_map.find(func_name);
+  ICHECK(it != global_map.end()) << "Cannot find function " << func_name << " in executable";
+  return functions[it->second];
+}
+
+Module Executable::VMLoadExecutable() {
+  auto vm = make_object<VirtualMachine>();
+  vm->LoadExecutable(GetObjectPtr<Executable>(this));
+  return Module(vm);
 }
 
 int Executable::GetFunctionArity(std::string func_name) const {
-  auto it = global_map.find(func_name);
-  if (it == global_map.end()) {
-    LOG(ERROR) << "Cannot find function " << func_name << " in executable";
-    return -1;
-  }
-  const auto& func = functions[it->second];
+  const auto& func = GetVMFunctionWithName(func_name);
   return func.params.size();
 }
 
-std::string Executable::GetFunctionParameterName(std::string func_name, uint32_t index) const {
-  auto it = global_map.find(func_name);
-  if (it == global_map.end()) {
-    LOG(ERROR) << "Cannot find function " << func_name << " in executable";
-    return "";
-  }
-  const auto& func = functions[it->second];
-  if (index > func.params.size()) {
-    LOG(ERROR) << "Invalid parameter index";
-    return "";
-  }
+std::string Executable::GetFunctionParameterName(std::string func_name, int index) const {
+  const auto& func = GetVMFunctionWithName(func_name);
+  ICHECK_LT(index, func.params.size()) << "Invalid parameter index";
   return func.params[index];
 }
 
@@ -179,7 +124,7 @@ std::string Executable::GetConstants() const {
     const auto& constant = constants[i];
     auto ndarray = Downcast<NDArray>(constant);
     oss << "VM Const[" << i
-        << "]: " << RuntimeObject2String(ndarray, virtual_devices[host_device_index])
+        << "]: " << RuntimeObject2String(ndarray, virtual_devices[host_device_index].first)
         << " on device index " << const_device_indexes[i] << std::endl;
   }
   return oss.str();
@@ -188,9 +133,9 @@ std::string Executable::GetConstants() const {
 std::string Executable::GetVirtualDevices() const {
   std::ostringstream oss;
   for (size_t i = 0; i < virtual_devices.size(); ++i) {
-    const auto& device = virtual_devices[i];
-    oss << "VM VirtualDevice[" << i << "]: device type " << device.device_type << " and id "
-        << device.device_id << std::endl;
+    const auto& [device, scope] = virtual_devices[i];
+    oss << "VM VirtualDevice[" << i << "]: device type " << device.device_type << ", id "
+        << device.device_id << " and mem_scope " << scope << std::endl;
   }
   return oss.str();
 }
@@ -307,7 +252,7 @@ void Executable::SaveVirtualDevicesSection(dmlc::Stream* strm) {
   strm->Write(host_device_index);
 }
 
-void Executable::MoveLateBoundConstantsToStream(dmlc::Stream* stream, size_t byte_limit) {
+Map<String, NDArray> Executable::GetLateBoundConstants(int64_t byte_limit) {
   ICHECK(late_bound_constant_names.empty());
   late_bound_constant_names.reserve(constants.size());
   Map<String, NDArray> map;
@@ -315,7 +260,7 @@ void Executable::MoveLateBoundConstantsToStream(dmlc::Stream* stream, size_t byt
   for (size_t const_index = 0; const_index < constants.size(); ++const_index) {
     const auto ndarray = Downcast<NDArray>(constants[const_index]);
     ICHECK(ndarray.defined()) << "Undefined constant at index " << const_index;
-    size_t num_bytes = runtime::GetDataSize(*ndarray.operator->());
+    int64_t num_bytes = runtime::GetDataSize(*ndarray.operator->());
     if (num_bytes < byte_limit) {
       // Leave as immediate.
       late_bound_constant_names.emplace_back(nullptr);
@@ -330,14 +275,17 @@ void Executable::MoveLateBoundConstantsToStream(dmlc::Stream* stream, size_t byt
   }
   VLOG(1) << "moved " << map.size() << " constants of " << total_late_bound_bytes
           << " bytes (out of " << constants.size() << " overall) to be late-bound";
+  return map;
+}
+
+void Executable::MoveLateBoundConstantsToStream(dmlc::Stream* stream, int64_t byte_limit) {
+  Map<String, NDArray> map = GetLateBoundConstants(byte_limit);
   runtime::SaveParams(stream, map);
 }
 
-void Executable::MoveLateBoundConstantsToFile(const std::string& path, size_t byte_limit) {
-  std::string bytes;
-  dmlc::MemoryStringStream stream(&bytes);
+void Executable::MoveLateBoundConstantsToFile(const std::string& path, int64_t byte_limit) {
+  tvm::runtime::SimpleBinaryFileStream stream(path, "wb");
   MoveLateBoundConstantsToStream(&stream, byte_limit);
-  SaveBinaryToFile(path, bytes);
 }
 
 void Executable::LoadLateBoundConstantsFromStream(dmlc::Stream* stream) {
@@ -348,6 +296,10 @@ void Executable::LoadLateBoundConstantsFromStream(dmlc::Stream* stream) {
   ICHECK_EQ(late_bound_constant_names.size(), constants.size());
   Map<String, NDArray> map = runtime::LoadParams(stream);
   VLOG(1) << "loaded " << map.size() << " late-bound constants";
+  LoadLateBoundConstantsFromMap(map);
+}
+
+void Executable::LoadLateBoundConstantsFromMap(Map<String, NDArray> map) {
   for (size_t const_index = 0; const_index < constants.size(); ++const_index) {
     if (!late_bound_constant_names[const_index].defined()) {
       ICHECK(constants[const_index].defined())
@@ -367,9 +319,7 @@ void Executable::LoadLateBoundConstantsFromStream(dmlc::Stream* stream) {
 }
 
 void Executable::LoadLateBoundConstantsFromFile(const std::string& path) {
-  std::string bytes;
-  LoadBinaryFromFile(path, &bytes);
-  dmlc::MemoryStringStream stream(&bytes);
+  tvm::runtime::SimpleBinaryFileStream stream(path, "rb");
   LoadLateBoundConstantsFromStream(&stream);
 }
 
@@ -587,7 +537,13 @@ VMInstructionSerializer SerializeInstruction(const Instruction& instr) {
       fields.push_back(dtype.bits);
       fields.push_back(dtype.lanes);
       fields.push_back(instr.alloc_storage.device_index);
+      fields.push_back(instr.alloc_storage.ndim);
       fields.push_back(instr.dst);
+
+      // Save the shape of the tensor.
+      // Note that this field is rotated to the end of the list.
+      fields.insert(fields.end(), instr.alloc_storage.shape,
+                    instr.alloc_storage.shape + instr.alloc_storage.ndim);
       break;
     }
     case Opcode::AllocADT: {
@@ -630,8 +586,8 @@ VMInstructionSerializer SerializeInstruction(const Instruction& instr) {
       break;
     }
     case Opcode::LoadConst: {
-      // Number of fields = 2
-      fields.assign({instr.const_index, instr.dst});
+      // Number of fields = 3
+      fields.assign({instr.const_index, instr.device_index, instr.dst});
       break;
     }
     case Opcode::LoadConsti: {
@@ -668,6 +624,10 @@ VMInstructionSerializer SerializeInstruction(const Instruction& instr) {
       // Number of fields = 4
       fields.assign({instr.device_copy.src, instr.device_copy.src_device_index,
                      instr.device_copy.dst_device_index, instr.dst});
+      break;
+    }
+    case Opcode::KillRegister: {
+      fields.assign({instr.dst});
       break;
     }
     default:
@@ -897,8 +857,8 @@ Instruction DeserializeInstruction(const VMInstructionSerializer& instr) {
       return Instruction::AllocClosure(clo_index, num_freevar, free_vars, dst);
     }
     case Opcode::AllocStorage: {
-      // Number of fields = 7
-      DCHECK_GE(instr.fields.size(), 7U);
+      // Number of fields = 9
+      DCHECK_GE(instr.fields.size(), 9U);
       Index allocation_size = instr.fields[0];
       Index alignment = instr.fields[1];
 
@@ -908,9 +868,11 @@ Instruction DeserializeInstruction(const VMInstructionSerializer& instr) {
       dtype.lanes = instr.fields[4];
 
       Index device_type = instr.fields[5];
-      RegName dst = instr.fields[6];
+      Index ndim = instr.fields[6];
+      RegName dst = instr.fields[7];
+      std::vector<Index> shape = ExtractFields(instr.fields, 8, ndim);
 
-      return Instruction::AllocStorage(allocation_size, alignment, dtype, device_type, dst);
+      return Instruction::AllocStorage(allocation_size, alignment, dtype, device_type, shape, dst);
     }
     case Opcode::If: {
       // Number of fields = 4
@@ -947,9 +909,9 @@ Instruction DeserializeInstruction(const VMInstructionSerializer& instr) {
       return Instruction::InvokeClosure(closure, args, dst);
     }
     case Opcode::LoadConst: {
-      // Number of fields = 2
-      DCHECK_EQ(instr.fields.size(), 2U);
-      return Instruction::LoadConst(instr.fields[0], instr.fields[1]);
+      // Number of fields = 3
+      DCHECK_EQ(instr.fields.size(), 3U);
+      return Instruction::LoadConst(instr.fields[0], instr.fields[1], instr.fields[2]);
     }
     case Opcode::LoadConsti: {
       // Number of fields = 2
@@ -987,9 +949,12 @@ Instruction DeserializeInstruction(const VMInstructionSerializer& instr) {
       return Instruction::DeviceCopy(instr.fields[0], instr.fields[1], instr.fields[2],
                                      instr.fields[3]);
     }
+    case Opcode::KillRegister: {
+      DCHECK_EQ(instr.fields.size(), 1U);
+      return Instruction::KillRegister(instr.fields[0]);
+    }
     default:
       LOG(FATAL) << "Invalid opcode" << instr.opcode;
-      return Instruction();
   }
 }
 
@@ -1041,23 +1006,17 @@ Module ExecutableLoadBinary(void* strm) {
   return exec;
 }
 
-void Executable::SaveToFile(const std::string& path, const std::string& format) {
-  std::string data;
-  dmlc::MemoryStringStream writer(&data);
-  dmlc::SeekStream* strm = &writer;
-  SaveToBinary(strm);
-  SaveBinaryToFile(path, data);
+void Executable::SaveToFile(const String& path, const String& format) {
+  tvm::runtime::SimpleBinaryFileStream stream(path, "wb");
+  SaveToBinary(&stream);
 }
 
 TVM_REGISTER_GLOBAL("runtime.module.loadbinary_VMExecutable").set_body_typed(ExecutableLoadBinary);
 
 // Load module from module.
-Module ExecutableLoadFile(const std::string& file_name, const std::string& format) {
-  std::string data;
-  LoadBinaryFromFile(file_name, &data);
-  dmlc::MemoryStringStream reader(&data);
-  dmlc::Stream* strm = &reader;
-  auto exec = ExecutableLoadBinary(reinterpret_cast<void*>(strm));
+Module ExecutableLoadFile(const std::string& file_name, const String& format) {
+  tvm::runtime::SimpleBinaryFileStream stream(file_name, "rb");
+  auto exec = ExecutableLoadBinary(reinterpret_cast<void*>(&stream));
   return exec;
 }
 

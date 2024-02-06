@@ -17,11 +17,14 @@
 import os
 import pytest
 import tarfile
+import textwrap
 
 import numpy as np
 
 from PIL import Image
 
+import tvm
+from tvm import relay
 from tvm.driver import tvmc
 
 from tvm.contrib.download import download_testdata
@@ -145,7 +148,7 @@ def pytorch_mobilenetv2_quantized(tmpdir_factory):
 
 @pytest.fixture(scope="session")
 def onnx_resnet50():
-    base_url = "https://github.com/onnx/models/raw/master/vision/classification/resnet/model"
+    base_url = "https://github.com/onnx/models/raw/bd206494e8b6a27b25e5cf7199dbcdbfe9d05d1c/vision/classification/resnet/model"
     file_to_download = "resnet50-v2-7.onnx"
     model_file = download_testdata(
         "{}/{}".format(base_url, file_to_download), file_to_download, module=["tvmc"]
@@ -160,7 +163,7 @@ def paddle_resnet50(tmpdir_factory):
     model_url = "paddle_resnet50.tar"
     model_file = download_and_untar(
         "{}/{}".format(base_url, model_url),
-        "paddle_resnet50/model",
+        "paddle_resnet50/model.pdmodel",
         temp_dir=tmpdir_factory.mktemp("data"),
     )
     return model_file
@@ -168,7 +171,7 @@ def paddle_resnet50(tmpdir_factory):
 
 @pytest.fixture(scope="session")
 def onnx_mnist():
-    base_url = "https://github.com/onnx/models/raw/master/vision/classification/mnist/model"
+    base_url = "https://github.com/onnx/models/raw/bd206494e8b6a27b25e5cf7199dbcdbfe9d05d1c/vision/classification/mnist/model"
     file_to_download = "mnist-1.onnx"
     model_file = download_testdata(
         "{}/{}".format(base_url, file_to_download), file_to_download, module=["tvmc"]
@@ -184,6 +187,22 @@ def tflite_compile_model(tmpdir_factory):
     def model_compiler(model_file, **overrides):
         package_path = tmpdir_factory.mktemp("data").join("mock.tar")
         tvmc_model = tvmc.frontends.load_model(model_file)
+        args = {"target": "llvm", **overrides}
+        return tvmc.compiler.compile_model(tvmc_model, package_path=package_path, **args)
+
+    # Returns a TVMCPackage
+    return model_compiler
+
+
+@pytest.fixture
+def relay_compile_model(tmpdir_factory):
+    """Support function that returns a TFLite compiled module"""
+
+    def model_compiler(model_file, shape_dict, **overrides):
+        package_path = tmpdir_factory.mktemp("data").join("mock.tar")
+        tvmc_model = tvmc.frontends.load_model(
+            model_file, model_format="relay", shape_dict=shape_dict
+        )
         args = {"target": "llvm", **overrides}
         return tvmc.compiler.compile_model(tvmc_model, package_path=package_path, **args)
 
@@ -223,9 +242,61 @@ def tflite_mobilenet_v1_0_25_128(tmpdir_factory):
 
 @pytest.fixture(scope="session")
 def tflite_cnn_s_quantized(tmpdir_factory):
-    base_url = "https://github.com/ARM-software/ML-zoo/raw/master/models/keyword_spotting/cnn_small/tflite_int8/"
+    base_url = "https://github.com/ARM-software/ML-zoo/raw/48a22ee22325d15d2371a6df24eb7d67e21dcc97/models/keyword_spotting/cnn_small/tflite_int8"
     file_to_download = "cnn_s_quantized.tflite"
     model_file = download_testdata(
         "{}/{}".format(base_url, file_to_download), file_to_download, module=["tvmc"]
     )
     return model_file
+
+
+@pytest.fixture(scope="session")
+def relay_text_conv2d(tmpdir_factory):
+    file_path = os.path.join(tmpdir_factory.mktemp("model"), "relay.txt")
+
+    RELAY_MODEL = textwrap.dedent(
+        """\
+        #[version = "0.0.5"]
+        def @main(%data : Tensor[(1, 3, 64, 64), uint8], %weight : Tensor[(3, 3, 5, 5), int8]) {
+            %1 = nn.conv2d(
+                 %data,
+                 %weight,
+                 padding=[2, 2],
+                 channels=3,
+                 kernel_size=[5, 5],
+                 data_layout="NCHW",
+                 kernel_layout="OIHW",
+                 out_dtype="int32");
+            %2 = cast(nn.max_pool2d(%1, pool_size=[3, 3]), dtype="int8");
+            %3 = nn.conv2d(
+                 %2,
+                 %weight,
+                 padding=[2, 2],
+                 channels=3,
+                 kernel_size=[5, 5],
+                 data_layout="NCHW",
+                 kernel_layout="OIHW",
+                 out_dtype="int32");
+            %4 = nn.max_pool2d(%3, pool_size=[3, 3]);
+            %4
+        }
+    """
+    )
+
+    with open(file_path, "w") as relay_text:
+        relay_text.write(RELAY_MODEL)
+    return file_path
+
+
+@pytest.fixture(scope="session")
+def relay_conv2d():
+    """
+    Simple conv2d Relay implementation.
+    """
+    dtype = "float32"
+
+    x = relay.var("x", shape=(1, 4, 2, 2), dtype=dtype)
+    weight = relay.const(np.random.uniform(size=(2, 4, 2, 2)), dtype=dtype)
+    x = relay.nn.conv2d(x, weight)
+    func = relay.Function(relay.analysis.free_vars(x), x)
+    return tvm.IRModule.from_expr(func)

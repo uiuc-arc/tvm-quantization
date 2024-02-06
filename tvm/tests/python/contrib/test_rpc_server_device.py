@@ -16,7 +16,6 @@
 # under the License.
 """iOS RPC Server tests."""
 # pylint: disable=invalid-name, no-value-for-parameter, missing-function-docstring, import-error
-import sys
 import multiprocessing
 import pytest
 import numpy as np
@@ -440,4 +439,4 @@ def test_check_auto_schedule_tuning(host, port):  # pylint: disable=too-many-loc
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__] + sys.argv[1:]))
+    tvm.testing.main()

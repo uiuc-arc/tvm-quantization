@@ -71,7 +71,7 @@ std::vector<const Object*> GetPath(PrimExpr target, PrimExpr expr) {
 enum CompareOp { kGreater, kLess, kEqual };
 
 // a visitor to deduce the bound of a variable from a expression
-class BoundDeducer : public ExprVisitor {
+class BoundDeducer : public ExprFunctor<void(const PrimExpr&)> {
  public:
   friend class BoundDeduceInputChecker;
   friend class Converter;
@@ -85,20 +85,23 @@ class BoundDeducer : public ExprVisitor {
   void VisitExpr(const PrimExpr& e) final {
     if (!success_) return;
     if (iter_ < path_.size() && e.get() == path_[iter_++]) {
-      ExprVisitor::VisitExpr(e);
+      ExprFunctor::VisitExpr(e);
     } else {
       success_ = false;
       return;
     }
   }
 
-  void VisitExpr_(const LTNode* op) final { success_ = false; }
+  void VisitExprDefault_(const Object* op) final { success_ = false; }
 
-  void VisitExpr_(const LENode* op) final { success_ = false; }
+  SignType GetSignType(const PrimExpr& e) {
+    if (e.dtype().is_uint()) {
+      return kPositive;
+    }
+    return expr_map_[e].GetSignType();
+  }
 
-  void VisitExpr_(const GTNode* op) final { success_ = false; }
-
-  void VisitExpr_(const GENode* op) final { success_ = false; }
+  void VisitExpr_(const VarNode* op) final {}
 
   void VisitExpr_(const AddNode* op) final {
     bool left = op->a.get() == path_[iter_];
@@ -123,13 +126,7 @@ class BoundDeducer : public ExprVisitor {
     PrimExpr operand = left ? op->b : op->a;
     PrimExpr target_var = left ? op->a : op->b;
 
-    SignType sign_operand;
-    if (operand.dtype().is_uint()) {
-      sign_operand = kPositive;
-    } else {
-      sign_operand = expr_map_[operand].GetSignType();
-    }
-
+    SignType sign_operand = GetSignType(operand);
     if (sign_operand == SignType::kNegative) {
       comp_op = ReverseOp(comp_op);
     } else if (sign_operand == SignType::kUnknown) {
@@ -164,6 +161,52 @@ class BoundDeducer : public ExprVisitor {
       }
     }
     this->VisitExpr(left ? op->a : op->b);
+  }
+
+  void VisitExpr_(const FloorDivNode* op) final {
+    if (op->b.get() == path_[iter_]) {
+      // Skip cases where the var is divisor.
+      success_ = false;
+      return;
+    }
+    PrimExpr divisor = op->b;
+    if (analyzer_.CanProveEqual(divisor, 0)) {
+      // Skip zero divisor
+      success_ = false;
+      return;
+    }
+
+    SignType sign_operand = GetSignType(divisor);
+    if (sign_operand == SignType::kNegative) {
+      comp_op = ReverseOp(comp_op);
+      divisor = -divisor;
+      result_ = -result_;
+    } else if (sign_operand == SignType::kUnknown) {
+      // unable to get the sign of operand
+      success_ = false;
+      return;
+    }
+
+    if (comp_op == kGreater) {
+      // (x // 6 >= 4 --> x >= 4 * 6)
+      result_ = result_ * divisor;
+    } else if (comp_op == kEqual) {
+      // The bound is not single directional
+      // (x // 6 == 4 --> 30 > x >= 24)
+      // TODO(@wrongtest): support bidirectional bound
+      success_ = false;
+      return;
+    } else {
+      // (x // 6 <= 4 --> x <= 4 * 6 + 5)
+      result_ = result_ * divisor + divisor - 1;
+    }
+    if (sign_operand == SignType::kNegative) {
+      // (x // -6 >= 4 --> -((x + 6 - 1) // 6) >= 4
+      //               --> (x + 6 - 1) // 6 <= -4
+      result_ = result_ - divisor + 1;
+    }
+
+    this->VisitExpr(op->a);
   }
 
   PrimExpr result_;
@@ -220,7 +263,6 @@ CompareOp BoundDeducer::ReverseOp(CompareOp comp_op) {
       return kGreater;
     default:
       LOG(FATAL) << "Not a valid compare op";
-      return kGreater;  // return some default value
   }
 }
 
@@ -302,6 +344,10 @@ void BoundDeducer::Deduce() {
   expr_map_ = EvalSetForEachSubExpr(expr_, hint_map_);
 
   this->VisitExpr(expr_);
+
+  if (success_) {
+    result_ = analyzer_.Simplify(result_);
+  }
 }
 
 void BoundDeducer::Relax() {

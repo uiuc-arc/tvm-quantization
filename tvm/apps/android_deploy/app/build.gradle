@@ -20,14 +20,41 @@ project.ext.ASSET_DIR = projectDir.toString() + '/src/main/assets'
 project.ext.TMP_DIR   = project.buildDir.toString() + '/downloads'
 
 // Download default models(darknet framework extraction model compiled version);
-// if you wish to use your own models then place them in the "assets" directory 
+// if you wish to use your own models then place them in the "assets" directory
 // and comment out this line.
 apply from: "download-models.gradle"
 
 apply plugin: 'com.android.application'
 
+task generateJniHeaders(type: Exec, description: 'Generate JNI Headers') {
+    def headerPath = "${project.projectDir}/src/main/jni"
+    def classPath = "${project.projectDir}/../../../jvm/core/target/*"
+    def filePath = "${project.projectDir}/../../../jvm/core/src/main/java/org/apache/tvm/LibInfo.java"
+    commandLine "javac", "-h", headerPath, "-classpath", classPath, filePath
+    doLast {
+        file("${headerPath}/org_apache_tvm_LibInfo.h").renameTo(file("${headerPath}/org_apache_tvm_native_c_api.h"))
+    }
+}
+
+task copyFiles(type: Copy, description: 'Copy Sources for ndk-build') {
+    dependsOn "generateJniHeaders"
+    def ndkFilesPath = "${project.projectDir}/../../../jvm/native/src/main/native"
+    def srcPath = "${project.projectDir}/src/main/jni/"
+
+    from "${ndkFilesPath}/org_apache_tvm_native_c_api.cc", "${ndkFilesPath}/jni_helper_func.h"
+    into srcPath
+}
+
+task deleteLibs(type: Delete, description: "Delete Compiled Libraries") {
+    dependsOn "copyFiles"
+    def libsPath = "${project.projectDir}/src/main/libs"
+    delete libsPath
+}
+
 task buildJni(type: Exec, description: 'Build JNI libs') {
-    commandLine 'sh', 'src/main/jni/build.sh'
+    dependsOn "deleteLibs"
+    def buildPath = "${project.projectDir}/src/main/jni"
+    commandLine "ndk-build", "--directory", buildPath
 }
 
 tasks.withType(JavaCompile) {
@@ -35,15 +62,14 @@ tasks.withType(JavaCompile) {
 }
 
 android {
-    compileSdkVersion 26
-    buildToolsVersion "26.0.1"
+    compileSdkVersion 33
     defaultConfig {
         applicationId "org.apache.tvm.android.demo"
-        minSdkVersion 17
-        targetSdkVersion 26
+        minSdkVersion 24
+        targetSdkVersion 33
         versionCode 1
         versionName "1.0"
-        testInstrumentationRunner "android.support.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
     buildTypes {
         release {
@@ -55,19 +81,25 @@ android {
         main {
             jni.srcDirs = []
             jniLibs.srcDirs = ['src/main/libs']
-            assets.srcDirs = [project.ext.ASSET_DIR]
         }
     }
+    lint {
+        disable 'Instantiatable' // MainActivity and RPCActivity must extend android.app.Activity
+        disable 'MissingApplicationIcon' // Should explicitly set android:icon, there is no default
+        disable 'UnsafeNativeCodeLocation' // Shared libraries should not be placed in the res or assets directories.
+    }
+    namespace 'org.apache.tvm.android.demo'
+
 }
 
 dependencies {
-    compile fileTree(dir: 'libs', include: ['*.jar'])
-    androidTestCompile('com.android.support.test.espresso:espresso-core:2.2.2', {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+    androidTestImplementation('androidx.test.espresso:espresso-core:3.1.0', {
         exclude group: 'com.android.support', module: 'support-annotations'
     })
-    compile 'com.android.support:appcompat-v7:26.0.1'
-    compile 'com.android.support.constraint:constraint-layout:1.0.2'
-    compile 'com.android.support:design:26.0.1'
-    compile 'org.apache.tvm:tvm4j-core:0.0.1-SNAPSHOT'
-    testCompile 'junit:junit:4.12'
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'com.google.android.material:material:1.8.0'
+    implementation files('../../../jvm/core/target/tvm4j-core-0.0.1-SNAPSHOT.jar')
+    testImplementation 'junit:junit:4.13.2'
 }

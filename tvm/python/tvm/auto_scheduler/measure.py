@@ -31,22 +31,21 @@ get the measurement results. The flow of data structures is
 We implement these in python to utilize python's multiprocessing and error handling.
 """
 
+import logging
+import multiprocessing
 import os
-import time
 import shutil
 import tempfile
-import multiprocessing
-import logging
+import time
 
 import tvm._ffi
-from tvm.runtime import Object, module, ndarray
+from tvm.autotvm.env import AutotvmGlobalScope, reset_global_scope
+from tvm.contrib import ndk, tar
+from tvm.contrib.popen_pool import PopenPoolExecutor, PopenWorker, StatusKind
 from tvm.driver import build_module
 from tvm.ir import transform
-from tvm.autotvm.env import AutotvmGlobalScope, reset_global_scope
-from tvm.contrib import tar, ndk
-from tvm.contrib.popen_pool import PopenWorker, PopenPoolExecutor, StatusKind
+from tvm.runtime import Object, module, ndarray
 from tvm.target import Target
-
 
 from . import _ffi_api
 from .loop_state import StateObject
@@ -59,8 +58,8 @@ from .utils import (
     request_remote,
 )
 from .workload_registry import (
-    serialize_workload_registry_entry,
     deserialize_workload_registry_entry,
+    serialize_workload_registry_entry,
 )
 
 # pylint: disable=invalid-name
@@ -224,9 +223,7 @@ def recover_measure_input(inp, rebuild_state=False):
     from .search_task import SearchTask  # lazily import to avoid recursive dependency
 
     task = inp.task
-    task.target, task.target_host = Target.check_and_update_host_consist(
-        task.target, task.target_host
-    )
+    task.target, task.target_host = Target.canon_target_and_host(task.target, task.target_host)
     new_task = SearchTask(
         workload_key=task.workload_key,
         target=task.target,
@@ -557,11 +554,11 @@ class LocalRPCMeasureContext:
         device=0,
     ):
         # pylint: disable=import-outside-toplevel
-        from tvm.rpc.tracker import Tracker
         from tvm.rpc.server import Server
+        from tvm.rpc.tracker import Tracker
 
         self.tracker = Tracker(port=9000, port_end=10000, silent=True)
-        device_key = "$local$device$%d" % self.tracker.port
+        device_key = f"$local$device${self.tracker.port}"
         self.server = Server(
             port=self.tracker.port,
             port_end=10000,
@@ -612,9 +609,7 @@ def _local_build_worker(inp_serialized, build_func, verbose):
     tic = time.time()
     inp = MeasureInput.deserialize(inp_serialized)
     task = inp.task
-    task.target, task.target_host = Target.check_and_update_host_consist(
-        task.target, task.target_host
-    )
+    task.target, task.target_host = Target.canon_target_and_host(task.target, task.target_host)
 
     error_no = MeasureErrorNo.NO_ERROR
     error_msg = None
@@ -634,9 +629,9 @@ def _local_build_worker(inp_serialized, build_func, verbose):
         filename = os.path.join(dirname, "tmp_func." + build_func.output_format)
 
         try:
-            with transform.PassContext():
+            with transform.PassContext().current():
                 func = build_module.build(sch, args, target=task.target)
-            func.export_library(filename, build_func)
+            func.export_library(filename, fcompile=build_func)
         # pylint: disable=broad-except
         except Exception:
             error_no = MeasureErrorNo.COMPILE_HOST
@@ -703,15 +698,7 @@ def local_builder_build(inputs, timeout, n_parallel, build_func="default", verbo
         n_parallel, timeout, reset_global_scope, (AutotvmGlobalScope.current,)
     )
     tuple_res = executor.map_with_error_catching(
-        local_build_worker,
-        [
-            (
-                i.serialize(),
-                BuildFunc.build_func,
-                verbose,
-            )
-            for i in inputs
-        ],
+        local_build_worker, [(i.serialize(), BuildFunc.build_func, verbose) for i in inputs]
     )
 
     results = []
@@ -776,7 +763,7 @@ def register_task_input_check_func(func_name, f=None, override=False):
     def register(myf):
         """internal register function"""
         if func_name in TASK_INPUT_CHECK_FUNC_REGISTRY and not override:
-            raise RuntimeError("%s has been registered already" % func_name)
+            raise RuntimeError(f"{func_name} has been registered already")
         TASK_INPUT_CHECK_FUNC_REGISTRY[func_name] = myf
         return myf
 
@@ -785,7 +772,7 @@ def register_task_input_check_func(func_name, f=None, override=False):
     return register
 
 
-def prepare_input_map(args):
+def prepare_input_map(args, workload_key=None):
     """This function deals with special task inputs. Map the input Tensor of a TVM subgraph
     to a specific buffer name in the global buffer map.
 
@@ -793,6 +780,11 @@ def prepare_input_map(args):
     ----------
     args : List[Tensor]
         Input/output Tensor of a TVM subgraph.
+
+    workload_key: Optional[str]
+        The workload for which these inputs are being prepared.  This
+        is used to identify if an input is being provided by (see
+        `register_task_input_buffer`).
 
     Returns
     -------
@@ -808,13 +800,19 @@ def prepare_input_map(args):
 
     global TASK_INPUT_CHECK_FUNC_REGISTRY
 
+    from .search_task import TASK_INPUT_BUFFER_TABLE
+
     # A dict that maps the input tensor arg to a buffer name
     tensor_input_map = {}
 
     # Case 0: Check placeholder name
     for arg in args:
         if isinstance(arg.op, tvm.te.PlaceholderOp):
-            if arg.op.name != "placeholder":
+            if (
+                workload_key
+                and workload_key in TASK_INPUT_BUFFER_TABLE
+                and arg.op.name in TASK_INPUT_BUFFER_TABLE[workload_key]
+            ):
                 tensor_input_map[arg] = arg.op.name
 
     # Case 1: Check specific tensor inputs
@@ -848,7 +846,7 @@ def prepare_runner_args(inp, build_res):
     from .search_task import get_task_input_buffer  # lazily import to avoid recursive dependency
 
     task_input_names = inp.task.task_input_names
-    tensor_input_map = prepare_input_map(build_res.args)
+    tensor_input_map = prepare_input_map(build_res.args, inp.task.workload_key)
     if not task_input_names:
         tensor_input_map = {}
     args = []
@@ -863,8 +861,8 @@ def prepare_runner_args(inp, build_res):
                 task_inputs_count += 1
             else:
                 raise ValueError(
-                    "%s not found in task_inputs, " % (tensor_name)
-                    + "should provide with `SearchTask(..., task_inputs={...})`"
+                    f"{tensor_name} not found in task_inputs, "
+                    f"should provide with `SearchTask(..., task_inputs={{...}})`"
                 )
         else:
             args.append(None)

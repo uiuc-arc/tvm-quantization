@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Test the pass that removes unnecssary identity operation if the identity 
+"""Test the pass that removes unnecssary identity operation if the identity
 uses LUT and the preceding operator is LUT capable and doesn't already have a LUT.
 """
 import pytest
@@ -27,10 +27,9 @@ import numpy as np
 import tvm
 from tvm import relay
 from tvm.relay.backend.contrib.ethosu.codegen import LUTsOptimizer
-from tvm.relay.backend.contrib.ethosu.codegen import relay_to_tir_func
+from tvm.relay.backend.contrib.ethosu.codegen import relay_to_tir
 from tvm.relay.op.contrib.ethosu import partition_for_ethosu
 
-from .test_codegen import _get_tflite_graph
 from . import infra
 
 
@@ -49,6 +48,7 @@ def test_merge_lut_into_conv():
         id2 = infra.make_ethosu_identity(conv2, lut=lut2, activation="SIGMOID")
 
         func = relay.Function(relay.analysis.free_vars(id2), id2)
+        func = func.with_attr("Compiler", "ethos-u")
         mod = tvm.IRModule.from_expr(func)
         return mod
 
@@ -61,6 +61,49 @@ def test_merge_lut_into_conv():
         )
 
         func = relay.Function(relay.analysis.free_vars(conv2), conv2)
+        func = func.with_attr("Compiler", "ethos-u")
+        mod = tvm.IRModule.from_expr(func)
+        mod = relay.transform.InferType()(mod)
+        return mod
+
+    mod = LUTsOptimizer()(before())
+    mod = relay.transform.InferType()(mod)
+
+    assert tvm.ir.structural_equal(mod, after())
+
+
+def test_merge_lut_into_binary_elementwise():
+    """If an binary elementwise operator is followed by an identity operator
+    with LUT, we can merge the two operataors."""
+
+    shape = (1, 8, 8, 4)
+    dtype = "int8"
+    ifm = relay.var("x", shape=shape, dtype=dtype)
+    ifm2 = relay.var("x", shape=shape, dtype=dtype)
+    lut1 = relay.const([i for i in range(256)], dtype=dtype)
+    lut2 = relay.const([i for i in reversed(range(256))], dtype=dtype)
+
+    def before():
+        sub = infra.make_ethosu_binary_elementwise(ifm, ifm2, shape[-1], shape[-1], "SUB", dtype)
+        id1 = infra.make_ethosu_identity(sub, lut=lut1, activation="TANH")
+        add = infra.make_ethosu_binary_elementwise(id1, ifm2, shape[-1], shape[-1], "ADD", dtype)
+        id2 = infra.make_ethosu_identity(add, lut=lut2, activation="SIGMOID")
+
+        func = relay.Function(relay.analysis.free_vars(id2), id2)
+        func = func.with_attr("Compiler", "ethos-u")
+        mod = tvm.IRModule.from_expr(func)
+        return mod
+
+    def after():
+        sub = infra.make_ethosu_binary_elementwise(
+            ifm, ifm2, shape[-1], shape[-1], "SUB", dtype, lut=lut1, activation="TANH"
+        )
+        add = infra.make_ethosu_binary_elementwise(
+            sub, ifm2, shape[-1], shape[-1], "ADD", dtype, lut=lut2, activation="SIGMOID"
+        )
+
+        func = relay.Function(relay.analysis.free_vars(add), add)
+        func = func.with_attr("Compiler", "ethos-u")
         mod = tvm.IRModule.from_expr(func)
         mod = relay.transform.InferType()(mod)
         return mod
@@ -84,6 +127,7 @@ def test_multiple_luts():
         id2 = infra.make_ethosu_identity(id1, lut=lut2, activation="TANH")
 
         func = relay.Function(relay.analysis.free_vars(id2), id2)
+        func = func.with_attr("Compiler", "ethos-u")
         mod = tvm.IRModule.from_expr(func)
         return mod
 
@@ -94,6 +138,7 @@ def test_multiple_luts():
         id2 = infra.make_ethosu_identity(conv1, lut=lut2, activation="TANH")
 
         func = relay.Function(relay.analysis.free_vars(id2), id2)
+        func = func.with_attr("Compiler", "ethos-u")
         mod = tvm.IRModule.from_expr(func)
         mod = relay.transform.InferType()(mod)
         return mod
@@ -117,12 +162,12 @@ def test_lut_optimizer_runs_in_compilation_pipeline():
         op = tf.nn.depthwise_conv2d(op, weight2, (1, 1, 1, 1), "VALID")
         return tf.nn.tanh(op)
 
-    mod, _ = _get_tflite_graph(get_graph, [ifm_shape])
+    mod, _ = infra.get_tflite_graph(get_graph, [ifm_shape])
     mod = partition_for_ethosu(mod)
+    mod = relay_to_tir(mod)
 
     external_gv_name = mod["main"].body.op.name_hint
-    external_func = mod[external_gv_name]
-    prim_func = relay_to_tir_func(external_func)
+    prim_func = mod[external_gv_name]
 
     # Check for hints in the TIR prim func that the LUT optimization pass has ran.
     # If the module was optimized, there should be no identity operations.

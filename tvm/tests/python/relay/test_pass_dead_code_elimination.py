@@ -15,8 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 import tvm
+import tvm.testing
+from tvm import relay
 from tvm.relay import Function, transform
 from tvm.relay.testing import inception_v3
+import numpy as np
 import pytest
 
 cpu_scope = tvm.target.VirtualDevice(tvm.cpu(), tvm.target.Target("llvm"))
@@ -27,9 +30,9 @@ core.import_from_std("core.rly")
 
 def optimize_and_check(before_program, after_program, passes):
     if isinstance(before_program, str):
-        before_program = tvm.parser.parse(before_program)
+        before_program = tvm.relay.parse(before_program)
     if isinstance(after_program, str):
-        after_program = tvm.parser.parse(after_program)
+        after_program = tvm.relay.parse(after_program)
     if not isinstance(passes, list):
         passes = [passes]
     optimize = tvm.transform.Sequential(passes)
@@ -227,14 +230,20 @@ def test_inline_into_function():
 
 
 def test_impure_op():
+    shape = np.array([64, 2])
+    metatable = {
+        "VirtualDevice": [cpu_scope],
+        "relay.Constant": [relay.const(shape, dtype="int64")],
+    }
     """Don't elide calls to side-effecting operators."""
-    before_program = tvm.parser.parse(
+    before_program = tvm.relay.parse(
         """
         #[version = "0.0.5"]
         def @main() {
            let %size: int64 = cast(1024, dtype="int64");
            let %alignment: int64 = cast(64, dtype="int64");
-           let %x = memory.alloc_storage(%size, %alignment, virtual_device=meta[VirtualDevice][0]);
+           let %x = memory.alloc_storage(%size, meta[relay.Constant][0], %alignment, virtual_device=meta[VirtualDevice][0]);
+           let %_ = memory.kill(%x);
            0
         }
         """,
@@ -243,13 +252,15 @@ def test_impure_op():
         metatable,
     )
 
-    after_program = tvm.parser.parse(
+    after_program = tvm.relay.parse(
         """
         #[version = "0.0.5"]
         def @main() {
-           let %x = memory.alloc_storage(cast(1024, dtype="int64"),
-                                         cast(64, dtype="int64"),
-                                         virtual_device=meta[VirtualDevice][0]);
+           %0 = memory.alloc_storage(cast(1024, dtype="int64"),
+                                     meta[relay.Constant][0],
+                                     cast(64, dtype="int64"),
+                                     virtual_device=meta[VirtualDevice][0]);
+           let %_ = memory.kill(%0);
            0
         }
         """,
@@ -264,14 +275,20 @@ def test_impure_op():
 
 
 def test_impure_func():
+    shape = np.array([64, 2])
+    metatable = {
+        "VirtualDevice": [cpu_scope],
+        "relay.Constant": [relay.const(shape, dtype="int64")],
+    }
     """Don't elide calls to side-effecting functions."""
-    before_program = tvm.parser.parse(
+    before_program = tvm.relay.parse(
         """
         #[version = "0.0.5"]
         def @f() -> int {
            let %size: int64 = cast(1024, dtype="int64");
            let %alignment: int64 = cast(64, dtype="int64");
-           let %x = memory.alloc_storage(%size, %alignment, virtual_device=meta[VirtualDevice][0]);
+           let %x = memory.alloc_storage(%size, meta[relay.Constant][0], %alignment, virtual_device=meta[VirtualDevice][0]);
+           let %_ = memory.kill(%x);
            0
         }
         def @main() -> int {
@@ -284,13 +301,15 @@ def test_impure_func():
         metatable,
     )
 
-    after_program = tvm.parser.parse(
+    after_program = tvm.relay.parse(
         """
         #[version = "0.0.5"]
         def @f() -> int {
-           let %x = memory.alloc_storage(cast(1024, dtype="int64"),
-                                         cast(64, dtype="int64"),
-                                         virtual_device=meta[VirtualDevice][0]);
+           %0 = memory.alloc_storage(cast(1024, dtype="int64"),
+                                     meta[relay.Constant][0],
+                                     cast(64, dtype="int64"),
+                                     virtual_device=meta[VirtualDevice][0]);
+           let %_ = memory.kill(%0);
            0
         }
         def @main() -> int {
@@ -316,7 +335,7 @@ def test_refs():
         let %v = ref_read(%r);
         let %u = ref_write(%r, %v + 1);
         %v
-    }    
+    }
     def @main() -> int {
         let %r = ref(0);
         let %y = @f(%r);
@@ -343,6 +362,4 @@ def test_complexity():
 
 
 if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__] + sys.argv[1:]))
+    tvm.testing.main()

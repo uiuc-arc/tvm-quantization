@@ -228,9 +228,7 @@ Stmt ApplyLoopShapes(const Stage& stage, const std::unordered_map<IterVar, Range
 
     Stmt VisitStmt_(const ForNode* op) final {
       if (op->loop_var.get() == parent) {
-        std::unordered_map<const VarNode*, PrimExpr> rmap;
-        rmap[op->loop_var.get()] = inner + outer * factor;
-        Stmt ret = tir::Substitute(op->body, rmap);
+        Stmt ret = tir::Substitute(op->body, {{op->loop_var, inner + outer * factor}});
         PrimExpr cond = likely(outer * factor < (op->extent - inner));
         ret = IfThenElse(cond, ret);
         ret = For(inner->var, PrimExpr(0), inner->dom->extent,
@@ -448,7 +446,7 @@ std::vector<IterVar> GatherLoopVars(Stmt stmt) {
   PostOrderVisit(stmt, [&res_](const ObjectRef& node) {
     if (const ForNode* op = node.as<ForNode>()) {
       Var loop_var(op->loop_var);
-      Range dom = Range::FromMinExtent(op->min, op->extent);
+      Range dom = Range::FromMinExtent(op->min, cast(loop_var.dtype(), op->extent));
       res_.push_back(IterVar(dom, loop_var, ForKindToIterVarType(op->kind)));
     }
   });

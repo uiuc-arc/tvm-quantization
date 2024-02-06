@@ -17,8 +17,11 @@
 # pylint: disable=unused-import
 """Namespace for the TensorIR schedule API."""
 
-from .block_scope import BlockScope, Dependency, DepKind, StmtSRef
+from ..block_scope import BlockScope, Dependency, DepKind, StmtSRef
 from .instruction import Instruction, InstructionKind
 from .schedule import BlockRV, ExprRV, LoopRV, Schedule, ScheduleError
 from .state import ScheduleDebugMask, ScheduleState
 from .trace import Trace
+
+from . import analysis
+from . import transform

@@ -25,6 +25,7 @@ Deploy the Pretrained Model on Android
 This is an example of using Relay to compile a keras model and deploy it on Android device.
 """
 
+
 import os
 import numpy as np
 from PIL import Image
@@ -131,11 +132,10 @@ from tvm.contrib.download import download_testdata
 #
 #   # the additional include headers you want to add, e.g., SDK_PATH/adrenosdk/Development/Inc
 #   ADD_C_INCLUDES += /work/adrenosdk-linux-5_0/Development/Inc
-#   # downloaded from https://github.com/KhronosGroup/OpenCL-Headers
-#   ADD_C_INCLUDES += /usr/local/OpenCL-Headers/
+#   ADD_C_INCLUDES =
 #
 #   # the additional link libs you want to add, e.g., ANDROID_LIB_PATH/libOpenCL.so
-#   ADD_LDLIBS = /workspace/pull-from-android-device/libOpenCL.so
+#   ADD_LDLIBS =
 #
 # .. note::
 #
@@ -281,7 +281,7 @@ with tvm.transform.PassContext(opt_level=3):
 tmp = utils.tempdir()
 lib_fname = tmp.relpath("net.so")
 fcompile = ndk.create_shared if not local_demo else None
-lib.export_library(lib_fname, fcompile)
+lib.export_library(lib_fname, fcompile=fcompile)
 
 ######################################################################
 # Deploy the Model Remotely by RPC

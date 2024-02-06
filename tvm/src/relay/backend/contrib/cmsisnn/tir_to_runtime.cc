@@ -16,6 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+#include <tvm/ir/transform.h>
+
 #include <cmath>
 #include <fstream>
 #include <map>
@@ -26,6 +28,7 @@
 #include "../../../../runtime/file_utils.h"
 #include "../../../../target/source/codegen_c.h"
 #include "../../../../target/source/codegen_c_host.h"
+#include "compiler_attrs.h"
 
 namespace tvm {
 using namespace tir;
@@ -35,23 +38,18 @@ namespace cmsisnn {
 
 class CodeGenCMSISNN : public codegen::CodeGenCHost {
  public:
-  void Init(bool output_ssa, bool emit_asserts, std::string target_str) {
-    decl_stream << "#include <stdio.h>\n";
-    decl_stream << "#include <stdlib.h>\n";
-    decl_stream << "#include <dlpack/dlpack.h>\n";
-    decl_stream << "#include <arm_nnfunctions.h>\n";
-    decl_stream << "#include <arm_nn_types.h>\n";
-    CodeGenCHost::Init(output_ssa, emit_asserts, target_str);
+  void Init(bool output_ssa, bool emit_asserts, bool emit_fwd_func_decl, std::string target_str,
+            bool debug_last_error) {
+    this->debug_last_error = debug_last_error;
+    std::unordered_set<std::string> devices;
+    devices.insert("cmsis-nn");
+    CodeGenCHost::Init(output_ssa, emit_asserts, emit_fwd_func_decl, target_str, devices);
   }
 
-  /*!
-   * \brief Emit code that offloads a subgraph to the Cortex-M
-   *
-   * \return string of code that offloads a subgraph to the Cortex-M
-   */
-  void AddFunction(const PrimFunc& prim_func) { CodeGenC::AddFunction(prim_func); }
-
  private:
+  /*!  * \brief Enable storing the last error */
+  bool debug_last_error;
+
   /*!  * \brief CMSIS-NN context buffer info */
   struct CMSISNNContextBuffer {
     std::string name;
@@ -101,6 +99,11 @@ class CodeGenCMSISNN : public codegen::CodeGenCHost {
     int clip_max;
   };
 
+  struct CMSISNNSoftmaxLutS16 {
+    std::string exp_lut_name;
+    std::string one_by_one_lut_name;
+  };
+
   using codegen::CodeGenCHost::VisitStmt_;
 
   /*!  * \brief Emits CMSIS-NN APIs for every call_extern */
@@ -109,17 +112,26 @@ class CodeGenCMSISNN : public codegen::CodeGenCHost {
       CodeGenCHost::VisitExpr_(op, os);
       return;
     }
+
     std::string cmsis_func_name = op->args[0].as<StringImmNode>()->value;
     if (cmsis_func_name == "arm_softmax_s8" || cmsis_func_name == "arm_elementwise_mul_s8" ||
-        cmsis_func_name == "arm_elementwise_add_s8") {
+        cmsis_func_name == "arm_elementwise_add_s8" ||
+        cmsis_func_name == "arm_elementwise_mul_s16" ||
+        cmsis_func_name == "arm_elementwise_add_s16") {
       CodeGenC::VisitExpr_(op, os);
     } else if (cmsis_func_name == "arm_convolve_wrapper_s8" ||
-               cmsis_func_name == "arm_depthwise_conv_wrapper_s8") {
+               cmsis_func_name == "arm_convolve_wrapper_s16" ||
+               cmsis_func_name == "arm_depthwise_conv_wrapper_s8" ||
+               cmsis_func_name == "arm_depthwise_conv_wrapper_s16") {
       EmitConv2D(op);
-    } else if (cmsis_func_name == "arm_fully_connected_s8") {
+    } else if (cmsis_func_name == "arm_fully_connected_s8" ||
+               cmsis_func_name == "arm_fully_connected_s16") {
       EmitFullyConnected(op);
-    } else if (cmsis_func_name == "arm_avgpool_s8" || cmsis_func_name == "arm_max_pool_s8") {
+    } else if (cmsis_func_name == "arm_avgpool_s8" || cmsis_func_name == "arm_avgpool_s16" ||
+               cmsis_func_name == "arm_max_pool_s8" || cmsis_func_name == "arm_max_pool_s16") {
       EmitPool2D(op);
+    } else if (cmsis_func_name == "arm_softmax_s16") {
+      EmitSoftmaxInt16(op);
     }
     return;
   }
@@ -216,6 +228,14 @@ class CodeGenCMSISNN : public codegen::CodeGenCHost {
        << "," << dims.c << "};\n";
     return struct_name;
   }
+  /*!  * \brief Emits cmsis_nn_softmax_params struct */
+  std::string EmitCMSISNNSoftmaxLutS16(std::ostream& os, CMSISNNSoftmaxLutS16 softmax_params) {
+    std::string struct_name = "softmax_params";
+    PrintIndent();
+    os << "cmsis_nn_softmax_lut_s16 " << struct_name << "= {" << softmax_params.exp_lut_name << ", "
+       << softmax_params.one_by_one_lut_name << "};\n";
+    return struct_name;
+  }
 
   /*!  * \brief Deduces variable name from call_extern argument resting at id */
   std::string VarNameFromArg(const CallNode* op, int id) {
@@ -228,7 +248,14 @@ class CodeGenCMSISNN : public codegen::CodeGenCHost {
   /*!  * \brief extracts CMSIS-NN context buffer information */
   CMSISNNContextBuffer extract_context_buffer_info(const CallNode* op, int base_pos) {
     CMSISNNContextBuffer context_buffer;
-    context_buffer.name = op->args[base_pos].as<StringImmNode>()->value;
+
+    // The argument could be a Var if it is allocated to hold the
+    // context buffer OR it will be a StringImm with "NULL"
+    if (op->args[base_pos]->IsInstance<VarNode>()) {
+      context_buffer.name = op->args[base_pos].as<VarNode>()->name_hint;
+    } else {
+      context_buffer.name = op->args[base_pos].as<StringImmNode>()->value;
+    }
     context_buffer.size = ValueFromArg(op, base_pos + 1);
     return context_buffer;
   }
@@ -284,6 +311,14 @@ class CodeGenCMSISNN : public codegen::CodeGenCHost {
     dims.c = ValueFromArg(op, ++base_pos);
     return dims;
   }
+  /*!  * \brief extracts CMSIS-NN softmax LUTs from call_extern */
+  CMSISNNSoftmaxLutS16 extract_softmax_softmax_lut_s16(const CallNode* op, int exp_lut_pos,
+                                                       int one_by_one_lut_pos) {
+    CMSISNNSoftmaxLutS16 softmax_params;
+    softmax_params.exp_lut_name = op->args[exp_lut_pos].as<VarNode>()->name_hint;
+    softmax_params.one_by_one_lut_name = op->args[one_by_one_lut_pos].as<VarNode>()->name_hint;
+    return softmax_params;
+  }
 
   /*!  * \brief Emits CMSIS-NN APIs for every call_extern comprising convolution */
   void EmitConv2D(const CallNode* op) {
@@ -338,7 +373,7 @@ class CodeGenCMSISNN : public codegen::CodeGenCHost {
 
     // Emit CMSIS-NN API
     PrintIndent();
-    stream << "arm_status status = ";
+    stream << "arm_cmsis_nn_status status = ";
     stream << cmsis_func_name << "(";
     stream << "&" << context << ", ";
     stream << "&" << conv_params << ", ";
@@ -347,13 +382,7 @@ class CodeGenCMSISNN : public codegen::CodeGenCHost {
     stream << "&" << filter_dim << ", " << filter_data << ", ";
     stream << "&" << bias_dim << ", " << bias_data << ", ";
     stream << "&" << output_dim << ", " << output_data << ");\n";
-    PrintIndent();
-    stream << "if (status != ARM_MATH_SUCCESS) {\n";
-    PrintIndent();
-    PrintIndent();
-    stream << "return -1;\n";
-    PrintIndent();
-    stream << "}\n";
+    EmitErrorCheck();
   }
 
   /*!  * \brief Emits CMSIS-NN APIs for every call_extern comprising fully connected */
@@ -407,7 +436,7 @@ class CodeGenCMSISNN : public codegen::CodeGenCHost {
     std::string output_dim = EmitCMSISNNDims(stream, "output", output_dims);
 
     PrintIndent();
-    stream << "arm_status status = ";
+    stream << "arm_cmsis_nn_status status = ";
     stream << cmsis_func_name << "(";
     stream << "&" << context << ", ";
     stream << "&" << cmsisnn_fc_params << ", ";
@@ -416,13 +445,7 @@ class CodeGenCMSISNN : public codegen::CodeGenCHost {
     stream << "&" << filter_dim << ", " << filter_data << ", ";
     stream << "&" << bias_dim << ", " << bias_data << ", ";
     stream << "&" << output_dim << ", " << output_data << ");\n";
-    PrintIndent();
-    stream << "if (status != ARM_MATH_SUCCESS) {\n";
-    PrintIndent();
-    PrintIndent();
-    stream << "return -1;\n";
-    PrintIndent();
-    stream << "}\n";
+    EmitErrorCheck();
   }
 
   /*!  * \brief Emits CMSIS-NN APIs for every call_extern comprising pooling ops */
@@ -463,36 +486,117 @@ class CodeGenCMSISNN : public codegen::CodeGenCHost {
     std::string output_dim = EmitCMSISNNDims(stream, "output", output_dims);
 
     PrintIndent();
-    stream << "arm_status status = ";
+    stream << "arm_cmsis_nn_status status = ";
     stream << cmsis_func_name << "(";
     stream << "&" << context << ", ";
     stream << "&" << cmsisnn_pool_params << ", ";
     stream << "&" << input_dim << ", " << input_data << ", ";
     stream << "&" << filter_dim << ", ";
     stream << "&" << output_dim << ", " << output_data << ");\n";
+    EmitErrorCheck();
+  }
+
+  void EmitSoftmaxInt16(const CallNode* op) {
+    std::string cmsis_func_name = op->args[0].as<StringImmNode>()->value;
+
+    // extract buffer names from call_extern
+    int arg_id = 0;
+    std::string input_data = VarNameFromArg(op, ++arg_id);
+    int num_rows = ValueFromArg(op, ++arg_id);
+    int row_size = ValueFromArg(op, ++arg_id);
+    int multiplier = ValueFromArg(op, ++arg_id);
+    int shift = ValueFromArg(op, ++arg_id);
+    // extracting LUT names from call_extern
+    CMSISNNSoftmaxLutS16 softmax_params_buffer =
+        extract_softmax_softmax_lut_s16(op, arg_id + 1, arg_id + 2);
+    arg_id += 2;
+    std::string output_data = VarNameFromArg(op, ++arg_id);
+
+    // Emit CMSIS-NN API arguments
+    std::string softmax_params = EmitCMSISNNSoftmaxLutS16(stream, softmax_params_buffer);
+
     PrintIndent();
-    stream << "if (status != ARM_MATH_SUCCESS) {\n";
+    stream << "arm_cmsis_nn_status status = ";
+    stream << cmsis_func_name << "(";
+    stream << input_data << ", ";
+    stream << num_rows << ", ";
+    stream << row_size << ", ";
+    stream << multiplier << ", ";
+    stream << shift << ", ";
+    stream << "&" << softmax_params << ", ";
+    stream << output_data << ");\n";
+    EmitErrorCheck();
+  }
+
+  void EmitErrorCheck() {
+    auto emit_error = [&](std::string error) {
+      if (this->debug_last_error) {
+        stream << "TVMAPISetLastError(\"" << error << "\"); ";
+      }
+    };
+
     PrintIndent();
+    stream << "switch (!status) {\n";
     PrintIndent();
+    stream << "case ARM_CMSIS_NN_SUCCESS: break;\n";
+    PrintIndent();
+    stream << "case ARM_CMSIS_NN_ARG_ERROR: ";
+    emit_error("ARM_CMSIS_NN_ARG_ERROR");
+    stream << "return -1;\n";
+    PrintIndent();
+    stream << "case ARM_CMSIS_NN_NO_IMPL_ERROR: ";
+    emit_error("ARM_CMSIS_NN_NO_IMPL_ERROR");
     stream << "return -1;\n";
     PrintIndent();
     stream << "}\n";
   }
 };
 
+static CMSISNNCompilerConfig GetCompilerAttrs() {
+  auto ctx = tvm::tir::transform::PassContext::Current();
+  Optional<CMSISNNCompilerConfig> cfg =
+      ctx->GetConfig<CMSISNNCompilerConfig>("relay.ext.cmsisnn.options");
+  if (!cfg.defined()) {
+    return AttrsWithDefaultValues<CMSISNNCompilerConfig>();
+  }
+  return cfg.value();
+}
+
 runtime::Module TIRToRuntime(IRModule mod, Target target) {
   bool output_ssa = false;
   bool emit_asserts = false;
+  bool emit_fwd_func_decl = false;
+  bool debug_last_error = GetCompilerAttrs()->debug_last_error;
   CodeGenCMSISNN codegen;
-  Array<String> function_names;
-  codegen.Init(output_ssa, emit_asserts, target->str());
-  for (auto kv : mod->functions) {
-    auto prim_func = Downcast<PrimFunc>(kv.second);
-    auto global_symbol = prim_func->GetAttr<String>(tvm::attr::kGlobalSymbol);
-    function_names.push_back(global_symbol.value());
-    codegen.AddFunction(prim_func);
+  codegen.Init(output_ssa, emit_asserts, emit_fwd_func_decl, target->str(), debug_last_error);
+
+  std::vector<std::pair<tvm::GlobalVar, tvm::PrimFunc>> funcs;
+  for (auto [gvar, base_func] : mod->functions) {
+    funcs.push_back({gvar, Downcast<PrimFunc>(base_func)});
+  }
+
+  std::sort(funcs.begin(), funcs.end(),
+            [](std::pair<tvm::GlobalVar, tvm::BaseFunc> kv_a,
+               std::pair<tvm::GlobalVar, tvm::BaseFunc> kv_b) {
+              std::string name_hint_a = kv_a.first->name_hint;
+              std::string name_hint_b = kv_b.first->name_hint;
+              size_t name_a_length = name_hint_a.length();
+              size_t name_b_length = name_hint_b.length();
+              if (name_a_length < name_b_length) return true;
+              if (name_a_length > name_b_length) return false;
+              return name_hint_a < name_hint_b;
+            });
+
+  for (auto [gvar, prim_func] : funcs) {
+    codegen.AddFunction(gvar, prim_func);
   }
   std::string code = codegen.Finish();
+
+  Array<String> function_names;
+  for (auto [gvar, prim_func] : funcs) {
+    function_names.push_back(codegen.GetFunctionName(gvar));
+  }
+
   return codegen::CSourceModuleCreate(code, "c", function_names);
 }
 

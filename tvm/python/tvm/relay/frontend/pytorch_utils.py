@@ -31,12 +31,20 @@ from ..dataflow_pattern import (
 
 
 def is_version_greater_than(ver):
+    """
+    Returns True if the local PyTorch version is greater
+    than the one given as an argument.
+    """
     import torch
-    import re
+    from distutils.version import LooseVersion
 
-    return int("".join(re.findall(r"(\d+)\.(\d+)\.(\d)", torch.__version__)[0])) > int(
-        "".join(re.findall(r"(\d+)\.(\d+)\.(\d)", ver)[0])
-    )
+    torch_ver = torch.__version__
+    # PT version numbers can include +cu[cuda version code]
+    # and we don't want to include that in the comparison
+    if "+cu" in torch_ver:
+        torch_ver = torch_ver.split("+cu")[0]
+
+    return LooseVersion(torch_ver) > ver
 
 
 def getattr_attr_name(node):
@@ -323,7 +331,7 @@ def scatter_roi_align_result_pattern(levels, roi_align_results, num_scales):
         scatter_indices = is_op("repeat")(scatter_indices)
         scatter_indices = is_op("repeat")(scatter_indices)
 
-        scatter_res = is_op("scatter")(scatter_res, scatter_indices, roi_align_results[i])
+        scatter_res = is_op("scatter_elements")(scatter_res, scatter_indices, roi_align_results[i])
 
     return is_op("reshape")(scatter_res)
 

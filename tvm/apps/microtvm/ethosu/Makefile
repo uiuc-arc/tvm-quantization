@@ -35,21 +35,20 @@ RANLIB = arm-none-eabi-ranlib
 PKG_CFLAGS = ${PKG_COMPILE_OPTS} \
 	-I${STANDALONE_CRT_PATH}/include \
 	-I${STANDALONE_CRT_PATH}/src/runtime/crt/include \
+	-I${PWD}/${BUILD_DIR}/crt_config \
 	-I${PWD}/include \
-	-I${CORSTONE_300_PATH} \
-	-I${ETHOSU_PATH}/core_driver/include \
+	-I${ETHOSU_DRIVER_PATH}/include \
+	-I${ETHOSU_PLATFORM_PATH}/drivers/uart/include \
 	-I${CMSIS_PATH}/Device/ARM/${ARM_CPU}/Include/ \
 	-I${CMSIS_PATH}/CMSIS/Core/Include \
-	-I${CMSIS_PATH}/CMSIS/NN/Include \
+	-I${CMSIS_PATH}/CMSIS-NN/Include \
 	-I${CMSIS_PATH}/CMSIS/DSP/Include \
 	-I$(abspath $(BUILD_DIR))/codegen/host/include \
 	-DETHOSU_TEST_RUNNER_TOL=${ETHOSU_TEST_RUNNER_TOL}
-DRIVER_CMAKE_FLAGS = -DCMAKE_TOOLCHAIN_FILE=$(abspath $(BUILD_DIR))/../arm-none-eabi-gcc.cmake \
-	-DETHOSU_LOG_SEVERITY=debug \
-	-DCMAKE_SYSTEM_PROCESSOR=cortex-m55
-CMSIS_NN_CMAKE_FLAGS = -DCMAKE_TOOLCHAIN_FILE=$(abspath $(BUILD_DIR))/../arm-none-eabi-gcc.cmake \
-	-DTARGET_CPU=cortex-m55 \
-	-DBUILD_CMSIS_NN_FUNCTIONS=YES
+CMAKE_FLAGS = -DCMAKE_TOOLCHAIN_FILE=$(abspath $(BUILD_DIR))/../arm-none-eabi-gcc.cmake \
+	-DTARGET_CPU=cortex-m55
+DRIVER_CMAKE_FLAGS = $(CMAKE_FLAGS) \
+	-DETHOSU_LOG_SEVERITY=debug
 PKG_LDFLAGS = -lm -specs=nosys.specs -static -T corstone300.ld
 
 $(ifeq VERBOSE,1)
@@ -58,10 +57,29 @@ $(else)
 QUIET ?= @
 $(endif)
 
+ifdef FREERTOS_PATH
+DEMO_MAIN = src/demo_freertos.c
+FREERTOS_KERNEL = $(FREERTOS_PATH)/FreeRTOS/Source
+FREERTOS_FLAGS = -I$(FREERTOS_KERNEL)/include/ \
+	-I$(FREERTOS_KERNEL)/crt_config/ \
+	-I$(FREERTOS_KERNEL)/portable/GCC/ARM_CM33_NTZ/non_secure/
+FREERTOS_SOURCES = $(FREERTOS_KERNEL)/portable/GCC/ARM_CM33_NTZ/non_secure/port.c \
+	$(FREERTOS_KERNEL)/portable/GCC/ARM_CM33_NTZ/non_secure/portasm.c \
+	$(FREERTOS_KERNEL)/tasks.c \
+	$(FREERTOS_KERNEL)/list.c \
+	$(FREERTOS_KERNEL)/queue.c \
+	$(FREERTOS_KERNEL)/timers.c \
+	$(FREERTOS_KERNEL)/event_groups.c \
+	$(FREERTOS_KERNEL)/portable/MemMang/heap_3.c
+else
+DEMO_MAIN = src/demo_bare_metal.c
+endif
+
 CODEGEN_SRCS = $(wildcard $(abspath $(BUILD_DIR))/codegen/host/src/*.c)
 CODEGEN_OBJS = $(subst .c,.o,$(CODEGEN_SRCS))
 CMSIS_STARTUP_SRCS = $(wildcard ${CMSIS_PATH}/Device/ARM/${ARM_CPU}/Source/*.c)
-UART_SRCS = $(wildcard ${CORSTONE_300_PATH}/*.c)
+CMSIS_NN_SOFTMAX_SRCS = $(shell find ${CMSIS_PATH}/CMSIS-NN/Source/SoftmaxFunctions/*.c)
+CORSTONE_300_SRCS = $(wildcard ${CORSTONE_300_PATH}/*.c)
 
 demo: $(BUILD_DIR)/demo
 
@@ -93,15 +111,21 @@ ${BUILD_DIR}/ethosu_core_driver/libethosu_core_driver.a:
 	$(QUIET)cd $(abspath $(BUILD_DIR)/ethosu_core_driver) && $(MAKE)
 
 # Build CMSIS-NN Softmax
-${BUILD_DIR}/cmsis_nn/Source/SoftmaxFunctions/libCMSISNNSoftmax.a:
-	$(QUIET)mkdir -p $(@D)
-	$(QUIET)cd $(CMSIS_PATH)/CMSIS/NN && $(CMAKE) -B $(abspath $(BUILD_DIR)/cmsis_nn) $(CMSIS_NN_CMAKE_FLAGS)
-	$(QUIET)cd $(abspath $(BUILD_DIR)/cmsis_nn) && $(MAKE) CMSISNNSoftmax	
+${BUILD_DIR}/libcmsis_nn_softmax.a: $(CMSIS_NN_SOFTMAX_SRCS)
+	$(QUIET)mkdir -p $(abspath $(BUILD_DIR)/libcmsis_nn)
+	$(QUIET)cd $(abspath $(BUILD_DIR)/libcmsis_nn) && $(CC) -c $(PKG_CFLAGS) -D${ARM_CPU} $^
+	$(QUIET)$(AR) -cr $(abspath $(BUILD_DIR)/libcmsis_nn_softmax.a) $(abspath $(BUILD_DIR))/libcmsis_nn/*.o
+	$(QUIET)$(RANLIB) $(abspath $(BUILD_DIR)/libcmsis_nn_softmax.a)
 
-# Build demo application
-$(BUILD_DIR)/demo: src/demo.c src/tvm_ethosu_runtime.c $(UART_SRCS) $(BUILD_DIR)/stack_allocator.o $(BUILD_DIR)/crt_backend_api.o ${BUILD_DIR}/libcodegen.a ${BUILD_DIR}/libcmsis_startup.a ${BUILD_DIR}/ethosu_core_driver/libethosu_core_driver.a ${BUILD_DIR}/cmsis_nn/Source/SoftmaxFunctions/libCMSISNNSoftmax.a
+# Build UART driver
+${BUILD_DIR}/ethosu_core_platform/libethosu_uart_cmsdk_apb.a:
 	$(QUIET)mkdir -p $(@D)
-	$(QUIET)$(CC) $(PKG_CFLAGS) -o $@ $^ $(PKG_LDFLAGS)
+	$(QUIET)cd ${ETHOSU_PLATFORM_PATH}/drivers/uart && $(CMAKE) -B $(abspath $(BUILD_DIR)/ethosu_core_platform) $(CMAKE_FLAGS)
+	$(QUIET)cd $(abspath $(BUILD_DIR)/ethosu_core_platform) && $(MAKE)
+
+$(BUILD_DIR)/demo: $(DEMO_MAIN) src/tvm_ethosu_runtime.c $(FREERTOS_SOURCES) $(CORSTONE_300_SRCS) $(BUILD_DIR)/stack_allocator.o $(BUILD_DIR)/crt_backend_api.o ${BUILD_DIR}/libcodegen.a ${BUILD_DIR}/libcmsis_startup.a ${BUILD_DIR}/ethosu_core_driver/libethosu_core_driver.a ${BUILD_DIR}/libcmsis_nn_softmax.a ${BUILD_DIR}/ethosu_core_platform/libethosu_uart_cmsdk_apb.a
+	$(QUIET)mkdir -p $(@D)
+	$(QUIET)$(CC) $(PKG_CFLAGS) $(FREERTOS_FLAGS) -o $@ $^ $(PKG_LDFLAGS)
 
 clean:
 	$(QUIET)rm -rf $(BUILD_DIR)/codegen

@@ -1,24 +1,30 @@
 /***************************************************************************************************
- * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
@@ -46,32 +52,33 @@ template<typename ImplicitGemmKernel_>
 class ImplicitGemmConvolution {
 public:
 
-  using ImplicitGemmKernel = ImplicitGemmKernel_;
+  using UnderlyingKernel = ImplicitGemmKernel_;
 
-  using ElementA = typename ImplicitGemmKernel::ElementA;
-  using LayoutA = typename ImplicitGemmKernel::LayoutA;
-  using ElementB = typename ImplicitGemmKernel::ElementB;
-  using LayoutB = typename ImplicitGemmKernel::LayoutB;
-  using ElementC = typename ImplicitGemmKernel::ElementC;
-  using LayoutC = typename ImplicitGemmKernel::LayoutC;
-  using ElementAccumulator = typename ImplicitGemmKernel::ElementAccumulator;
-  using ElementCompute = typename ImplicitGemmKernel::ElementCompute;
-  using OperatorClass = typename ImplicitGemmKernel::OperatorClass;
-  using ArchTag = typename ImplicitGemmKernel::ArchTag;
-  using ThreadblockShape = typename ImplicitGemmKernel::ThreadblockShape;
-  using WarpShape = typename ImplicitGemmKernel::WarpShape;
-  using InstructionShape = typename ImplicitGemmKernel::InstructionShape;
-  using ThreadblockSwizzle = typename ImplicitGemmKernel::ThreadblockSwizzle;
-  using EpilogueOutputOp = typename ImplicitGemmKernel::EpilogueOutputOp;
-  static int const kStages = ImplicitGemmKernel::kStages;
-  static int const kConvDim = ImplicitGemmKernel::kConvDim;
-  using WarpMmaOperator = typename ImplicitGemmKernel::WarpMmaOperator;
-  using ArchMmaOperator = typename ImplicitGemmKernel::ArchMmaOperator;
-  using MathOperator = typename ImplicitGemmKernel::MathOperator; 
+  using ElementA = typename UnderlyingKernel::ElementA;
+  using LayoutA = typename UnderlyingKernel::LayoutA;
+  using ElementB = typename UnderlyingKernel::ElementB;
+  using LayoutB = typename UnderlyingKernel::LayoutB;
+  using ElementC = typename UnderlyingKernel::ElementC;
+  using LayoutC = typename UnderlyingKernel::LayoutC;
+  using ElementAccumulator = typename UnderlyingKernel::ElementAccumulator;
+  using ElementCompute = typename UnderlyingKernel::ElementCompute;
+  using OperatorClass = typename UnderlyingKernel::OperatorClass;
+  using ArchTag = typename UnderlyingKernel::ArchTag;
+  using ThreadblockShape = typename UnderlyingKernel::ThreadblockShape;
+  using WarpShape = typename UnderlyingKernel::WarpShape;
+  using InstructionShape = typename UnderlyingKernel::InstructionShape;
+  using ThreadblockSwizzle = typename UnderlyingKernel::ThreadblockSwizzle;
+  using EpilogueOutputOp = typename UnderlyingKernel::EpilogueOutputOp;
+  static int const kStages = UnderlyingKernel::kStages;
+  static int const kConvDim = UnderlyingKernel::kConvDim;
+  using WarpMmaOperator = typename UnderlyingKernel::WarpMmaOperator;
+  using ArchMmaOperator = typename UnderlyingKernel::ArchMmaOperator;
+  using MathOperator = typename UnderlyingKernel::MathOperator; 
 
-  static cutlass::conv::Operator const kConvolutionalOperator = ImplicitGemmKernel::kConvolutionalOperator;
-  static cutlass::conv::IteratorAlgorithm const kIteratorAlgorithm = ImplicitGemmKernel::kIteratorAlgorithm;
-  static cutlass::conv::StrideSupport const kStrideSupport = ImplicitGemmKernel::kStrideSupport;
+  static cutlass::conv::Operator const kConvolutionalOperator = UnderlyingKernel::kConvolutionalOperator;
+  static cutlass::conv::IteratorAlgorithm const kIteratorAlgorithm = UnderlyingKernel::kIteratorAlgorithm;
+  static cutlass::conv::StrideSupport const kStrideSupport = UnderlyingKernel::kStrideSupport;
+  static cutlass::conv::GroupMode const kGroupMode = UnderlyingKernel::kGroupMode;
 
   static int const kWarpCount = 
     (ThreadblockShape::kM / WarpShape::kM) * 
@@ -79,12 +86,12 @@ public:
     (ThreadblockShape::kK / WarpShape::kK);
 
   /// Argument structure
-  using Arguments = typename ImplicitGemmKernel::Arguments;
+  using Arguments = typename UnderlyingKernel::Arguments;
 
 private:
 
   /// Kernel parameters object
-  typename ImplicitGemmKernel::Params params_;
+  typename UnderlyingKernel::Params params_;
 
 public:
 
@@ -95,17 +102,51 @@ public:
   static Status can_implement(Arguments const &args) {
 
     // dispatch to iterators
-    Status status = ImplicitGemmKernel::Mma::IteratorA::can_implement(args.problem_size);
+    Status status = UnderlyingKernel::Mma::IteratorA::can_implement(args.problem_size);
     if (Status::kSuccess != status) {
       return status;
     }
 
-    status = ImplicitGemmKernel::Mma::IteratorB::can_implement(args.problem_size);
+    status = UnderlyingKernel::Mma::IteratorB::can_implement(args.problem_size);
     if (Status::kSuccess != status) {
       return status;
     }
 
-    static int const kAlignmentC = ImplicitGemmKernel::Epilogue::OutputTileIterator::kElementsPerAccess;
+    // check group conv constraint
+    if (args.problem_size.groups != 1) {
+      if (kGroupMode == conv::GroupMode::kNone) {
+        return Status::kErrorInvalidProblem;
+      } 
+
+      // C and K should be multiple of groups
+      if (args.problem_size.K % args.problem_size.groups ||
+        args.problem_size.C % args.problem_size.groups) {
+        return Status::kErrorInvalidProblem;
+      }
+
+      // split-k is not supported
+      if (args.problem_size.split_k_slices != 1) {
+        return Status::kErrorInvalidProblem;
+      }
+
+      int k_per_group = args.problem_size.K / args.problem_size.groups;
+      // k_per_group should be multiple of ThreadblockShape N, one CTA calculate one group
+      if (kGroupMode == conv::GroupMode::kSingleGroup && k_per_group % ThreadblockShape::kN) {
+        return Status::kErrorInvalidProblem;
+      }
+      // ThreadblockShape::kN should be divisible by k_per_group, one CTA calculate multiple groups
+      if (kGroupMode == conv::GroupMode::kMultipleGroup && ThreadblockShape::kN % k_per_group) {
+        return Status::kErrorInvalidProblem;
+      }
+
+      // current optimized iterator algo only supports SingleGroup mode
+      if (kIteratorAlgorithm == IteratorAlgorithm::kOptimized &&
+        kGroupMode != conv::GroupMode::kSingleGroup) {
+        return Status::kErrorInvalidProblem;
+      }
+    }
+
+    static int const kAlignmentC = UnderlyingKernel::Epilogue::OutputTileIterator::kElementsPerAccess;
     if (kConvolutionalOperator == conv::Operator::kFprop) {
       if (args.problem_size.K % kAlignmentC)
         return Status::kErrorMisalignedOperand;
@@ -120,15 +161,6 @@ public:
     // check for unsupported problem sizes for strided dgrad implementation
     if (kConvolutionalOperator == conv::Operator::kDgrad && 
       kStrideSupport == conv::StrideSupport::kStrided) {
-
-      // Unity stride (1x1) is supported by strided dgrad but disabled for performance 
-      // reasons. For unity stride, use strided dgrad optimized unity stride specialization.
-      // Note that unit tests strided dgrad for unity stride to make sure that strided 
-      // dgrad implemetnation is functionaly sound. 
-      // Strided dgrad implementation also support mixed strides, i.e., (1x2) and (2x1)
-      if(args.problem_size.stride_h == 1 && args.problem_size.stride_w == 1) {
-        return Status::kErrorNotSupported;
-      }
 
       // split-k (serial or parallel) is not supported for strided dgrad
       if(args.problem_size.split_k_slices > 1) {
@@ -214,15 +246,15 @@ public:
     }
 
     // initialize the params structure from the arguments
-    params_ = typename ImplicitGemmKernel::Params(
+    params_ = typename UnderlyingKernel::Params(
     	args,
     	static_cast<int *>(workspace)
     );
     
-    int smem_size = int(sizeof(typename ImplicitGemmKernel::SharedStorage));
+    int smem_size = int(sizeof(typename UnderlyingKernel::SharedStorage));
 
     if (smem_size >= (48 << 10)) {
-      cudaError_t result = cudaFuncSetAttribute(cutlass::Kernel<ImplicitGemmKernel>,
+      cudaError_t result = cudaFuncSetAttribute(cutlass::Kernel<UnderlyingKernel>,
                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                                     smem_size);
 
@@ -257,9 +289,9 @@ public:
     dim3 grid = threadblock_swizzle.get_grid_shape(params_.grid_tiled_shape);
     dim3 block(32 * kWarpCount, 1, 1);
 
-    int smem_size = int(sizeof(typename ImplicitGemmKernel::SharedStorage));
+    int smem_size = int(sizeof(typename UnderlyingKernel::SharedStorage));
 
-    cutlass::Kernel<ImplicitGemmKernel><<<grid, block, smem_size, stream>>>(params_);
+    cutlass::Kernel<UnderlyingKernel><<<grid, block, smem_size, stream>>>(params_);
 
     cudaError_t result = cudaGetLastError();
 

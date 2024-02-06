@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# pylint: disable=cell-var-from-loop, use-list-literal
 
 """Defines functions for exporting to Model Library Format."""
 
@@ -26,20 +27,21 @@ import tarfile
 import typing
 
 import tvm
-from tvm.ir.type import TupleType
-from tvm.micro import get_standalone_crt_dir
+from tvm.micro import get_standalone_crt_dir, get_microtvm_template_projects
+
 from .._ffi import get_global_func
 from ..contrib import utils
 from ..driver import build_module
-from ..runtime import ndarray as _nd
-from ..relay.backend import executor_factory
-from ..relay.backend.name_transforms import to_c_variable_style, prefix_generated_name
 from ..relay import param_dict
+from ..relay.backend import executor_factory
+from ..relay.backend.name_transforms import prefix_generated_name, to_c_variable_style
 from ..tir import expr
 
 # This should be kept identical to runtime::symbol::tvm_module_main
 MAIN_FUNC_NAME_STR = "__tvm_main__"
 STANDALONE_CRT_URL = "./runtime"
+CRT_TEMPLATE_FILES_URL = "./templates"
+METADATA_FILE = "metadata.json"
 
 
 class UnsupportedInModelLibraryFormatError(Exception):
@@ -47,14 +49,33 @@ class UnsupportedInModelLibraryFormatError(Exception):
 
 
 def generate_c_interface_header(
-    module_name, inputs, outputs, devices, workspace_size, include_path
+    module_name,
+    inputs,
+    outputs,
+    pools,
+    io_pool_allocations,
+    devices,
+    workspace_size,
+    include_path,
+    input_sizes,
+    output_sizes,
 ):
     """Generate C Interface header to be included in MLF"""
     mangled_name = to_c_variable_style(prefix_generated_name(module_name))
     metadata_header = os.path.join(include_path, f"{mangled_name}.h")
 
     interface_c_create = tvm._ffi.get_global_func("runtime.InterfaceCCreate")
-    interface_c_module = interface_c_create(module_name, inputs, outputs, devices, workspace_size)
+    interface_c_module = interface_c_create(
+        module_name,
+        inputs,
+        outputs,
+        pools,
+        io_pool_allocations,
+        devices,
+        workspace_size,
+        input_sizes,
+        output_sizes,
+    )
 
     with open(metadata_header, "w") as header_file:
         header_file.write(interface_c_module.get_source())
@@ -62,51 +83,82 @@ def generate_c_interface_header(
     return metadata_header
 
 
-def _populate_codegen_dir(mod, codegen_dir: str, module_name: str = None):
+# List of type_key for modules which are ephemeral and do not need to be exported.
+EPHEMERAL_MODULE_TYPE_KEYS = ("metadata_module",)
+
+
+def _populate_codegen_dir(
+    mods: typing.Union[
+        typing.List[executor_factory.ExecutorFactoryModule],
+        typing.List[tvm.runtime.Module],
+    ],
+    codegen_dir: str,
+):
     """Populate the codegen sub-directory as part of a Model Library Format export.
 
     Parameters
     ----------
-    mod : tvm.runtime.Module
-        Module which should be written to codegen_dir.
+    mods : List[tvm.relay.backend.executor_factory.ExecutorFactoryModule], List[tvm.runtime.Module]
+        A list of the return value of tvm.relay.build, which
+        will be exported into Model Library Format.
     codegen_dir : str
         Path to the codegen directory on disk.
     module_name: Optional[str]
         Name used to prefix the generated source files
 
     """
-    dso_modules = mod._collect_dso_modules()
-    non_dso_modules = mod._collect_from_import_tree(lambda m: m not in dso_modules)
-    if non_dso_modules:
-        raise UnsupportedInModelLibraryFormatError(
-            f"Don't know how to export non-c or non-llvm modules; found: {non_dso_modules!r}"
+    dso_modules = []
+    for mod in mods:
+        if isinstance(mod, executor_factory.ExecutorFactoryModule):
+            lib = mod.lib
+        elif isinstance(mod, tvm.runtime.Module):
+            lib = mod
+        else:
+            raise RuntimeError(f"Not supported module type: {type(mod)}")
+
+        dso_modules = lib._collect_dso_modules()
+        non_dso_modules = lib._collect_from_import_tree(lambda m: m not in dso_modules)
+
+        # Filter ephemeral modules which cannot be exported.
+        dso_modules = [m for m in dso_modules if m.type_key not in EPHEMERAL_MODULE_TYPE_KEYS]
+        non_dso_modules = [
+            m for m in non_dso_modules if m.type_key not in EPHEMERAL_MODULE_TYPE_KEYS
+        ]
+
+        if non_dso_modules:
+            raise UnsupportedInModelLibraryFormatError(
+                f"Don't know how to export non-c or non-llvm modules; found: {non_dso_modules!r}"
+            )
+
+        mod_indices = {"lib": 0, "src": 0}
+        host_codegen_dir = os.path.join(codegen_dir, "host")
+        lib_name = (
+            f"{mod.libmod_name}_lib"
+            if isinstance(mod, executor_factory.ExecutorFactoryModule)
+            else "lib"
         )
 
-    mod_indices = {"lib": 0, "src": 0}
-    host_codegen_dir = os.path.join(codegen_dir, "host")
-    lib_name = f"{module_name}_lib" if module_name else "lib"
+        for dso_mod in dso_modules:
+            if dso_mod.type_key == "c":
+                assert dso_mod.format in ["c", "cc", "cpp"]
+                ext = dso_mod.format
+                index = mod_indices["src"]
+                mod_indices["src"] += 1
+                parent_dir = os.path.join(host_codegen_dir, "src")
+                file_name = os.path.join(parent_dir, f"{lib_name}{index}.{ext}")
+            elif dso_mod.type_key == "llvm":
+                index = mod_indices["lib"]
+                mod_indices["lib"] += 1
+                parent_dir = os.path.join(host_codegen_dir, "lib")
+                file_name = os.path.join(parent_dir, f"{lib_name}{index}.o")
+            else:
+                assert (
+                    False
+                ), f"do not expect module with type_key={lib.type_key} from _collect_dso_modules"
 
-    for dso_mod in dso_modules:
-        if dso_mod.type_key == "c":
-            assert dso_mod.format in ["c", "cc", "cpp"]
-            ext = dso_mod.format
-            index = mod_indices["src"]
-            mod_indices["src"] += 1
-            parent_dir = os.path.join(host_codegen_dir, "src")
-            file_name = os.path.join(parent_dir, f"{lib_name}{index}.{ext}")
-        elif dso_mod.type_key == "llvm":
-            index = mod_indices["lib"]
-            mod_indices["lib"] += 1
-            parent_dir = os.path.join(host_codegen_dir, "lib")
-            file_name = os.path.join(parent_dir, f"{lib_name}{index}.o")
-        else:
-            assert (
-                False
-            ), f"do not expect module with type_key={mod.type_key} from _collect_dso_modules"
-
-        if not os.path.exists(parent_dir):
-            os.makedirs(parent_dir)
-        dso_mod.save(file_name)
+            if not os.path.exists(parent_dir):
+                os.makedirs(parent_dir)
+            dso_mod.save(file_name)
 
 
 def _build_memory_map(mod):
@@ -160,6 +212,36 @@ def _build_sid_map(graph_json):
     return memory_map
 
 
+def _create_type_metadata(input_type):
+    return {
+        "size": int(_shape_to_size(input_type.shape, input_type.dtype)),
+        "dtype": str(input_type.dtype),
+    }
+
+
+def _flatten_tuple_outputs(ret_type, predefined_names, offset=0):
+    if isinstance(ret_type, tvm.ir.tensor_type.TensorType):
+        name = predefined_names[offset] if predefined_names else f"output{offset}"
+        return {name: ret_type}
+
+    added_fields = len(ret_type.fields)
+    outputs = {}
+    for output_index in range(added_fields):
+        next_output = offset + len(outputs)
+        outputs.update(
+            _flatten_tuple_outputs(ret_type.fields[output_index], predefined_names, next_output)
+        )
+
+    return outputs
+
+
+def _get_outputs_from_ret_type(ret_type, predefined_names):
+    if isinstance(ret_type, tvm.ir.tensor_type.TensorType):
+        name = predefined_names[0] if predefined_names else "output"
+        return {name: ret_type}
+    return _flatten_tuple_outputs(ret_type, predefined_names)
+
+
 def _build_function_memory_map(function_metadata):
     """Build a simple map that shows how much workspace is required to execute
     each primitive function. The main_func describes how much memory is required
@@ -179,42 +261,26 @@ def _build_function_memory_map(function_metadata):
     """
     device_max_workspace = dict()
     main_func_metadata = function_metadata[MAIN_FUNC_NAME_STR]
-    num_targets = len(main_func_metadata.workspace_sizes.items())
-    from tvm.driver import tvmc  # pylint: disable=import-outside-toplevel
-
-    external_codegens = tvmc.composite_target.get_codegen_names()
     func_entries = []
     target_local_entries = dict()
-    for i in range(num_targets):
-        main_target = main_func_metadata.workspace_sizes.items()[i][0]
-        device_max_workspace[main_target] = 0
-        for func_name, finfo in function_metadata.items():
-            if func_name == MAIN_FUNC_NAME_STR:
-                continue
-            target_local_entries[func_name] = list()
 
-        for func_name, finfo in function_metadata.items():
-            # Skip a few unsupported cases:
-            # 1. The main function metadata is exported elsewhere.
-            # 2. BYOC operator implementations do not currently export useful FunctionInfo.
-            if func_name == MAIN_FUNC_NAME_STR or not finfo.tir_primfuncs:
-                continue
-            assert (
-                len(finfo.constant_sizes.items()) == num_targets
-            ), f"{func_name}: found {finfo.constant_sizes!r} vs {num_targets}"
-            assert len(finfo.io_sizes.items()) == num_targets
-            target = finfo.workspace_sizes.items()[i][0]
-            workspace_size = finfo.workspace_sizes.items()[i][1]
+    for func_name, finfo in function_metadata.items():
+        # Skip a few unsupported cases:
+        # 1. The main function metadata is exported elsewhere.
+        # 2. BYOC operator implementations do not currently export useful FunctionInfo.
+        if func_name == MAIN_FUNC_NAME_STR or not finfo.tir_primfuncs:
+            continue
+        if func_name not in target_local_entries.keys():
+            target_local_entries[func_name] = list()
+        for target in dict(finfo.workspace_sizes).keys():
+            workspace_size = finfo.workspace_sizes[target]
             target_entry = {
-                "device": int(target.kind.device_type),
+                "device": int(target.get_target_device_type()),
                 "workspace_size_bytes": int(workspace_size),
             }
             target_local_entries[func_name].append(target_entry)
-            if workspace_size > device_max_workspace.get(target, 0):
-                device_max_workspace[target] = workspace_size
-            # TODO(Mousius) - Remove this massive hack when Targets are unified
-            if target.kind.name in external_codegens:
-                device_max_workspace[main_target] += int(workspace_size)
+            if workspace_size >= device_max_workspace.get(int(target.get_target_device_type()), 0):
+                device_max_workspace[int(target.get_target_device_type())] = workspace_size
 
     for func_name, target_entries_ in target_local_entries.items():
         func_entry = {
@@ -223,63 +289,79 @@ def _build_function_memory_map(function_metadata):
         }
         func_entries.append(func_entry)
 
-    target_main_entries = list()
-    for i in range(num_targets):
-        target = main_func_metadata.workspace_sizes.items()[i][0]
-        main_func_local_workspace = main_func_metadata.workspace_sizes.items()[i][1]
-        main_func_constants = main_func_metadata.constant_sizes.items()[i][1]
-        main_func_io = main_func_metadata.io_sizes.items()[i][1]
-        target_main_entries.append(
-            {
-                "device": int(target.kind.device_type),
-                "workspace_size_bytes": int(device_max_workspace[target])
-                + int(main_func_local_workspace),
-                "constants_size_bytes": int(main_func_constants),
-                "io_size_bytes": int(main_func_io),
-            }
+    target_main_entries = dict()
+
+    def _create_empty_entry(target_device_type):
+        return {
+            "device": int(target_device_type),
+            "workspace_size_bytes": 0,
+            "constants_size_bytes": 0,
+            "io_size_bytes": 0,
+        }
+
+    for target in dict(main_func_metadata.workspace_sizes).keys():
+        main_func_local_workspace = main_func_metadata.workspace_sizes[target]
+        target_main_entries[int(target.get_target_device_type())] = _create_empty_entry(
+            int(target.get_target_device_type())
         )
+        target_main_entries[int(target.get_target_device_type())]["workspace_size_bytes"] = int(
+            device_max_workspace.get(int(target.get_target_device_type()), 0)
+        ) + int(main_func_local_workspace)
+
+    for target in dict(main_func_metadata.constant_sizes).keys():
+        if int(target.get_target_device_type()) not in target_main_entries.keys():
+            target_main_entries[int(target.get_target_device_type())] = _create_empty_entry(
+                int(target.get_target_device_type())
+            )
+        target_main_entries[int(target.get_target_device_type())]["constants_size_bytes"] = int(
+            main_func_metadata.constant_sizes[target]
+        )
+
+    for target in dict(main_func_metadata.io_sizes).keys():
+        if int(target.get_target_device_type()) not in target_main_entries.keys():
+            target_main_entries[int(target.get_target_device_type())] = _create_empty_entry(
+                int(target.get_target_device_type())
+            )
+        target_main_on_device = target_main_entries[int(target.get_target_device_type())]
+        target_main_on_device["io_size_bytes"] = int(main_func_metadata.io_sizes[target])
+
+        main_relay_func = main_func_metadata.relay_primfuncs[target]
+        target_main_on_device["inputs"] = {
+            input_param.name_hint: _create_type_metadata(input_param.checked_type)
+            for input_param in main_relay_func.params
+        }
+        predefined_names = (
+            main_relay_func.attrs["output_tensor_names"]
+            if "output_tensor_names" in main_relay_func.attrs
+            else None
+        )
+        target_main_on_device["outputs"] = {
+            name: _create_type_metadata(output_type)
+            for name, output_type in _get_outputs_from_ret_type(
+                main_relay_func.ret_type, predefined_names
+            ).items()
+        }
 
     ret = {
         "operator_functions": func_entries,
-        "main": target_main_entries,
+        "main": list(target_main_entries.values()),
     }
     return ret
 
 
-def _get_main_relay_func(mod: executor_factory.ExecutorFactoryModule):
-    main_func = mod.function_metadata[MAIN_FUNC_NAME_STR]
-    target = list(main_func.relay_primfuncs.keys())[0]
-    return main_func.relay_primfuncs[target]
+def _get_pools_from_module(mod):
+    return list(dict(mod.executor_codegen_metadata.pool_inputs).values())
 
 
-def _convert_tuple_to_outputs(ret_type, offset=0):
-    outputs = []
-    added_fields = len(ret_type.fields)
-    for output_index in range(added_fields):
-        next_output = offset + len(outputs)
-        if isinstance(ret_type.fields[output_index], TupleType):
-            outputs.extend(_convert_tuple_to_outputs(ret_type.fields[output_index], next_output))
-        else:
-            outputs.append(f"output{next_output}")
-    return outputs
-
-
-def _get_inputs_and_outputs_from_module(mod):
-    main_func = _get_main_relay_func(mod)
-    inputs = [argument.name_hint for argument in main_func.params]
-
-    outputs = ["output"]
-    if isinstance(main_func.ret_type, TupleType):
-        outputs = _convert_tuple_to_outputs(main_func.ret_type)
-
-    return inputs, outputs
+def _get_io_pool_allocation_from_module(mod):
+    return dict(mod.executor_codegen_metadata.io_pool_allocations)
 
 
 def _should_generate_interface_header(mod):
     return "interface-api" in mod.executor and mod.executor["interface-api"] == "c"
 
 
-def _make_tar(source_dir, tar_file_path, mod):
+def _make_tar(source_dir, tar_file_path, modules):
     """Build a tar file from source_dir."""
     with tarfile.open(tar_file_path, "w") as tar_f:
 
@@ -289,82 +371,143 @@ def _make_tar(source_dir, tar_file_path, mod):
             return tarinfo
 
         tar_f.add(str(source_dir), arcname=".", filter=reset)
-        is_aot = isinstance(mod, executor_factory.AOTExecutorFactoryModule)
-        if is_aot and str(mod.runtime) == "crt":
-            tar_f.add(get_standalone_crt_dir(), arcname=STANDALONE_CRT_URL)
+
+        for mod in modules:
+            is_aot = isinstance(mod, executor_factory.AOTExecutorFactoryModule)
+            if is_aot and str(mod.runtime) == "crt":
+                crt_template_path = pathlib.Path(get_microtvm_template_projects("crt"))
+                tar_f.add(get_standalone_crt_dir(), arcname=STANDALONE_CRT_URL)
+
+                # Add template files from CRT template project
+                for file in [
+                    "templates/crt_config.h.template",
+                    "templates/platform.c.template",
+                ]:
+                    tar_f.add(
+                        crt_template_path / pathlib.Path(file),
+                        arcname=f"{CRT_TEMPLATE_FILES_URL}/{pathlib.Path(file).name}",
+                    )
+                break
 
 
-_GENERATED_VERSION = 5
+_GENERATED_VERSION = 7
+
+
+def _is_module_names_unique(mods: typing.List[executor_factory.ExecutorFactoryModule]):
+    """Check if built modules have unique names.
+
+    Parameters
+    ----------
+    mods : List[tvm.relay.backend.executor_factory.ExecutorFactoryModule]
+        A list of the return value of tvm.relay.build,
+        which will be exported into Model Library Format.
+    """
+    all_names = []
+    for mod in mods:
+        all_names.append(mod.libmod_name)
+
+    return len(set(all_names)) == len(all_names)
 
 
 def _export_graph_model_library_format(
-    mod: executor_factory.ExecutorFactoryModule, tempdir: pathlib.Path
+    mods: typing.List[executor_factory.ExecutorFactoryModule], tempdir: pathlib.Path
 ):
     """Export a tvm.relay.build artifact in Model Library Format.
 
     Parameters
     ----------
-    mod : tvm.relay.backend.executor_factory.ExecutorFactoryModule
-        The return value of tvm.relay.build, which will be exported into Model Library Format.
+    mods : List[tvm.relay.backend.executor_factory.ExecutorFactoryModule]
+        A list of the return value of tvm.relay.build,
+        which will be exported into Model Library Format.
     tempdir : pathlib.Path
         Temporary directory to populate with Model Library Format contents.
     """
-    is_aot = isinstance(mod, executor_factory.AOTExecutorFactoryModule)
-    executor = ["aot"] if is_aot else ["graph"]
+
+    assert _is_module_names_unique(mods), "Multiple modules should have unique names."
 
     metadata = {
         "version": _GENERATED_VERSION,
-        "model_name": mod.libmod_name,
-        "export_datetime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%SZ"),
-        "memory": _build_memory_map(mod),
-        "target": {int(k): str(v) for k, v in mod.target.items()},
-        "executors": executor,
-        "style": "full-model",
     }
-
-    if is_aot and (str(mod.runtime) == "crt"):
-        standalone_crt = {
-            "short_name": "tvm_standalone_crt",
-            "url": f"{STANDALONE_CRT_URL}",
-            "url_type": "mlf_path",
-            "version_spec": f"{tvm.__version__}",
+    metadata["modules"] = {}
+    for mod in mods:
+        is_aot = isinstance(mod, executor_factory.AOTExecutorFactoryModule)
+        executor = ["aot"] if is_aot else ["graph"]
+        module_name = mod.libmod_name
+        metadata["modules"][module_name] = {
+            "model_name": module_name,
+            "export_datetime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%SZ"),
+            "memory": _build_memory_map(mod),
+            "target": [str(t) for t in mod.target],
+            "executors": executor,
+            "style": "full-model",
         }
-        external_dependencies = [standalone_crt]
-        metadata["external_dependencies"] = external_dependencies
 
-    with open(tempdir / "metadata.json", "w") as json_f:
+        if is_aot and (str(mod.runtime) == "crt"):
+            standalone_crt = {
+                "short_name": "tvm_standalone_crt",
+                "url": f"{STANDALONE_CRT_URL}",
+                "url_type": "mlf_path",
+                "version_spec": f"{tvm.__version__}",
+            }
+            external_dependencies = [standalone_crt]
+            metadata["modules"][module_name]["external_dependencies"] = external_dependencies
+
+    with open(tempdir / METADATA_FILE, "w") as json_f:
         json.dump(metadata, json_f, indent=2, sort_keys=True)
 
     codegen_dir = tempdir / "codegen"
     codegen_dir.mkdir()
-    _populate_codegen_dir(mod.lib, codegen_dir, mod.libmod_name)
-
-    if _should_generate_interface_header(mod):
-        include_path = codegen_dir / "host" / "include"
-        include_path.mkdir()
-        inputs, outputs = _get_inputs_and_outputs_from_module(mod)
-        devices = mod.get_devices()
-        workspace_size = int(metadata["memory"]["functions"]["main"][0]["workspace_size_bytes"])
-        generate_c_interface_header(
-            mod.libmod_name, inputs, outputs, devices, workspace_size, include_path
-        )
+    _populate_codegen_dir(mods, codegen_dir)
 
     parameters_dir = tempdir / "parameters"
     parameters_dir.mkdir()
-    param_filename = parameters_dir / f"{mod.libmod_name}.params"
-    with open(param_filename, "wb") as f:
-        f.write(param_dict.save_param_dict(mod.params))
-
     src_dir = tempdir / "src"
     src_dir.mkdir()
-    with open(src_dir / "relay.txt", "w") as f:
-        f.write(str(mod.ir_mod))
+    graph_config_dir = tempdir / "executor-config" / "graph"
+    for mod in mods:
+        if _should_generate_interface_header(mod):
+            include_path = codegen_dir / "host" / "include"
+            if not include_path.exists():
+                include_path.mkdir()
 
-    if not is_aot:
-        graph_config_dir = tempdir / "executor-config" / "graph"
-        graph_config_dir.mkdir(parents=True)
-        with open(graph_config_dir / "graph.json", "w") as f:
-            f.write(mod.get_executor_config())
+            devices = mod.get_devices()
+            pools = _get_pools_from_module(mod)
+            io_pool_allocations = _get_io_pool_allocation_from_module(mod)
+            main_func = metadata["modules"][mod.libmod_name]["memory"]["functions"]["main"][0]
+            workspace_size = int(main_func["workspace_size_bytes"])
+            inputs = main_func["inputs"]
+            outputs = main_func["outputs"]
+            inputs_sizes = {name: property_map["size"] for name, property_map in inputs.items()}
+            output_sizes = {name: property_map["size"] for name, property_map in outputs.items()}
+            input_names = list(inputs.keys())
+            output_names = list(outputs.keys())
+
+            generate_c_interface_header(
+                mod.libmod_name,
+                input_names,
+                output_names,
+                pools,
+                io_pool_allocations,
+                devices,
+                workspace_size,
+                include_path,
+                inputs_sizes,
+                output_sizes,
+            )
+
+        is_aot = isinstance(mod, executor_factory.AOTExecutorFactoryModule)
+        param_filename = parameters_dir / f"{mod.libmod_name}.params"
+        with open(param_filename, "wb") as f:
+            f.write(param_dict.save_param_dict(mod.params))
+
+        with open(src_dir / f"{mod.libmod_name}.relay", "w") as f:
+            f.write(str(mod.ir_mod))
+
+        if not is_aot:
+            if not graph_config_dir.exists():
+                graph_config_dir.mkdir(parents=True)
+            with open(graph_config_dir / f"{mod.libmod_name}.graph", "w") as f:
+                f.write(mod.get_executor_config())
 
 
 class NonStaticShapeError(Exception):
@@ -373,7 +516,7 @@ class NonStaticShapeError(Exception):
 
 def _shape_to_size(shape, dtype):
     bits_per_item = int(
-        re.match(r"((float)|(int))(?P<width_bits>[0-9]+)", dtype).group("width_bits")
+        re.match(r"((float)|(int)|(uint))(?P<width_bits>[0-9]+)", dtype).group("width_bits")
     )
     assert bits_per_item is not None, f"don't know how to compute size of type {dtype}"
     total_bits = bits_per_item
@@ -395,9 +538,11 @@ def _write_tir_and_build_operator_memory_map(src_dir, targets, ir_module_by_targ
         return shape
 
     memory_map = {}
-    for target_device_type, target in targets.items():
+    for target in targets:
+        # TODO(mbs): The device type is not unique, better would be to use target.kind.name
+        target_device_type = target.get_target_device_type()
         ir_mod = ir_module_by_target[target]
-        printer = get_global_func("tir.ModelLibraryFormatPrinter")(False, None, False)
+        printer = get_global_func("relay.ir.ModelLibraryFormatPrinter")(False, None, False)
         with open(src_dir / f"tir-{target_device_type}.txt", "w") as f:
             f.write(printer["print"](ir_mod))
 
@@ -422,17 +567,14 @@ def _write_tir_and_build_operator_memory_map(src_dir, targets, ir_module_by_targ
 
 def _export_operator_model_library_format(mod: build_module.OperatorModule, tempdir):
     """Export the result of tvm.build() in Model Library Format.
-
     Parameters
     ----------
     mod : runtime.Module
         The Module returned from tvm.build().
-    args : list of Buffer or Tensor or Var, optional
-        The args supplied to tvm.build().
-    file_name : str
+    tempdir : str
         Path to the .tar archive to generate.
     """
-    targets = {}
+    targets = []
     for target in mod.ir_module_by_target.keys():
         if str(target.kind) not in ("llvm", "c"):
             raise UnsupportedInModelLibraryFormatError(
@@ -440,7 +582,7 @@ def _export_operator_model_library_format(mod: build_module.OperatorModule, temp
                 "Model Library Format"
             )
 
-        targets[int(_nd.device(str(target)).device_type)] = target
+        targets.append(target)
 
     src_dir = tempdir / "src"
     src_dir.mkdir()
@@ -451,16 +593,16 @@ def _export_operator_model_library_format(mod: build_module.OperatorModule, temp
         "model_name": mod.name,
         "export_datetime": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%SZ"),
         "memory": memory_map,
-        "target": {k: str(v) for k, v in targets.items()},
+        "target": [str(t) for t in targets],
         "executors": [],
         "style": "operator",
     }
-    with open(tempdir / "metadata.json", "w") as metadata_f:
+    with open(tempdir / METADATA_FILE, "w") as metadata_f:
         json.dump(metadata, metadata_f)
 
     codegen_dir = tempdir / "codegen"
     codegen_dir.mkdir()
-    _populate_codegen_dir(mod, codegen_dir)
+    _populate_codegen_dir(list([mod]), codegen_dir)
 
 
 ExportableModule = typing.Union[
@@ -470,7 +612,10 @@ ExportableModule = typing.Union[
 ]
 
 
-def export_model_library_format(mod: ExportableModule, file_name: typing.Union[str, pathlib.Path]):
+def export_model_library_format(
+    mods: typing.Union[ExportableModule, typing.List[ExportableModule]],
+    file_name: typing.Union[str, pathlib.Path],
+):
     """Export the build artifact in Model Library Format.
 
     This function creates a .tar archive containing the build artifacts in a standardized
@@ -479,7 +624,7 @@ def export_model_library_format(mod: ExportableModule, file_name: typing.Union[s
 
     Parameters
     ----------
-    mod : ExportableModule
+    mod : ExportableModule, List[ExportableModule]
         The return value of tvm.build or tvm.relay.build.
     file_name : str
         Path to the .tar archive to generate.
@@ -489,20 +634,36 @@ def export_model_library_format(mod: ExportableModule, file_name: typing.Union[s
     file_name : str
         The path to the generated .tar archive.
     """
-    file_name = pathlib.Path(file_name)
+    modules = mods
+    if not isinstance(mods, list):
+        modules = list([mods])
 
+    operator_module_type = all(isinstance(mod, build_module.OperatorModule) for mod in modules)
+    graph_module_type = all(
+        isinstance(
+            mod,
+            (
+                executor_factory.AOTExecutorFactoryModule,
+                executor_factory.GraphExecutorFactoryModule,
+            ),
+        )
+        for mod in modules
+    )
+
+    file_name = pathlib.Path(file_name)
     tempdir = utils.tempdir()
 
-    if isinstance(mod, build_module.OperatorModule):
-        _export_operator_model_library_format(mod, tempdir.path)
-    elif isinstance(
-        mod,
-        (executor_factory.AOTExecutorFactoryModule, executor_factory.GraphExecutorFactoryModule),
-    ):
-        _export_graph_model_library_format(mod, tempdir.path)
+    if operator_module_type:
+        if len(modules) != 1:
+            raise RuntimeError("Multiple operator is not supported.")
+        _export_operator_model_library_format(modules[0], tempdir.path)
+    elif graph_module_type:
+        _export_graph_model_library_format(modules, tempdir.path)
     else:
-        raise NotImplementedError(f"Don't know how to export module of type {mod.__class__!r}")
+        raise NotImplementedError(
+            f"Don't know how to export module of type {modules[0].__class__!r}"
+        )
 
-    _make_tar(tempdir.path, file_name, mod)
+    _make_tar(tempdir.path, file_name, modules)
 
     return file_name

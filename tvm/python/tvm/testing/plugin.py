@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# pylint: disable=unused-argument
 
 """Pytest plugin for using tvm testing extensions.
 
@@ -37,6 +38,13 @@ import _pytest
 import tvm
 from tvm.testing import utils
 
+try:
+    from xdist.scheduler.loadscope import LoadScopeScheduling
+
+    HAVE_XDIST = True
+except ImportError:
+    HAVE_XDIST = False
+
 
 MARKERS = {
     "gpu": "mark a test as requiring a gpu",
@@ -56,11 +64,16 @@ MARKERS = {
 def pytest_configure(config):
     """Runs at pytest configure time, defines marks to be used later."""
 
-    for markername, desc in MARKERS.items():
-        config.addinivalue_line("markers", "{}: {}".format(markername, desc))
+    for feature in utils.Feature._all_features.values():
+        feature._register_marker(config)
 
     print("enabled targets:", "; ".join(map(lambda x: x[0], utils.enabled_targets())))
     print("pytest marker:", config.option.markexpr)
+
+
+def pytest_addoption(parser):
+    """Add pytest options."""
+    parser.addoption("--gtest_args", action="store", default="")
 
 
 def pytest_generate_tests(metafunc):
@@ -68,6 +81,11 @@ def pytest_generate_tests(metafunc):
     _parametrize_correlated_parameters(metafunc)
     _auto_parametrize_target(metafunc)
     _add_target_specific_marks(metafunc)
+
+    # Process gtest arguments
+    option_value = metafunc.config.option.gtest_args
+    if "gtest_args" in metafunc.fixturenames and option_value is not None:
+        metafunc.parametrize("gtest_args", [option_value])
 
 
 def pytest_collection_modifyitems(config, items):
@@ -269,25 +287,26 @@ def _target_to_requirement(target):
 
     # mapping from target to decorator
     if target.kind.name == "cuda" and "cudnn" in target.attrs.get("libs", []):
-        return utils.requires_cudnn()
+        return utils.requires_cudnn.marks()
     if target.kind.name == "cuda" and "cublas" in target.attrs.get("libs", []):
-        return utils.requires_cublas()
+        return utils.requires_cublas.marks()
     if target.kind.name == "cuda":
-        return utils.requires_cuda()
+        return utils.requires_cuda.marks()
     if target.kind.name == "rocm":
-        return utils.requires_rocm()
+        return utils.requires_rocm.marks()
     if target.kind.name == "vulkan":
-        return utils.requires_vulkan()
+        return utils.requires_vulkan.marks()
     if target.kind.name == "nvptx":
-        return utils.requires_nvptx()
+        return utils.requires_nvptx.marks()
     if target.kind.name == "metal":
-        return utils.requires_metal()
+        return utils.requires_metal.marks()
     if target.kind.name == "opencl":
-        return utils.requires_opencl()
+        return utils.requires_opencl.marks()
     if target.kind.name == "llvm":
-        return utils.requires_llvm()
+        return utils.requires_llvm.marks()
     if target.kind.name == "hexagon":
-        return utils.requires_hexagon()
+        return utils.requires_hexagon.marks()
+
     return []
 
 
@@ -318,3 +337,38 @@ def _parametrize_correlated_parameters(metafunc):
             names = ",".join(name for name, values in params)
             value_sets = zip(*[values for name, values in params])
             metafunc.parametrize(names, value_sets, indirect=True, ids=ids)
+
+
+# pytest-xdist isn't required but is used in CI, so guard on its presence
+if HAVE_XDIST:
+
+    def pytest_xdist_make_scheduler(config, log):
+        """
+        Serialize certain tests for pytest-xdist that have inter-test
+        dependencies
+        """
+
+        class TvmTestScheduler(LoadScopeScheduling):
+            """
+            Scheduler to serializer tests
+            """
+
+            def _split_scope(self, nodeid):
+                """
+                Returns a specific string for classes of nodeids
+                """
+                # NOTE: these tests contain inter-test dependencies and must be
+                # serialized
+                items = {
+                    "test_tvm_testing_features": "functional-tests",
+                    "tests/python/micro/test_crt": "crt-tests",
+                    "tests/python/driver/tvmc": "tvmc-tests",
+                }
+
+                for nodeid_pattern, suite_name in items.items():
+                    if nodeid_pattern in nodeid:
+                        return suite_name
+
+                return nodeid
+
+        return TvmTestScheduler(config, log)

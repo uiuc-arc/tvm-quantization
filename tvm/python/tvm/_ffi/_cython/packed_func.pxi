@@ -17,7 +17,7 @@
 
 import ctypes
 import traceback
-from cpython cimport Py_INCREF, Py_DECREF
+from cpython cimport Py_INCREF, Py_DECREF, PyGILState_Ensure, PyGILState_Release
 from numbers import Number, Integral
 from ..base import string_types, py2cerror
 from ..runtime_ctypes import DataType, Device, TVMByteArray, ObjectRValueRef
@@ -46,7 +46,7 @@ cdef int tvm_callback(TVMValue* args,
             tcode == kTVMNDArrayHandle or
             tcode == kTVMObjectRefArg or
             tcode > kTVMExtBegin):
-            CALL(TVMCbArgToReturn(&value, &tcode))
+            CHECK_CALL(TVMCbArgToReturn(&value, &tcode))
 
         if tcode != kTVMDLTensorHandle:
             pyargs.append(make_ret(value, tcode))
@@ -54,17 +54,18 @@ cdef int tvm_callback(TVMValue* args,
             pyargs.append(c_make_array(value.v_handle, True, False))
     try:
         rv = local_pyfunc(*pyargs)
-    except Exception:
+    except Exception as err:
         msg = traceback.format_exc()
         msg = py2cerror(msg)
-        TVMAPISetLastError(c_str(msg))
+        TVMAPISetLastPythonError(<void*>err)
+
         return -1
     if rv is not None:
         if isinstance(rv, tuple):
             raise ValueError("PackedFunction can only support one return value")
         temp_args = []
         make_arg(rv, &value, &tcode, temp_args)
-        CALL(TVMCFuncSetReturn(ret, &value, &tcode, 1))
+        CHECK_CALL(TVMCFuncSetReturn(ret, &value, &tcode, 1))
     return 0
 
 
@@ -90,10 +91,10 @@ def convert_to_tvm_func(object pyfunc):
     """
     cdef TVMPackedFuncHandle chandle
     Py_INCREF(pyfunc)
-    CALL(TVMFuncCreateFromCFunc(tvm_callback,
-                                <void*>(pyfunc),
-                                tvm_callback_finalize,
-                                &chandle))
+    CHECK_CALL(TVMFuncCreateFromCFunc(tvm_callback,
+                                      <void*>(pyfunc),
+                                      tvm_callback_finalize,
+                                      &chandle))
     return make_packed_func(chandle, False)
 
 
@@ -243,8 +244,12 @@ cdef inline int FuncCall3(void* chandle,
     temp_args = []
     for i in range(nargs):
         make_arg(args[i], &values[i], &tcodes[i], temp_args)
-    CALL(TVMFuncCall(chandle, &values[0], &tcodes[0],
-                     nargs, ret_val, ret_tcode))
+
+    with nogil:
+        c_api_ret_code = TVMFuncCall(chandle, &values[0], &tcodes[0],
+                                     nargs, ret_val, ret_tcode)
+
+    CHECK_CALL(c_api_ret_code)
     return 0
 
 cdef inline int FuncCall(void* chandle,
@@ -252,6 +257,7 @@ cdef inline int FuncCall(void* chandle,
                          TVMValue* ret_val,
                          int* ret_tcode) except -1:
     cdef int nargs
+    cdef int c_api_ret_code
     nargs = len(args)
     if nargs <= 3:
         FuncCall3(chandle, args, nargs, ret_val, ret_tcode)
@@ -264,8 +270,11 @@ cdef inline int FuncCall(void* chandle,
     temp_args = []
     for i in range(nargs):
         make_arg(args[i], &values[i], &tcodes[i], temp_args)
-    CALL(TVMFuncCall(chandle, &values[0], &tcodes[0],
-                     nargs, ret_val, ret_tcode))
+
+    with nogil:
+        c_api_ret_code = TVMFuncCall(chandle, &values[0], &tcodes[0],
+                                     nargs, ret_val, ret_tcode)
+    CHECK_CALL(c_api_ret_code)
     return 0
 
 
@@ -314,7 +323,7 @@ cdef class PackedFuncBase:
 
     def __dealloc__(self):
         if self.is_global == 0:
-            CALL(TVMFuncFree(self.chandle))
+            CHECK_CALL(TVMFuncFree(self.chandle))
 
     def __call__(self, *args):
         cdef TVMValue ret_val
@@ -326,7 +335,7 @@ cdef class PackedFuncBase:
 
 def _get_global_func(name, allow_missing):
     cdef TVMPackedFuncHandle chandle
-    CALL(TVMFuncGetGlobal(c_str(name), &chandle))
+    CHECK_CALL(TVMFuncGetGlobal(c_str(name), &chandle))
     if chandle != NULL:
         return make_packed_func(chandle, True)
 
@@ -360,3 +369,19 @@ def _set_class_object_generic(object_generic_class, func_convert_to_object):
     global _FUNC_CONVERT_TO_OBJECT
     _CLASS_OBJECT_GENERIC = object_generic_class
     _FUNC_CONVERT_TO_OBJECT = func_convert_to_object
+
+# Py_INCREF and Py_DECREF are C macros, not function objects.
+# Therefore, providing a wrapper function.
+cdef void _py_incref_wrapper(void* py_object):
+    Py_INCREF(<object>py_object)
+cdef void _py_decref_wrapper(void* py_object):
+    Py_DECREF(<object>py_object)
+
+def _init_pythonapi_inc_def_ref():
+    register_func = TVMBackendRegisterEnvCAPI
+    register_func(c_str("Py_IncRef"), <void*>_py_incref_wrapper)
+    register_func(c_str("Py_DecRef"), <void*>_py_decref_wrapper)
+    register_func(c_str("PyGILState_Ensure"), <void*>PyGILState_Ensure)
+    register_func(c_str("PyGILState_Release"), <void*>PyGILState_Release)
+
+_init_pythonapi_inc_def_ref()

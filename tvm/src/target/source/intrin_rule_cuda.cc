@@ -40,8 +40,15 @@ struct CUDAMath {
           return name;
         case 32:
           return name + 'f';
-        case 16:
-          return 'h' + name;
+        case 16: {
+          if (name == "fabs") {
+            return "__habs";
+          } else if (name == "round") {
+            return "hrint";
+          } else {
+            return "h" + name;
+          }
+        }
         default:
           return "";
       }
@@ -139,6 +146,9 @@ TVM_REGISTER_OP("tir.fabs")
     .set_attr<FLowerIntrinsic>("cuda.FLowerIntrinsic", DispatchPureExtern<CUDAMath>);
 
 TVM_REGISTER_OP("tir.round")
+    .set_attr<FLowerIntrinsic>("cuda.FLowerIntrinsic", DispatchPureExtern<CUDAMath>);
+
+TVM_REGISTER_OP("tir.nearbyint")
     .set_attr<FLowerIntrinsic>("cuda.FLowerIntrinsic", DispatchPureExtern<CUDAMath>);
 
 TVM_REGISTER_OP("tir.exp").set_attr<FLowerIntrinsic>("cuda.FLowerIntrinsic",

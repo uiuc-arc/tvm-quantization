@@ -1,24 +1,30 @@
 /***************************************************************************************************
- * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
@@ -44,8 +50,11 @@
 #include "cutlass/util/reference/host/gemm.h"
 
 #include "testbed_utils.h"
+#include "testbed_universal.h"
 
 #include "cutlass/layout/matrix.h"
+#include "cutlass/matrix_coord.h"
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
 
 namespace test {
 namespace gemm {
@@ -53,9 +62,12 @@ namespace device {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename Gemm>
+template <typename Gemm, bool Relu = false>
 struct Testbed {
 
+  using ElementA = typename Gemm::ElementA;
+  using ElementB = typename Gemm::ElementB;
+  using ElementC = typename Gemm::ElementC;
   using ElementAccumulator = typename Gemm::ElementAccumulator;
   using ElementCompute = typename Gemm::GemmKernel::Epilogue::OutputOp::ElementCompute;
 
@@ -266,6 +278,17 @@ struct Testbed {
       ElementAccumulator(0)
     );
 
+    if (Relu) {
+      for (int i = 0; i < problem_size.m(); ++i) {
+        for (int j = 0; j < problem_size.n(); ++j) {
+           reference_D.at(cutlass::MatrixCoord(i, j)) = 
+                  ((ElementCompute)reference_D.at(cutlass::MatrixCoord(i, j)) < (ElementCompute)0)
+                  ? (typename Gemm::ElementC)0
+                  : reference_D.at(cutlass::MatrixCoord(i, j));
+        }
+      }
+    }
+
     return compare_reference(problem_size, alpha, beta);
   }
 
@@ -291,7 +314,7 @@ struct Testbed {
       throw std::runtime_error("cudaGetDeviceProperties() failed");
     }
 
-    if (properties.sharedMemPerMultiprocessor < smem_size) {
+    if (properties.sharedMemPerBlockOptin < smem_size) {
       return false;
     }
 
@@ -301,10 +324,19 @@ struct Testbed {
 
   /// Executes one test
   bool run(
-    cutlass::gemm::GemmCoord problem_size, 
+    cutlass::gemm::GemmCoord problem_size,
     int split_k_slices = 1,
-    ElementCompute alpha = ElementCompute(1), 
-    ElementCompute beta = ElementCompute(0)) {
+    ElementCompute alpha = ElementCompute(1),
+    ElementCompute beta = ElementCompute(0))
+  {
+/*
+    std::cout << "\n-----------------------\n";
+    std::cout << "problem size: " << problem_size << "\n";
+    std::cout << "split_k_slices: " << split_k_slices << "\n";
+    std::cout << "alpha: " << alpha << "\n";
+    std::cout << "beta: " << beta << "\n";
+    std::cout << "-----------------------\n\n";
+*/
 
     // Waive test if insufficient CUDA device
     if (!sufficient()) {
@@ -368,8 +400,8 @@ struct Testbed {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <typename Gemm>
-bool TestAllGemm(
+template <typename Gemm, bool Relu=false>
+bool TestAllGemmBasic(
     const typename Gemm::LayoutA::Stride& stride_factor_A = typename Gemm::LayoutA::Stride(),
     const typename Gemm::LayoutB::Stride& stride_factor_B = typename Gemm::LayoutB::Stride(),
     const typename Gemm::LayoutC::Stride& stride_factor_C = typename Gemm::LayoutC::Stride()) {
@@ -418,7 +450,7 @@ bool TestAllGemm(
     2.0
   };
 
-  Testbed<Gemm> testbed(stride_factor_A, stride_factor_B, stride_factor_C);
+  Testbed<Gemm, Relu> testbed(stride_factor_A, stride_factor_B, stride_factor_C);
 
   using ElementCompute = typename Gemm::EpilogueOutputOp::ElementCompute;
 
@@ -457,6 +489,52 @@ bool TestAllGemm(
   }
 
   return passed;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename Gemm, bool Relu=false>
+bool TestAllGemm(
+    const typename Gemm::LayoutA::Stride& stride_factor_A,
+    const typename Gemm::LayoutB::Stride& stride_factor_B = typename Gemm::LayoutB::Stride(),
+    const typename Gemm::LayoutC::Stride& stride_factor_C = typename Gemm::LayoutC::Stride())
+{
+  // Test basic GEMM with non-default stride factors
+  return TestAllGemmBasic<Gemm, Relu>(stride_factor_A, stride_factor_B, stride_factor_C);
+}
+
+template <typename Gemm, bool Relu=false>
+bool TestAllGemm()
+{
+#ifdef NDEBUG
+  // Non-debug builds also test basic GEMM with default stride factors
+  if (!TestAllGemmBasic<Gemm, Relu>()) {
+    return false;
+  }
+#endif // NDEBUG
+
+  // Test universal GEMM
+#if 0
+  // Define the universal kernel
+  using UniversalKernel = cutlass::gemm::kernel::GemmUniversal<
+    typename Gemm::GemmKernel::Mma,                                 // Mma
+    typename Gemm::GemmKernel::Epilogue,                            // Epilogue
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>    // ThreadblockSwizzle
+  >;
+#else
+  // Define the streamk universal kernel
+  using UniversalKernel = cutlass::gemm::kernel::GemmUniversalStreamk<
+    typename Gemm::GemmKernel::Mma,                                 // Mma
+    typename Gemm::GemmKernel::Epilogue,                            // Epilogue
+    cutlass::gemm::threadblock::ThreadblockSwizzleStreamK           // ThreadblockSwizzle
+  >;
+#endif
+
+  // Define the universal adaptor
+  using UniversalGemm = cutlass::gemm::device::GemmUniversalAdapter<UniversalKernel>;
+
+  // Test universal GEMM
+  return TestAllGemmUniversal<UniversalGemm, Relu>();
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////

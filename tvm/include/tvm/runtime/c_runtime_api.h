@@ -53,6 +53,13 @@
 #define TVM_DLL EMSCRIPTEN_KEEPALIVE
 #endif
 
+// helper macro to suppress unused warning
+#if defined(__GNUC__)
+#define TVM_ATTRIBUTE_UNUSED __attribute__((unused))
+#else
+#define TVM_ATTRIBUTE_UNUSED
+#endif
+
 #ifndef TVM_DLL
 #ifdef _WIN32
 #ifdef TVM_EXPORTS
@@ -66,7 +73,7 @@
 #endif
 
 // TVM version
-#define TVM_VERSION "0.9.dev0"
+#define TVM_VERSION "0.15.0"
 
 // TVM Runtime is DLPack compatible.
 #include <dlpack/dlpack.h>
@@ -80,16 +87,73 @@ extern "C" {
 /*! \brief type of array index. */
 typedef int64_t tvm_index_t;
 
-/*! \brief Extension device types in TVM */
+/*! \brief Extension device types in TVM
+ *
+ * Additional enumerators to supplement those provided by
+ * DLPack's `DLDeviceType` enumeration.
+ *
+ * MAINTAINERS NOTE #1: We need to ensure that the two devices
+ * are identified by the same integer.
+ * Currently this requires manual verification.
+ * Discussed here: https://github.com/dmlc/dlpack/issues/111
+ * As of DLPack v0.7, the highest-valued enumerator in
+ * `DLDeviceType` is kDLHexagon = 16.
+ *
+ * MAINTAINERS NOTE #2: As of DLPack v0.7, the definition for
+ * `DLDeviceType` specifies an underlying storage type of
+ * `int32_t`.  That guarantees a variable of type
+ * `DLDeviceType` is capable of holding any integers provided
+ * by *either* of these enumerations.
+ *
+ * However, the `int32_t` specification only applies when the
+ * header file is compiled as C++, and this header file is also
+ * meant to work as C code.  So the unspecified storage type
+ * could be a latent bug when compiled as C.
+ */
+#ifdef __cplusplus
+typedef enum : int32_t {
+#else
 typedef enum {
-  kDLAOCL = 5,
-  kDLSDAccel = 6,
-  kOpenGL = 11,
-  kDLMicroDev = 13,
-  kDLHexagon = 14,
-  kDLWebGPU = 15
-  // AddExtraTVMType which is not in DLPack here
+#endif
+  // To help avoid accidental conflicts between `DLDeviceType`
+  // and this enumeration, start numbering the new enumerators
+  // a little higher than (currently) seems necessary.
+  kDLAOCL = 32,
+  kDLSDAccel,
+  kOpenGL,
+  kDLMicroDev,
+  TVMDeviceExtType_End,  // sentinel value
 } TVMDeviceExtType;
+
+#ifdef __cplusplus
+// Some other parts of TVM hardcode the integer identifier for
+// some DLPack / TVM devices, rather then using the symbolic
+// enumerator.   E.g., `2` rather than `kDLCUDA`.
+// These asserts should alert us when that mapping breaks.
+#define TVM_HARCODED_INTEGER_CHANGED_MSG                                                          \
+  "Change in compile-time integer.  Make sure hardcoded uses of this integer throughout TVM are " \
+  "updated."
+static_assert(kDLCPU == 1, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLCUDA == 2, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLCUDAHost == 3, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLOpenCL == 4, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLVulkan == 7, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLMetal == 8, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLVPI == 9, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLROCM == 10, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLROCMHost == 11, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLExtDev == 12, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLCUDAManaged == 13, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLOneAPI == 14, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLWebGPU == 15, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLHexagon == 16, TVM_HARCODED_INTEGER_CHANGED_MSG);
+
+static_assert(kDLAOCL == 32, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLSDAccel == 33, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kOpenGL == 34, TVM_HARCODED_INTEGER_CHANGED_MSG);
+static_assert(kDLMicroDev == 35, TVM_HARCODED_INTEGER_CHANGED_MSG);
+#undef TVM_HARCODED_INTEGER_CHANGED_MSG
+#endif
 
 /*!
  * \brief The type code in used and only used in TVM FFI for argument passing.
@@ -181,6 +245,25 @@ typedef void* TVMObjectHandle;
 TVM_DLL void TVMAPISetLastError(const char* msg);
 
 /*!
+ * \brief Used for implementing C API function.
+ *  Set last exception before return.
+ * \param py_object The python exception to be set
+ */
+TVM_DLL void TVMAPISetLastPythonError(void* py_object);
+
+/*! \brief Return the previous python error, if any.
+ *
+ * Used to propagate the original Python exception to a python
+ * try/except, when there are C++ stack frames between the location thro
+ *
+ * \return The previous argument passed during the most recent call to
+ *     TVMAPISetLastPythonError.  If TVMAPISetLastPythonError has not
+ *     been called, or if TVMDropLastPythonError has been called since
+ *     the most recent to TVMAPISetLastPythonError, returns nullptr.
+ */
+TVM_DLL void* TVMGetLastPythonError();
+
+/*!
  * \brief return str message of the last error
  *  all function in this file will return 0 when success
  *  and nonzero when an error occurred,
@@ -190,6 +273,42 @@ TVM_DLL void TVMAPISetLastError(const char* msg);
  *  \return error info
  */
 TVM_DLL const char* TVMGetLastError(void);
+
+/*!
+ * \brief Return the backtrace of the most recent error
+ *
+ * Returns the backtrace of the most recent error, if an error exists,
+ * and the error contains a backtrace.  If no error exists or the
+ * error does not contain a backtrace, returns nullptr.
+ *
+ *  \return The backtrace of the most recent error
+ */
+TVM_DLL const char* TVMGetLastBacktrace();
+
+/*!
+ * \brief Remove the propagated python error, if any
+ *
+ * Removes the TVM-held reference to a thrown python exception object.
+ * Because these objects contain references to the stack frames from
+ * which the exception was thrown, maintaining a reference to an
+ * exception object prevents any local python variables from being
+ * garbage-collected.  After retrieving the object using
+ * TVMGetLastPythonError, the Python FFI interface uses this method to
+ * clear the TVM-held reference to the exception, to allow garbage
+ * collection to continue.
+ */
+TVM_DLL void TVMDropLastPythonError();
+
+/*! \brief Re-throw the most recent error.
+ *
+ * If an error was previously set using TVMAPISetLastError or
+ * TVMAPISetLastPythonError, re-throw the error.  This is similar to
+ * `LOG(FATAL) << TVMGetLastError()`, but includes handling to
+ * propagate a python exception across C++ stack frames, or to append
+ * a stack trace to an error message.
+ */
+TVM_DLL void TVMThrowLastError();
+
 /*!
  * \brief Load module from file.
  * \param file_name The file name to load the module from.
@@ -298,7 +417,7 @@ TVM_DLL int TVMCbArgToReturn(TVMValue* value, int* code);
  * \param type_codes The type codes of the arguments
  * \param num_args Number of arguments.
  * \param ret The return value handle.
- * \param resource_handle The handle additional resouce handle from fron-end.
+ * \param resource_handle The handle additional resouce handle from front-end.
  * \return 0 if success, -1 if failure happens, set error via TVMAPISetLastError.
  * \sa TVMCFuncSetReturn
  */
@@ -307,7 +426,7 @@ typedef int (*TVMPackedCFunc)(TVMValue* args, int* type_codes, int num_args, TVM
 
 /*!
  * \brief C callback to free the resource handle in C packed function.
- * \param resource_handle The handle additional resouce handle from fron-end.
+ * \param resource_handle The handle additional resouce handle from front-end.
  */
 typedef void (*TVMPackedCFuncFinalizer)(void* resource_handle);
 

@@ -48,7 +48,7 @@ This folder contains the source of TVM's documentation, hosted at https://tvm.ap
    ```bash
    # Pillow on Ubuntu may require libjpeg-dev from apt
    ./docker/bash.sh ci_gpu -c \
-       'python3 -m pip install --quiet tlcpack-sphinx-addon==0.2.1 synr==0.5.0 && python3 -m pip freeze' > frozen-requirements.txt
+       'python3 -m pip install --quiet tlcpack-sphinx-addon==0.2.1 && python3 -m pip freeze' > frozen-requirements.txt
 
    pip install -r frozen-requirements.txt
    ```
@@ -60,13 +60,14 @@ This folder contains the source of TVM's documentation, hosted at https://tvm.ap
    # work on most environments (e.g. MacOS).
    export TVM_TUTORIAL_EXEC_PATTERN=none
 
+   cd docs
    make html
    ```
 
 4. Run an HTTP server and visit http://localhost:8000 in your browser
 
    ```bash
-   cd docs/_build/html && python3 -m http.server
+   cd _build/html && python3 -m http.server
    ```
 
 ## Only Execute Specified Tutorials
@@ -79,14 +80,14 @@ the path that matches the regular expression pattern.
 For example, to only build tutorials under `/vta/tutorials`, run
 
 ```bash
-python tests/scripts/ci.py docs --tutorials=/vta/tutorials
+python tests/scripts/ci.py docs --tutorial-pattern=/vta/tutorials
 ```
 
 To only build one specific file, do
 
 ```bash
 # The slash \ is used to get . in regular expression
-python tests/scripts/ci.py docs --tutorials=file_name\.py
+python tests/scripts/ci.py docs --tutorial-pattern=file_name\.py
 ```
 
 ## Helper Scripts
@@ -95,14 +96,14 @@ You can run the following script to reproduce the CI sphinx pre-check stage.
 This script skips the tutorial executions and is useful to quickly check the content.
 
 ```bash
-python tests/scripts/ci.py docs --precheck
+tests/scripts/task_python_docs.sh
 ```
 
 The following script runs the full build which includes tutorial executions.
 You will need a GPU CI environment.
 
 ```bash
-python tests/scripts/ci.py --precheck --full
+python tests/scripts/ci.py docs --full
 ```
 
 ## Define the Order of Tutorials
@@ -110,3 +111,42 @@ python tests/scripts/ci.py --precheck --full
 You can define the order of tutorials with `subsection_order` and
 `within_subsection_order` in [`conf.py`](conf.py).
 By default, the tutorials within one subsection are sorted by filename.
+
+## Google Colab Integration
+
+All the TVM tutorials can be opened and used interactively in Google Colab by
+clicking the button at the top of the page. To do this, `sphinx-gallery` builds
+`.ipynb` files from each tutorial, which are automatically deployed to the
+[apache/tvm-site](https://github.com/apache/tvm-site/tree/asf-site) repo's
+`asf-site` branch by [@tvm-bot](https://github.com/tvm-bot).
+
+To make sure your tutorial runs correctly on Colab, any non-Python parts of
+the tutorial (e.g. dependency installations) should be prefixed by an
+[IPython magic command](https://ipython.readthedocs.io/en/stable/interactive/magics.html).
+These will not be included in the built `HTML` file. For example, to install
+Pytorch in your tutorial, add a ReStructured Text block like the following:
+
+```python
+######################################################################
+# To run this tutorial, we must install PyTorch:
+#
+# .. code-block:: bash
+#
+#     %%shell
+#     pip install torch
+#
+```
+
+### Interactive Bash Scripts
+
+In stock IPython, the `%%bash` magic command should be used to run shell
+commands. However, this command does not give real-time output - the
+tutorial's user will not see any output until the entire cell finishes
+running. When running commands that take several minutes (e.g. installing
+dependencies), this is annoying.
+
+Luckily, Google Colab has the `%%shell` magic command that does the same
+thing as `%%bash`, but gives output in real time. This command is specific
+to Colab, and its [source code](https://github.com/googlecolab/colabtools)
+is public. Thus, `%%shell` should be used instead of `%%bash` when writing
+TVM tutorials.

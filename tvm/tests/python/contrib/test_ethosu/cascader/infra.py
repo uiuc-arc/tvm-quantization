@@ -31,14 +31,24 @@ def make_options(
     max_proposals: int = 1,
     stripe_factors: int = 1,
     max_plan_size: int = 1,
+    max_open_plans: int = 8,
+    max_closed_plans: int = 32,
     always_copy_size: int = 1024,
+    disable_pareto_plans: bool = False,
+    disable_pareto_proposals: bool = False,
+    enable_striping: bool = True,
 ):
     return cs.CascaderOptions(
         cascade_region=cascade_region,
         max_proposals=max_proposals,
         stripe_factors=stripe_factors,
         max_plan_size=max_plan_size,
+        max_open_plans=max_open_plans,
+        max_closed_plans=max_closed_plans,
         always_copy_size=always_copy_size,
+        disable_pareto_plans=disable_pareto_plans,
+        disable_pareto_proposals=disable_pareto_proposals,
+        enable_striping=enable_striping,
     )
 
 
@@ -55,6 +65,7 @@ def make_simple_home_map(graph, var_region, const_region):
 
 if ethosu_enabled:
     from tvm.relay.backend.contrib.ethosu.tir.compiler import extract_constants, lower_to_te
+    from tvm.relay.backend.contrib.ethosu.te.common import get_layout_transform_matrices
 
     def create_te_graph(func):
         func, consts = extract_constants(func)
@@ -64,28 +75,24 @@ if ethosu_enabled:
         return te_graph, consts
 
     def make_matrices(
-        op_type, kernel, stride, padding, ifm_layout, ofm_layout, dilation=(1, 1), ifm_channels=1
+        op_type,
+        kernel,
+        stride,
+        padding,
+        ifm_layout,
+        ofm_layout,
+        dilation=(1, 1),
+        ifm_channels=1,
+        ofm_channels=1,
     ):
         kernel_h, kernel_w = kernel
         stride_h, stride_w = stride
         dilation_h, dilation_w = dilation
         dilated_kernel_h = (kernel_h - 1) * dilation_h + 1
         dilated_kernel_w = (kernel_w - 1) * dilation_w + 1
-        nhwc_to_nhcwb16 = [
-            [1, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0],
-            [0, 0, 0, 1 / 16, 0],
-            [0, 0, 1, 0, 0],
-            [0, 0, 0, 0, 16],
-            [0, 0, 0, 0, 1],
-        ]
-        nhcwb16_to_nhwc = [
-            [1, 0, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0, 0],
-            [0, 0, 0, 1, 0, 0],
-            [0, 0, 16, 0, 1, -16],
-            [0, 0, 0, 0, 0, 1],
-        ]
+
+        nhwc_to_nhcwb16, nhcwb16_to_nhwc = get_layout_transform_matrices(ofm_channels)
+
         if op_type == "ethosu_conv2d":
             ifm_matrix = [
                 [1, 0, 0, 0, 0],

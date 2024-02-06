@@ -51,6 +51,9 @@ convolution has a large batch. We strongly recommend covering the :ref:`opt-conv
 # We use stride size 1 and padding size 1 for the convolution. In the example, we use
 # NHWCnc memory layout.The following code defines the convolution algorithm in TVM.
 
+# sphinx_gallery_start_ignore
+# sphinx_gallery_requires_cuda = True
+# sphinx_gallery_end_ignore
 import tvm
 from tvm import te
 import numpy as np
@@ -306,7 +309,7 @@ def intrin_wmma_store_matrix():
 #   *Warp-level Operation*
 #
 #   Note that all TensorCore instructions are warp-level instructions, which means all 32 threads
-#   in a warp should do this instruction simultaneously. Making theadIdx.x extent=32 is one of the
+#   in a warp should do this instruction simultaneously. Making threadIdx.x extent=32 is one of the
 #   easiest way to solve this. Then We can bind threadIdx.x to any loops except those contain
 #   TensorCore intrinsics directly or indirectly. Also note that it is not the unique solution.
 #   The only thing we should do is to make sure all threads in a warp can call TensorCore at the same time.

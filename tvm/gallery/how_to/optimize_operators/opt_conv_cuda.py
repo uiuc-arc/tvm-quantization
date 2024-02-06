@@ -40,6 +40,9 @@ channel, batch.
 # convolution. The following code defines the convolution algorithm in TVM.
 #
 
+# sphinx_gallery_start_ignore
+# sphinx_gallery_requires_cuda = True
+# sphinx_gallery_end_ignore
 import numpy as np
 import tvm
 from tvm import te
@@ -97,7 +100,7 @@ B = te.compute(
 #      :width: 271px
 #
 # In this example, we load both Apad and W into buffer AA and WW, which are
-# stored in the shared memory. These bufferes will be later shared by all
+# stored in the shared memory. These buffers will be later shared by all
 # threads within the same thread block to compute the convolution. Each thread
 # then loads its own part from shared buffer into their local registers, AL and
 # WL. BL is a local cache of output B, which is also stored in the thread local

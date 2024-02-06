@@ -4,9 +4,15 @@
 
 # Tile Iterator Concepts
 
+Note: CUTLASS 3.0 deprecates all tile access iterators in favour of CuTe's single
+vocabulary type `cute::Tensor`, which is parameterized on `cute::Layout`.
+`cute::Tensor`s can therefore be manipulated with the same layout algebra as all CuTe layouts.
+This removes the need for bespoke types that encapsulate iterator properties.
+The following text thus only applies to legacy CUTLASS 2.x API and related types.
+
 CUTLASS 2.x implements generic algorithms on tiles of matrix or tensors of constant size. These may
 be considered as partitions of tensors of infinite size, with a range of partitions accessible
-by _tile iterators_. 
+by _tile iterators_.
 
 Various data structures may make operations such as random access to tiles inexpensive,
 while data structures may not offer random access at all. For example, iterating over a linked
@@ -14,7 +20,9 @@ list of matrices requires sequential traversal. Algorithms implemented in terms 
 should require only the minimum set of operators be defined for tile iterators.
 
 This document describes a set of C++ concepts which may be used to define tile iterators used
-by CUTLASS algorithms. Each concept specifies members and type definitions that a tile iterator
+by CUTLASS algorithms.  ("Concept" here does not refer to a C++20 concept that uses the `concept` keyword.
+Rather, it refers to a set of requirements on a type.)
+Each concept specifies members and type definitions that a tile iterator
 must implement. Frequently, a tile iterator implements several concepts, and its members are
 the union of the members from each individual concept. These definitions were inspired by
 [Boost "New style" iterator concepts](https://www.boost.org/doc/libs/1_40_0/libs/iterator/doc/new-iter-concepts.html).
@@ -22,7 +30,6 @@ the union of the members from each individual concept. These definitions were in
 The set of all possible combinations of these concepts is quite large, however most tile iterator
 templates can be described by one of several combinations. The section 
 Frequently Used Tile Iterator Concepts describes several common interfaces used throughout CUTLASS.
-
 
 ## Definitions
 
@@ -466,26 +473,32 @@ struct WriteableReadableRandomAccessContiguousTileIteratorConcept {
 
 # Copyright
 
-Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause
 
 ```
-  Redistribution and use in source and binary forms, with or without modification, are permitted
-  provided that the following conditions are met:
-      * Redistributions of source code must retain the above copyright notice, this list of
-        conditions and the following disclaimer.
-      * Redistributions in binary form must reproduce the above copyright notice, this list of
-        conditions and the following disclaimer in the documentation and/or other materials
-        provided with the distribution.
-      * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
-        to endorse or promote products derived from this software without specific prior written
-        permission.
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
 
-  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
-  IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
-  FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
-  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
-  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
-  OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
-  STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  1. Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+  3. Neither the name of the copyright holder nor the names of its
+  contributors may be used to endorse or promote products derived from
+  this software without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+  DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```

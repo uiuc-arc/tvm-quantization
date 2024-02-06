@@ -31,7 +31,7 @@ def enabled():
     return "cmsis-nn" in Target.list_kinds()
 
 
-def partition_for_cmsisnn(mod, params=None, **opts):
+def partition_for_cmsisnn(mod, params=None, mod_name="default", **opts):
     """Partition the graph greedily offloading supported
     operators on Cortex-M using CMSIS-NN
 
@@ -41,6 +41,8 @@ def partition_for_cmsisnn(mod, params=None, **opts):
         The module to run passes on.
     params : Optional[Dict[str, NDArray]]
         Constant input parameters.
+    mod_name: str, optional
+        The module name
 
     Returns
     -------
@@ -55,8 +57,9 @@ def partition_for_cmsisnn(mod, params=None, **opts):
             transform.InferType(),
             transform.MergeComposite(pattern_table()),
             transform.AnnotateTarget("cmsis-nn"),
-            transform.PartitionGraph(),
+            transform.PartitionGraph(mod_name=mod_name),
             GenerateCMSISNNConstants(),
+            CMSISNNFusePads(),
             ScalarToTensorConstants(),
             ExtractConstantsFromPartitionedFunction(),
             transform.InferType(),
@@ -83,16 +86,34 @@ def pattern_table():
         zero_point = pattern.args[2].data.numpy().item(0)
 
         # check for dtypes of quantize and dequantize
-        return (
+        if (
             (scale == 1.0 / 256 and zero_point == -128)
             and pattern.attrs.out_dtype == "int8"
             and dequantize_call.args[0].checked_type.dtype == "int8"
-        )
+        ):
+            return True
 
-    def qnn_conv2d_pattern():
-        """Create pattern for qnn.conv2D with optional fused relu."""
+        if (
+            (scale == 1.0 / 32768 and zero_point == 0)
+            and pattern.attrs.out_dtype == "int16"
+            and dequantize_call.args[0].checked_type.dtype == "int16"
+        ):
+            return True
+
+        return False
+
+    def qnn_conv2d_pattern(with_pad):
+        """Create pattern for qnn.conv2D with optional pad and/or optional fused relu."""
+        conv2d_input = wildcard()
+        if with_pad:
+            conv2d_input = is_op("nn.pad")(wildcard(), is_constant())
         qnn_conv2d = is_op("qnn.conv2d")(
-            wildcard(), is_constant(), is_constant(), is_constant(), is_constant(), is_constant()
+            conv2d_input,
+            is_constant(),
+            is_constant(),
+            is_constant(),
+            is_constant(),
+            is_constant(),
         )
         bias_add = is_op("nn.bias_add")(qnn_conv2d, is_constant())
         req = is_op("qnn.requantize")(
@@ -110,19 +131,13 @@ def pattern_table():
             requantize = pattern
         requantize_input = requantize.args[0]
         bias_add = None
-        bias_dtype = "int32"
         if str(requantize_input.op.name) == "nn.bias_add":
             bias_add = requantize_input
             conv2d = bias_add.args[0]
-            bias_dtype = bias_add.args[1].checked_type.dtype
         else:
             conv2d = requantize_input
         conv2d_input = conv2d.args[0]
         conv2d_weight = conv2d.args[1]
-
-        # kernel zero_point should be 0
-        kernel_zp = conv2d.args[3].data.numpy()
-        kernel_zp = [kernel_zp] if kernel_zp.ndim == 0 else kernel_zp
 
         # check if depthwise Conv2D
         kernel_layout = conv2d.attrs.kernel_layout
@@ -134,15 +149,76 @@ def pattern_table():
         ):
             is_depthwise = True
 
-        return (
-            conv2d.attrs.out_dtype == "int32"
-            and conv2d_input.checked_type.dtype == "int8"
-            and conv2d_weight.checked_type.dtype == "int8"
-            and pattern.checked_type.dtype == "int8"
-            and bias_dtype == "int32"
+        # check if dtypes are supported for the following entities
+        # (input_dtype, weight_dtype, bias_dtype, out_dtype, pattern_dtype)
+        are_dtypes_valid = False
+        conv2d_input_dtype = conv2d_input.checked_type.dtype
+        if bias_add:
+            bias_dtype = bias_add.args[1].checked_type.dtype
+        else:
+            # this is only to enable to following check that validates all sorts of dtypes
+            bias_dtype = "int32" if conv2d_input_dtype == "int8" else "int64"
+        valid_dtypes = None
+        if conv2d_input_dtype == "int8":
+            valid_dtypes = ("int8", "int8", "int32", "int32", "int8")
+        elif conv2d_input_dtype == "int16":
+            valid_dtypes = ("int16", "int8", "int64", "int64", "int16")
+
+        if (
+            conv2d_input_dtype,
+            conv2d_weight.checked_type.dtype,
+            bias_dtype,
+            conv2d.attrs.out_dtype,
+            pattern.checked_type.dtype,
+        ) == valid_dtypes:
+            are_dtypes_valid = True
+
+        # input_zero_point should be 0 when int16
+        valid_input_zp = True
+        if conv2d_input_dtype == "int16" and conv2d.args[2].data.numpy().item(0) != 0:
+            valid_input_zp = False
+
+        # kernel zero_point should be 0
+        kernel_zp = conv2d.args[3].data.numpy()
+        kernel_zp = [kernel_zp] if kernel_zp.ndim == 0 else kernel_zp
+
+        # combination of all checks to decide if pattern is eligible for partitioning
+        ret = (
+            are_dtypes_valid
+            and valid_input_zp
             and all([zp == 0 for zp in kernel_zp])
             and (not is_depthwise or bias_add is not None)
         )
+        return ret
+
+    def check_qnn_conv2d_pad(pattern):
+        """Check if the Pad followed by Conv2D is supported by CMSIS-NN."""
+        if str(pattern.op.name) == "clip":
+            relu = pattern
+            requantize = relu.args[0]
+        else:
+            requantize = pattern
+        requantize_input = requantize.args[0]
+        if str(requantize_input.op.name) == "nn.bias_add":
+            bias_add = requantize_input
+            conv2d = bias_add.args[0]
+        else:
+            conv2d = requantize_input
+        conv2d_input = conv2d.args[0]
+
+        # check if sum of paddings from pad() and conv2d() satisfies CMSIS-NN constraints
+        can_pad_be_fused = True
+        if isinstance(conv2d_input, tvm.relay.expr.Call) and str(conv2d_input.op.name) == "nn.pad":
+            pad_top, pad_left, pad_bottom, pad_right = GetEffectiveConv2DPadding(
+                conv2d, conv2d_input
+            )
+            # check if difference in the side paddings is 1 along each dimension
+            pad_w_diff = int(pad_right - pad_left)
+            pad_h_diff = int(pad_bottom - pad_top)
+            can_pad_be_fused = pad_w_diff in [0, 1] and pad_h_diff in [0, 1]
+
+        ret = check_qnn_conv2d(pattern) and can_pad_be_fused
+        return ret
 
     def qnn_fully_connected_pattern():
         """Create pattern for qnn.dense with optional Relu."""
@@ -165,27 +241,40 @@ def pattern_table():
             requantize = pattern
         requantize_input = requantize.args[0]
         bias_add = None
-        bias_dtype = "int32"
         if str(requantize_input.op.name) == "nn.bias_add":
             bias_add = requantize_input
             fc = bias_add.args[0]
-            bias_dtype = bias_add.args[1].checked_type.dtype
         else:
             fc = requantize_input
         fc_input = fc.args[0]
         fc_weight = fc.args[1]
 
+        are_dtypes_valid = False
+        fc_input_dtype = fc_input.checked_type.dtype
+        if bias_add:
+            bias_dtype = bias_add.args[1].checked_type.dtype
+        else:
+            bias_dtype = "int32" if fc_input_dtype == "int8" else "int64"
+
+        valid_dtypes = None
+        if fc_input_dtype == "int8":
+            valid_dtypes = ("int8", "int8", "int32", "int32", "int8")
+        elif fc_input_dtype == "int16":
+            valid_dtypes = ("int16", "int8", "int64", "int64", "int16")
+
+        if (
+            fc_input_dtype,
+            fc_weight.checked_type.dtype,
+            bias_dtype,
+            fc.attrs.out_dtype,
+            pattern.checked_type.dtype,
+        ) == valid_dtypes:
+            are_dtypes_valid = True
+
         # kernel zero_point should be 0
         kernel_zp = fc.args[3].data.numpy().item(0)
 
-        return (
-            fc.attrs.out_dtype == "int32"
-            and fc_input.checked_type.dtype == "int8"
-            and fc_weight.checked_type.dtype == "int8"
-            and pattern.checked_type.dtype == "int8"
-            and bias_dtype == "int32"
-            and kernel_zp == 0
-        )
+        return are_dtypes_valid and kernel_zp == 0
 
     def qnn_avg_pool2d_pattern():
         """Matches average pooling with optional Relu"""
@@ -197,9 +286,22 @@ def pattern_table():
 
     def check_qnn_avg_pool2d(pattern):
         """Check if avg pool2d is supported by CMSIS-NN."""
-        in_cast = pattern
-        out_cast = in_cast.args[0].args[0]
-        return in_cast.checked_type.dtype == "int8" and out_cast.checked_type.dtype == "int32"
+        output = pattern
+
+        if str(pattern.op.name) == "clip":
+            pooling = pattern.args[0].args[0]
+        else:
+            pooling = pattern.args[0]
+        input_op = pooling.args[0].args[0]
+
+        return (
+            pooling.attrs.layout == "NHWC"
+            and int(input_op.checked_type.shape[0]) == 1
+            and (
+                (input_op.checked_type.dtype == "int8" and output.checked_type.dtype == "int8")
+                or (input_op.checked_type.dtype == "int16" and output.checked_type.dtype == "int16")
+            )
+        )
 
     def qnn_max_pool2d_pattern():
         """Matches max pool2d with optional Relu"""
@@ -209,11 +311,26 @@ def pattern_table():
 
     def check_qnn_max_pool2d(pattern):
         """Check if max pool2d is supported by CMSIS-NN."""
-        return True
+        output = pattern
+
+        if str(pattern.op.name) == "clip":
+            pooling = pattern.args[0]
+        else:
+            pooling = pattern
+        input_op = pooling.args[0]
+
+        return (
+            pooling.attrs.layout == "NHWC"
+            and int(input_op.checked_type.shape[0]) == 1
+            and (
+                (input_op.checked_type.dtype == "int8" and output.checked_type.dtype == "int8")
+                or (input_op.checked_type.dtype == "int16" and output.checked_type.dtype == "int16")
+            )
+        )
 
     def binary_op_pattern(op):
         """Matches QNN binary operation"""
-        return is_op(f"qnn.{op}")(
+        pattern = is_op(f"qnn.{op}")(
             wildcard(),
             wildcard(),
             is_constant(),
@@ -223,28 +340,51 @@ def pattern_table():
             is_constant(),
             is_constant(),
         )
+        return pattern.optional(is_op("clip"))
 
     def check_qnn_binary_op(pattern):
-        """Check if multiply is supported by CMSIS-NN."""
-        arg0 = pattern.args[0]
-        arg1 = pattern.args[1]
-        both_args_scalar = False
+        """Check if binary op is supported by CMSIS-NN."""
+        binary_op = pattern
+        if str(pattern.op.name) == "clip":
+            binary_op = pattern.args[0]
+
+        arg0 = binary_op.args[0]
+        arg1 = binary_op.args[1]
+
+        # Check arguments are not scalar.
         if (
             isinstance(arg0, tvm.relay.expr.Constant)
             and len(arg0.checked_type.shape) == 0
             and isinstance(arg1, tvm.relay.expr.Constant)
             and len(arg1.checked_type.shape) == 0
         ):
-            both_args_scalar = True
+            return False
 
-        return (
-            arg0.checked_type.dtype == "int8"
-            and arg1.checked_type.dtype == "int8"
-            and not both_args_scalar
-        )
+        arg0_type = arg0.checked_type.dtype
+        arg1_type = arg1.checked_type.dtype
+
+        # Check arguments are of valid type.
+        if arg0_type not in ["int8", "int16"]:
+            return False
+
+        # Check arguments are the same type.
+        if arg0_type != arg1_type:
+            return False
+
+        # Check zero points are non-zero (arm_elementwise_(add|mul)_s16 does not
+        # handle non-zero zero points).
+        if arg0_type == "int16" and str(binary_op.op.name) in ["qnn.add", "qnn.mul"]:
+            arg_0_zero_point = binary_op.args[3].data.numpy()
+            arg_1_zero_point = binary_op.args[5].data.numpy()
+            output_zero_point = binary_op.args[7].data.numpy()
+            if any([arg_0_zero_point, arg_1_zero_point, output_zero_point]):
+                return False
+
+        return True
 
     return [
-        ("cmsis-nn.qnn_conv2d", qnn_conv2d_pattern(), check_qnn_conv2d),
+        ("cmsis-nn.qnn_conv2d", qnn_conv2d_pattern(with_pad=True), check_qnn_conv2d_pad),
+        ("cmsis-nn.qnn_conv2d", qnn_conv2d_pattern(with_pad=False), check_qnn_conv2d),
         ("cmsis-nn.qnn_fully_connected", qnn_fully_connected_pattern(), check_qnn_fully_connected),
         ("cmsis-nn.qnn_avg_pool2d", qnn_avg_pool2d_pattern(), check_qnn_avg_pool2d),
         ("cmsis-nn.qnn_max_pool2d", qnn_max_pool2d_pattern(), check_qnn_max_pool2d),

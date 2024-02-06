@@ -69,7 +69,7 @@ class TVM_DLL PipelineExecutor : public ModuleNode {
    * \param sptr_to_self The pointer to the module node.
    * \return The corresponding packed function.
    */
-  virtual PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self);
+  virtual PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self);
   /*!
    * \brief Using the global input name to get the index, and also get the input interface name
      of corresponding subgraph from the input connection configuration.
@@ -96,6 +96,10 @@ class TVM_DLL PipelineExecutor : public ModuleNode {
    */
   NDArray GetInput(std::string input_name);
   /*!
+   * \brief Getting the count of running pipeline.
+   */
+  int GetExecutionCount();
+  /*!
    * \brief Use the parameters group name to get the specific backend runtime then use
    *  the param_key_name to set param data for the said backend runtime.
    * \param param_group_name The parameters group name.
@@ -109,15 +113,9 @@ class TVM_DLL PipelineExecutor : public ModuleNode {
    * \return The number of outputs.
    */
   int NumOutputs() const { return num_outputs_; }
-  /*!
-   * \brief Run the pipeline executor.
-   * \param serialized_mode Whether run the pipeline executor in serialized mode.
-   */
-  void Run(bool serialized_mode);
-  /*!
-   * \brief Stop the pipeline executor.
-   */
-  void Stop();
+  /*!\brief Run the pipeline executor.*/
+  void Run();
+  int NumInputs();
   /*!
    * \brief Get a list output data.
    * \return A list of output data.
@@ -179,15 +177,16 @@ class TVM_DLL PipelineExecutor : public ModuleNode {
   /*!\brief The dependency information of each graph runtime module of the pipeline.*/
   ConfigPipelineExecution pipeline_config_;
   /*!\brief The map of global input and subgraph input.*/
-  InputConnectionConfig input_connection_config;
+  InputConnectionConfig input_connection_config_;
   /*!\brief The map includes global parameters groups and runtime modules.*/
-  ParamConnectionConfig param_connection_config;
+  ParamConnectionConfig param_connection_config_;
   /*!\brief The module information used to create the graph runtimes.*/
   ModuleConfig mod_config_;
   /*!\brief How many outputs are in this pipeline executor.*/
   size_t num_outputs_ = 0;
   /*!The list of backend runtime module.*/
   std::vector<std::shared_ptr<BackendRuntime>> runtimes_;
+  std::shared_ptr<GlobalRuntime> global_runtime_;
   /*!\brief Json loader.*/
   void LoadConfig(dmlc::JSONReader* reader) {
     reader->BeginObject();
@@ -196,9 +195,9 @@ class TVM_DLL PipelineExecutor : public ModuleNode {
       if (key == "module_connection") {
         reader->Read(&pipeline_config_);
       } else if (key == "input_connection") {
-        reader->Read(&input_connection_config);
+        reader->Read(&input_connection_config_);
       } else if (key == "param_connection") {
-        reader->Read(&param_connection_config);
+        reader->Read(&param_connection_config_);
       } else {
         LOG(FATAL) << "do not support key " << key;
       }

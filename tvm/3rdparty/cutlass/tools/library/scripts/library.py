@@ -51,6 +51,8 @@ class DataType(enum.Enum):
   s16 = enum_auto()
   s32 = enum_auto()
   s64 = enum_auto()
+  e4m3 = enum_auto()
+  e5m2 = enum_auto()
   f16 = enum_auto()
   bf16 = enum_auto()
   f32 = enum_auto()
@@ -76,6 +78,8 @@ class DataType(enum.Enum):
 #
 ShortDataTypeNames = {
   DataType.s32: 'i',
+  DataType.e4m3: 'e4m3',
+  DataType.e5m2: 'e5m2',
   DataType.f16: 'h',
   DataType.f32: 's',
   DataType.f64: 'd',
@@ -96,6 +100,8 @@ DataTypeNames = {
   DataType.s16: "s16",
   DataType.s32: "s32",
   DataType.s64: "s64",
+  DataType.e4m3: 'e4m3',
+  DataType.e5m2: 'e5m2',
   DataType.f16: "f16",
   DataType.bf16: "bf16",
   DataType.f32: "f32",
@@ -130,6 +136,8 @@ DataTypeTag = {
   DataType.s16: "int16_t",
   DataType.s32: "int32_t",
   DataType.s64: "int64_t",
+  DataType.e4m3: 'cutlass::float_e4m3_t',
+  DataType.e5m2: 'cutlass::float_e5m2_t',
   DataType.f16: "cutlass::half_t",
   DataType.bf16: "cutlass::bfloat16_t",
   DataType.f32: "float",
@@ -155,7 +163,7 @@ DataTypeTag = {
 DataTypeSize = {
   DataType.b1: 1,
   DataType.u4: 4,
-  DataType.u8: 4,
+  DataType.u8: 8,
   DataType.u16: 16,
   DataType.u32: 32,
   DataType.u64: 64,
@@ -164,6 +172,8 @@ DataTypeSize = {
   DataType.s16: 16,
   DataType.s32: 32,
   DataType.s64: 64,
+  DataType.e4m3: 8,
+  DataType.e5m2: 8,
   DataType.f16: 16,
   DataType.bf16: 16,
   DataType.f32: 32,
@@ -187,6 +197,17 @@ DataTypeSize = {
 }
 
 ###################################################################################################
+#
+class BlasMode(enum.Enum):
+  symmetric = enum_auto()
+  hermitian = enum_auto()
+
+#
+BlasModeTag = {
+  BlasMode.symmetric: 'cutlass::BlasMode::kSymmetric',
+  BlasMode.hermitian: 'cutlass::BlasMode::kHermitian',
+}
+
 #
 class ComplexTransform(enum.Enum):
   none = enum_auto()
@@ -341,6 +362,64 @@ ShortComplexLayoutNames = {
 }
 
 ###################################################################################################
+
+#
+class SideMode(enum.Enum):
+  Left = enum_auto()
+  Right = enum_auto()
+
+#
+SideModeTag = {
+  SideMode.Left: 'cutlass::SideMode::kLeft',
+  SideMode.Right: 'cutlass::SideMode::kRight'
+}
+
+#
+ShortSideModeNames = {
+  SideMode.Left: 'ls',
+  SideMode.Right: 'rs'
+}
+
+###################################################################################################
+
+#
+class FillMode(enum.Enum):
+  Lower = enum_auto()
+  Upper = enum_auto()
+
+#
+FillModeTag = {
+  FillMode.Lower: 'cutlass::FillMode::kLower',
+  FillMode.Upper: 'cutlass::FillMode::kUpper'
+}
+
+#
+ShortFillModeNames = {
+  FillMode.Lower: 'l',
+  FillMode.Upper: 'u'
+}
+
+###################################################################################################
+
+#
+class DiagType(enum.Enum):
+  NonUnit = enum_auto()
+  Unit = enum_auto()
+
+#
+DiagTypeTag = {
+  DiagType.NonUnit: 'cutlass::DiagType::kNonUnit',
+  DiagType.Unit: 'cutlass::DiagType::kUnit'
+}
+
+#
+ShortDiagTypeNames = {
+  DiagType.NonUnit: 'nu',
+  DiagType.Unit: 'un'
+}
+
+###################################################################################################
+
 #
 class OpcodeClass(enum.Enum):
   Simt = enum_auto()
@@ -366,12 +445,20 @@ OpcodeClassTag = {
 #
 class OperationKind(enum.Enum):
   Gemm = enum_auto()
+  RankK = enum_auto()
+  Rank2K = enum_auto()
+  Trmm = enum_auto()
+  Symm = enum_auto()
   Conv2d = enum_auto()        
   Conv3d = enum_auto()        
 
 #
 OperationKindNames = {
   OperationKind.Gemm: 'gemm'
+  , OperationKind.RankK: 'rank_k'
+  , OperationKind.Rank2K: 'rank_2k'
+  , OperationKind.Trmm: 'trmm'
+  , OperationKind.Symm: 'symm'
   , OperationKind.Conv2d: 'conv2d'  
   , OperationKind.Conv3d: 'conv3d' 
 }
@@ -379,7 +466,7 @@ OperationKindNames = {
 # 
 class Target(enum.Enum):
   library = enum_auto()
-
+#
 ArchitectureNames = {
   50: 'maxwell',
   60: 'pascal',
@@ -387,6 +474,20 @@ ArchitectureNames = {
   70: 'volta',
   75: 'turing',
   80: 'ampere',
+  89: 'ada',
+  90: 'hopper'
+}
+
+#
+SharedMemPerCC = {
+  70:  96, #  96KB of SMEM
+  72:  96, #  96KB of SMEM
+  75:  64, #  64KB of SMEM
+  80: 163, # 163KB of SMEM - 1KB reserved for the driver
+  86:  99, #  99KB of SMEM - 1KB reserved for the driver
+  87: 163, # 163KB of SMEM - 1KB reserved for the driver
+  89:  99, #  99KB of SMEM - 1KB reserved for the driver
+  90: 227, # 227KB of SMEM - 1KB reserved for the driver
 }
 
 ###################################################################################################
@@ -412,16 +513,47 @@ class GemmKind(enum.Enum):
   Gemm = enum_auto()
   Sparse = enum_auto()
   Universal = enum_auto()
+  Universal3x = enum_auto()
   PlanarComplex = enum_auto()
   PlanarComplexArray = enum_auto()
+  Grouped = enum_auto()
 
 #
 GemmKindNames = {
   GemmKind.Gemm: "gemm",
   GemmKind.Sparse: "spgemm",
   GemmKind.Universal: "gemm",
+  GemmKind.Universal3x: "gemm",
   GemmKind.PlanarComplex: "gemm_planar_complex",
   GemmKind.PlanarComplexArray: "gemm_planar_complex_array",
+  GemmKind.Grouped: "gemm_grouped"
+}
+
+#
+class RankKKind(enum.Enum):
+  Universal = enum_auto()
+
+#
+RankKKindNames = {
+  RankKKind.Universal: "rank_k"
+}
+
+#
+class TrmmKind(enum.Enum):
+  Universal = enum_auto()
+
+#
+TrmmKindNames = {
+  TrmmKind.Universal: "trmm"
+}
+
+#
+class SymmKind(enum.Enum):
+  Universal = enum_auto()
+
+#
+SymmKindNames = {
+  SymmKind.Universal: "symm"
 }
 
 #
@@ -445,7 +577,8 @@ class SwizzlingFunctor(enum.Enum):
   StridedDgradIdentity1 = enum_auto()
   StridedDgradIdentity4 = enum_auto()
   StridedDgradHorizontal = enum_auto()
-
+  StreamK = enum_auto()
+  
 #
 SwizzlingFunctorTag = {
   SwizzlingFunctor.Identity1: 'cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>',
@@ -456,6 +589,24 @@ SwizzlingFunctorTag = {
   SwizzlingFunctor.StridedDgradIdentity1: 'cutlass::conv::threadblock::StridedDgradIdentityThreadblockSwizzle<1>',
   SwizzlingFunctor.StridedDgradIdentity4: 'cutlass::conv::threadblock::StridedDgradIdentityThreadblockSwizzle<4>',
   SwizzlingFunctor.StridedDgradHorizontal: 'cutlass::conv::threadblock::StridedDgradHorizontalThreadblockSwizzle',
+  SwizzlingFunctor.StreamK: 'cutlass::gemm::threadblock::ThreadblockSwizzleStreamK',
+}
+
+#
+class GroupScheduleMode(enum.Enum):
+  Device = enum_auto(),
+  Host = enum_auto()
+
+#
+GroupScheduleModeTag = {
+  GroupScheduleMode.Device: 'cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly',
+  GroupScheduleMode.Host: 'cutlass::gemm::kernel::GroupScheduleMode::kHostPrecompute'
+}
+
+#
+ShortGroupScheduleModeNames = {
+  GroupScheduleMode.Device: 'Device',
+  GroupScheduleMode.Host: 'Host'
 }
 
 ###################################################################################################
@@ -483,34 +634,67 @@ ConvKindNames = {
 class IteratorAlgorithm(enum.Enum):
   Analytic = enum_auto()
   Optimized = enum_auto()
+  FixedChannels = enum_auto()
+  FewChannels = enum_auto()
+  FixedStrideDilation = enum_auto()
 
 #
 IteratorAlgorithmTag = {
   IteratorAlgorithm.Analytic: 'cutlass::conv::IteratorAlgorithm::kAnalytic',
   IteratorAlgorithm.Optimized: 'cutlass::conv::IteratorAlgorithm::kOptimized',
+  IteratorAlgorithm.FixedChannels: 'cutlass::conv::IteratorAlgorithm::kFixedChannels',
+  IteratorAlgorithm.FewChannels: 'cutlass::conv::IteratorAlgorithm::kFewChannels',
+  IteratorAlgorithm.FixedStrideDilation: 'cutlass::conv::IteratorAlgorithm::kFixedStrideDilation'
 }
 
 IteratorAlgorithmNames = {
   IteratorAlgorithm.Analytic: 'analytic',
   IteratorAlgorithm.Optimized: 'optimized',
+  IteratorAlgorithm.FixedChannels: 'fixed_channels',
+  IteratorAlgorithm.FewChannels: 'few_channels',
+  IteratorAlgorithm.FixedStrideDilation: 'fixed_stride_dilation'
 }
 
 #
 class StrideSupport(enum.Enum):
   Strided = enum_auto()
   Unity = enum_auto()
+  Fixed = enum_auto()
 
 #
 StrideSupportTag = {
   StrideSupport.Strided: 'cutlass::conv::StrideSupport::kStrided',
   StrideSupport.Unity: 'cutlass::conv::StrideSupport::kUnity',
+  StrideSupport.Fixed: 'cutlass::conv::StrideSupport::kFixed'
 }
 
 StrideSupportNames = {
   StrideSupport.Strided: '',
   StrideSupport.Unity: 'unity_stride',
+  StrideSupport.Fixed: 'fixed_stride'
 }
 
+#
+class GroupMode(enum.Enum):
+  NoneGroup = enum_auto()         # dense conv (G=1)
+  SingleGroup = enum_auto()       # grouped convolution (single group per CTA)
+  MultipleGroup = enum_auto()     # grouped convolution ( multiple groups per CTA)
+  Depthwise = enum_auto()    # Depthwise convolution ( C=K=G )
+
+#
+GroupModeTag = {
+  GroupMode.NoneGroup: 'cutlass::conv::GroupMode::kNone',
+  GroupMode.SingleGroup: 'cutlass::conv::GroupMode::kSingleGroup',
+  GroupMode.MultipleGroup: 'cutlass::conv::GroupMode::kMultipleGroup',
+  GroupMode.Depthwise: 'cutlass::conv::GroupMode::kDepthwise',
+}
+
+GroupModeNames = {
+  GroupMode.NoneGroup: '',
+  GroupMode.SingleGroup: 'single_group',
+  GroupMode.MultipleGroup: 'multiple_group',
+  GroupMode.Depthwise: 'depthwise',
+}
 
 ###################################################################################################
 
@@ -524,20 +708,96 @@ class MathInstruction:
     self.opcode_class = opcode_class
     self.math_operation = math_operation
 
-
 #
 class TileDescription:
 
-  def __init__(self, threadblock_shape, stages, warp_count, math_instruction, min_compute, max_compute):
+  def __init__(self, threadblock_shape, stages, warp_count, math_instruction, min_compute, max_compute, cluster_shape = [1,1,1]):
     self.threadblock_shape = threadblock_shape
     self.stages = stages
     self.warp_count = warp_count
     self.math_instruction = math_instruction
     self.minimum_compute_capability = min_compute
     self.maximum_compute_capability = max_compute
+    self.cluster_shape = cluster_shape
 
   def procedural_name(self):
-    return "%dx%d_%dx%d" % (self.threadblock_shape[0], self.threadblock_shape[1], self.threadblock_shape[2], self.stages)
+    if self.minimum_compute_capability >= 90:
+      return "{tbm}x{tbn}x{tbk}_{cm}x{cn}x{ck}_{s}".format(
+        tbm = self.threadblock_shape[0],
+        tbn = self.threadblock_shape[1],
+        tbk = self.threadblock_shape[2],
+        cm = self.cluster_shape[0],
+        cn = self.cluster_shape[1],
+        ck = self.cluster_shape[2],
+        s = self.stages)
+    else:
+      return "%dx%d_%dx%d" % (self.threadblock_shape[0], self.threadblock_shape[1], self.threadblock_shape[2], self.stages)
+
+#
+class Direct2dConvFixedStrideDilationTileDescription:
+  def __init__(self, threadblock_output_shape, filter_shape, stages, stride, dilation, warp_count, math_instruction, min_compute, max_compute):
+    self.threadblock_shape = [threadblock_output_shape[0]*threadblock_output_shape[1]*threadblock_output_shape[2], threadblock_output_shape[3], filter_shape[0]*filter_shape[1]]
+    self.threadblock_output_shape = threadblock_output_shape
+    self.filter_shape = filter_shape
+    self.stages = stages
+    self.warp_count = warp_count
+    self.stride = stride
+    self.dilation =  dilation
+    self.math_instruction = math_instruction
+    self.minimum_compute_capability = min_compute
+    self.maximum_compute_capability = max_compute
+
+  def procedural_name(self):
+    str_name = "%dx%dx%d_%dx%dx%dx%d_%d_filter%dx%d" % (self.threadblock_shape[0], 
+                                      self.threadblock_shape[1], 
+                                      self.threadblock_shape[2],
+                                      self.threadblock_output_shape[0],
+                                      self.threadblock_output_shape[1],
+                                      self.threadblock_output_shape[2],
+                                      self.threadblock_output_shape[3],
+                                      self.stages, 
+                                      self.filter_shape[0], 
+                                      self.filter_shape[1])
+    # Fixed Strided and dilation
+    if self.stride != [-1, -1] and self.dilation != [-1, -1]:
+      str_name += "_stride%dx%d_dilation%dx%d" % (self.stride[0],
+                                                  self.stride[1],
+                                                  self.dilation[0],
+                                                  self.dilation[1])
+    return str_name
+
+#
+class Direct2dConvFixedStrideDilationTileDescription:
+  def __init__(self, threadblock_output_shape, filter_shape, stages, stride, dilation, warp_count, math_instruction, min_compute, max_compute):
+    self.threadblock_shape = [threadblock_output_shape[0]*threadblock_output_shape[1]*threadblock_output_shape[2], threadblock_output_shape[3], filter_shape[0]*filter_shape[1]]
+    self.threadblock_output_shape = threadblock_output_shape
+    self.filter_shape = filter_shape
+    self.stages = stages
+    self.warp_count = warp_count
+    self.stride = stride
+    self.dilation =  dilation
+    self.math_instruction = math_instruction
+    self.minimum_compute_capability = min_compute
+    self.maximum_compute_capability = max_compute
+
+  def procedural_name(self):
+    str_name = "%dx%dx%d_%dx%dx%dx%d_%d_filter%dx%d" % (self.threadblock_shape[0], 
+                                      self.threadblock_shape[1], 
+                                      self.threadblock_shape[2],
+                                      self.threadblock_output_shape[0],
+                                      self.threadblock_output_shape[1],
+                                      self.threadblock_output_shape[2],
+                                      self.threadblock_output_shape[3],
+                                      self.stages, 
+                                      self.filter_shape[0], 
+                                      self.filter_shape[1])
+    # Fixed Strided and dilation
+    if self.stride != [-1, -1] and self.dilation != [-1, -1]:
+      str_name += "_stride%dx%d_dilation%dx%d" % (self.stride[0],
+                                                  self.stride[1],
+                                                  self.dilation[0],
+                                                  self.dilation[1])
+    return str_name
 
 #
 class TensorDescription:
@@ -547,4 +807,51 @@ class TensorDescription:
     self.alignment = alignment
     self.complex_transform = complex_transform
 
+#
+class SymmetricTensorDescription:
+  def __init__(self, element, layout, fill_mode, alignment = 1, complex_transform = ComplexTransform.none, side_mode = SideMode.Left):
+    self.element = element
+    self.layout = layout
+    self.fill_mode = fill_mode
+    self.alignment = alignment
+    self.complex_transform = complex_transform
+    self.side_mode = side_mode
+
+#
+class TriangularTensorDescription:
+  def __init__(self, element, layout, side_mode, fill_mode, diag_type, alignment = 1, complex_transform = ComplexTransform.none):
+    self.element = element
+    self.layout = layout
+    self.side_mode = side_mode
+    self.fill_mode = fill_mode
+    self.diag_type = diag_type
+    self.alignment = alignment
+    self.complex_transform = complex_transform
+
+###################################################################################################
+
+#
+def CalculateSmemUsage(operation):
+  cta_shape = operation.tile_description.threadblock_shape
+  stages = operation.tile_description.stages
+
+  if operation.operation_kind == OperationKind.Gemm and operation.gemm_kind == GemmKind.Sparse:
+    # Elements represented by 8 bits of metadata (based on 4:8, 2:4 or 1:2 sparsity)
+    if DataTypeSize[operation.A.element] == 32:
+      elements_per_8b_md = 2
+    elif DataTypeSize[operation.A.element] == 4:
+      elements_per_8b_md = 8
+    else:
+      elements_per_8b_md = 4
+
+    smem_per_stage = DataTypeSize[operation.A.element] * cta_shape[0] * (cta_shape[2] // 2) // 8 + \
+                     DataTypeSize[operation.B.element] * cta_shape[1] * cta_shape[2] // 8 + \
+                     cta_shape[0] * (cta_shape[2] // 2) // elements_per_8b_md
+  else:
+    # Few BLAS3 operations only have A tensor
+    smem_per_stage = DataTypeSize[operation.A.element] * cta_shape[0] * cta_shape[2] // 8 + \
+                     DataTypeSize[operation.A.element] * cta_shape[1] * cta_shape[2] // 8
+
+  smem_usage = smem_per_stage * stages
+  return (smem_usage >> 10)
 ###################################################################################################

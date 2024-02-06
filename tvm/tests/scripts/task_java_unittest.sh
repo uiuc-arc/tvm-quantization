@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,8 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
-set -u
+set -euxo pipefail
 
 export PYTHONPATH=python
 export LD_LIBRARY_PATH="lib:${LD_LIBRARY_PATH:-}"
@@ -30,18 +29,23 @@ CURR_DIR=$(cd `dirname $0`; pwd)
 SCRIPT_DIR=$CURR_DIR/../../jvm/core/src/test/scripts
 TEMP_DIR=$(mktemp -d)
 
-python3 $SCRIPT_DIR/test_add_cpu.py $TEMP_DIR
-python3 $SCRIPT_DIR/test_add_gpu.py $TEMP_DIR
-python3 $SCRIPT_DIR/test_graph_executor.py $TEMP_DIR
+cleanup()
+{
+  rm -rf "$TEMP_DIR"
+}
+trap cleanup 0
 
-# start rpc proxy server
-PORT=$(( ( RANDOM % 1000 )  + 9000 ))
-python3 $SCRIPT_DIR/test_rpc_proxy_server.py $PORT 30 &
+python3 "$SCRIPT_DIR"/test_add_cpu.py "$TEMP_DIR"
+python3 "$SCRIPT_DIR"/test_add_gpu.py "$TEMP_DIR"
+python3 "$SCRIPT_DIR"/test_graph_executor.py "$TEMP_DIR"
 
-make jvmpkg
-make jvmpkg JVM_TEST_ARGS="-DskipTests=false \
-  -Dtest.tempdir=$TEMP_DIR \
-  -Dtest.rpc.proxy.host=localhost \
-  -Dtest.rpc.proxy.port=$PORT"
+# Skip the Java RPC Unittests, see https://github.com/apache/tvm/issues/13168
+# # start rpc proxy server
+# PORT=$(( ( RANDOM % 1000 )  + 9000 ))
+# python3 $SCRIPT_DIR/test_rpc_proxy_server.py $PORT 30 &
 
-rm -rf $TEMP_DIR
+# make jvmpkg
+# make jvmpkg JVM_TEST_ARGS="-DskipTests=false \
+#   -Dtest.tempdir=$TEMP_DIR \
+#   -Dtest.rpc.proxy.host=localhost \
+#   -Dtest.rpc.proxy.port=$PORT"

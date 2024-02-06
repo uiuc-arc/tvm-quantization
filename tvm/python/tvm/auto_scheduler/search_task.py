@@ -238,9 +238,8 @@ def _save_buffer_to_file(buffer_name, buffer_data):
 
     buffer_name += "."
     for i in np_data.shape:
-        buffer_name += "%d_" % (i)
-    buffer_name += "%s" % (np_data.dtype)
-    buffer_name += ".npy"
+        buffer_name += f"{i}_"
+    buffer_name += f"{np_data.dtype}.npy"
 
     np_data.tofile(buffer_name, " ")
 
@@ -265,11 +264,7 @@ def _try_load_buffer_from_file(buffer_name):
 
 
 def register_task_input_buffer(
-    workload_key,
-    input_name,
-    input_data,
-    overwrite=False,
-    save_to_file=False,
+    workload_key, input_name, input_data, overwrite=False, save_to_file=False
 ):
     """Register special buffer for measurement.
 
@@ -360,8 +355,8 @@ def get_task_input_buffer(workload_key, input_name):
         return input_table[input_name]
 
     raise ValueError(
-        "%s not found in TASK_INPUT_BUFFER_TABLE, " % (input_name)
-        + "should provide with `SearchTask(..., task_inputs={...})`"
+        f"{input_name} not found in TASK_INPUT_BUFFER_TABLE, "
+        f"should provide with `SearchTask(..., task_inputs={{...}})`"
     )
 
 
@@ -380,9 +375,9 @@ class SearchTask(Object):
         The ComputeDAG for the corresponding compute declaration.
     workload_key : str
         The workload key for the corresponding compute declaration.
-    target : tvm.target.Target
+    target : any target-like object, see Target.canon_target
         The target device of this search task.
-    target_host : Optional[tvm.target.Target]
+    target_host : None or any target-like object, see Target.canon_target
         The target host device of this search task.
     hardware_params : Optional[HardwareParams]
         Hardware parameters used in this search task.
@@ -448,7 +443,7 @@ class SearchTask(Object):
 
         assert target is not None, "Must specify a target."
 
-        target, target_host = Target.check_and_update_host_consist(target, target_host)
+        target, target_host = Target.canon_target_and_host(target, target_host)
 
         if layout_rewrite_option is None:
             layout_rewrite_option = LayoutRewriteOption.get_target_default(target)
@@ -481,7 +476,7 @@ class SearchTask(Object):
             desc,
         )
 
-    def tune(self, tuning_options, search_policy=None):
+    def tune(self, tuning_options, search_policy=None, adaptive_training=False):
         """Run auto scheduling search for a task
 
         Parameters
@@ -492,7 +487,7 @@ class SearchTask(Object):
             The search policy to be used for schedule search.
         """
         if search_policy is None:
-            cost_model = XGBModel()
+            cost_model = XGBModel(adaptive_training=adaptive_training)
             search_policy = SketchPolicy(self, cost_model)
 
         _ffi_api.AutoSchedule(search_policy, tuning_options)
@@ -519,7 +514,7 @@ class SearchTask(Object):
         )
         if inp is None:
             raise RuntimeError(
-                "Cannot find any valid schedule for %s in file %s" % (self.workload_key, log_file)
+                f"Cannot find any valid schedule for {self.workload_key} in file {log_file}"
             )
 
         sch, args = self.compute_dag.apply_steps_from_state(
@@ -546,7 +541,7 @@ class SearchTask(Object):
         inp, _ = load_best_record(log_file, self.workload_key)
         if inp is None:
             raise RuntimeError(
-                "Cannot find any valid schedule for %s in file %s" % (self.workload_key, log_file)
+                f"Cannot find any valid schedule for {self.workload_key} in file {log_file}"
             )
 
         if print_mode == "schedule":
@@ -556,12 +551,10 @@ class SearchTask(Object):
             sch, args = self.compute_dag.apply_steps_from_state(inp.state)
             func = build(sch, args, "cuda")
             return func.imported_modules[0].get_source()
-        raise ValueError("Invalid print_mode: %s" % print_mode)
+        raise ValueError(f"Invalid print_mode: {print_mode}")
 
     def __getstate__(self):
-        self.target, self.target_host = Target.check_and_update_host_consist(
-            self.target, self.target_host
-        )
+        self.target, self.target_host = Target.canon_target_and_host(self.target, self.target_host)
         return {
             "compute_dag": self.compute_dag,
             "workload_key": self.workload_key,
@@ -578,16 +571,16 @@ class SearchTask(Object):
         try:
             workload = json.loads(state["workload_key"])
         except Exception:  # pylint: disable=broad-except
-            raise RuntimeError("Invalid workload key %s" % state["workload_key"])
+            raise RuntimeError(f"Invalid workload key {state['workload_key']}")
 
         # workload[0] is either the compute function name or the ComputeDAG hash.
         # The compute functions are already registered when importing TVM, so here
         # we only register the ComputeDAG workloads. If the same workload has
-        # already been registered, the later registration overrides the prvious one.
+        # already been registered, the later registration overrides the previous one.
         if workload[0] not in WORKLOAD_FUNC_REGISTRY:
             register_workload_tensors(state["workload_key"], state["compute_dag"].tensors)
 
-        state["target"], state["target_host"] = Target.check_and_update_host_consist(
+        state["target"], state["target_host"] = Target.canon_target_and_host(
             state["target"], state["target_host"]
         )
         self.__init_handle_by_constructor__(

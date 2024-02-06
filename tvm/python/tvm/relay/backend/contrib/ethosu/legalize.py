@@ -14,16 +14,17 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-# pylint: disable=invalid-name, unused-argument, import-outside-toplevel, no-value-for-parameter
+# pylint: disable=invalid-name, unused-argument, import-outside-toplevel
+# pylint: disable=no-value-for-parameter, use-list-literal
 """A set of passes to legalize some of operations for the NPU"""
 from typing import List, Type, Callable
 import math
 
 import numpy as np  # type: ignore
+from ethosu.vela import scaling, fp_math
 
 import tvm  # type: ignore
 from tvm import relay
-from tvm import ir
 from tvm.relay.dataflow_pattern import DFPatternCallback  # type: ignore
 from tvm.relay.dataflow_pattern import wildcard
 from tvm.relay.dataflow_pattern import is_op
@@ -32,6 +33,7 @@ from tvm.relay.dataflow_pattern import CallPattern
 from tvm.relay.backend.contrib.ethosu import op as ethosu_ops  # type: ignore
 from tvm.relay.backend.contrib.ethosu import vela_api
 from tvm.relay.backend.contrib.ethosu import util
+from tvm.relay.backend.contrib.ethosu.softmax_rewriter import SoftmaxRewriter
 from tvm.relay.op.contrib import ethosu as ethosu_patterns  # type: ignore
 
 
@@ -127,27 +129,15 @@ class PartitionedSplitRewriter(DFPatternCallback):
         return relay.op.split(split_input, indices_or_sections, axis=axis).astuple()
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeSplit:
-    """This is the pass that wraps SplitRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(PartitionedSplitRewriter(), func)
-            func = rewrite(SplitRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
-
-
 def get_lut_from_func(
-    ifm_scale: float, ifm_zp: int, ofm_scale: float, ofm_zp: int, func: Callable[[float], float]
+    ifm_scale: float,
+    ifm_zp: int,
+    ofm_scale: float,
+    ofm_zp: int,
+    func: Callable[[float], float],
 ) -> List[int]:
-    """Method to calculate the values of the lookup table based on the calculation function"""
+    """Calculates the values of the lookup table based on the calculation function"""
+
     lut_values = list()
     # Only int8 is currently supported
     dtype = np.int8
@@ -166,32 +156,38 @@ class LutActivationRewriter(DFPatternCallback):
     """A class to create an identity operator with the LUT"""
 
     def __init__(
-        self, params_class: Type, activation_type: str, calc_func: Callable[[float], float]
+        self,
+        params_class: Type,
+        activation_type: str,
+        calc_func: Callable[[float], float],
     ):
         super().__init__(require_type=True, rewrite_once=True)
+        self.params_class = params_class
         self.pattern = (wildcard().has_attr({"Composite": params_class.composite_name}))(wildcard())
         self.activation_type = activation_type
         self.calc_func = calc_func
 
     def callback(self, pre: tvm.relay.Expr, post: tvm.relay.Expr, node_map: tvm.ir.container.Map):
-        id_input = post.args[0]
+        params = self.params_class(post.op.body)
+        params.ifm.tensor = post.args[0]
 
-        quantize_args = post.op.body.args
-        output_scale = float(quantize_args[1].data.asnumpy())
-        output_zp = int(quantize_args[2].data.asnumpy())
-
-        dequantize_args = quantize_args[0].args[0].args
-        input_scale = float(dequantize_args[1].data.asnumpy())
-        input_zp = int(dequantize_args[2].data.asnumpy())
+        input_scale = float(params.ifm.q_params.scale_f32)
+        input_zp = int(params.ifm.q_params.zero_point)
+        output_scale = float(params.ofm.q_params.scale_f32)
+        output_zp = int(params.ofm.q_params.zero_point)
 
         lut_values = get_lut_from_func(
-            input_scale, input_zp, output_scale, output_zp, self.calc_func
+            input_scale,
+            input_zp,
+            output_scale,
+            output_zp,
+            self.calc_func,
         )
-        lut = relay.const(lut_values, dtype="uint8")
+        lut = relay.const(lut_values, dtype=params.ifm.dtype)
 
         # We baked the requantization into the LUT, so we don't requantize the identity operator
         identity = ethosu_ops.ethosu_identity(
-            ifm=id_input,
+            ifm=params.ifm.tensor,
             lut=lut,
             ifm_scale=input_scale,
             ifm_zero_point=input_zp,
@@ -210,22 +206,6 @@ class TanhRewriter(LutActivationRewriter):
         super().__init__(
             params_class=ethosu_patterns.TanhParams, activation_type="TANH", calc_func=math.tanh
         )
-
-
-@ir.transform.module_pass(opt_level=1)
-class LegalizeTanh:
-    """This is the pass that wraps TanhRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(TanhRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
 
 
 def sigmoid_calc_func(x: float) -> float:
@@ -254,20 +234,147 @@ class SigmoidRewriter(LutActivationRewriter):
         )
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeSigmoid:
-    """This is the pass that wraps SigmoidRewriter"""
+def leaky_relu_calc_func(x: float, alpha: float) -> float:
+    """Function to calculate the values for leaky relu."""
+    return x if x >= 0 else x * alpha
 
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(SigmoidRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
 
-    def __call__(self, *args, **kwargs):
-        pass
+class LeakyReLURewriter(DFPatternCallback):
+    """This pass adds leaky relu as a LUT for identity op."""
+
+    def __init__(self):
+        super().__init__(require_type=True, rewrite_once=True)
+        self.params_class = ethosu_patterns.LeakyReLUParams
+        self.pattern = wildcard().has_attr({"Composite": self.params_class.composite_name})(
+            wildcard()
+        )
+
+    def callback(self, pre: tvm.relay.Expr, post: tvm.relay.Expr, node_map: tvm.ir.container.Map):
+        params = self.params_class(post.op.body)
+        params.ifm.tensor = post.args[0]
+
+        input_scale = np.double(float(params.ifm.q_params.scale_f32))
+        input_zp = int(params.ifm.q_params.zero_point)
+        output_scale = np.double(float(params.ofm.q_params.scale_f32))
+        output_zp = int(params.ofm.q_params.zero_point)
+
+        alpha = params.alpha
+
+        # The calculation of the LUT values is similar to that in Vela
+        # convert_lrelu_to_lut(op, arch)
+        # (https://review.mlplatform.org/plugins/gitiles/ml/ethos-u/ethos-u-vela/+/refs/tags/3.2.0/ethosu/vela/tflite_graph_optimiser.py#864)  # pylint: disable=line-too-long
+        alpha_scalar = 1
+        alpha_scale, alpha_shift = scaling.elementwise_mul_scale(input_scale, alpha, output_scale)
+        identity_scale, identity_shift = scaling.elementwise_mul_scale(input_scale, 1, output_scale)
+
+        dtype = params.ifm.dtype
+        qmin, qmax = np.iinfo(dtype).min, np.iinfo(dtype).max
+
+        def calculate_lut_value(i):
+            zp_shift = (
+                fp_math.multiply_by_quantized_multiplier(
+                    alpha_scalar * (i - input_zp), alpha_scale, alpha_shift
+                )
+                if i < input_zp
+                else fp_math.multiply_by_quantized_multiplier(
+                    i - input_zp, identity_scale, identity_shift
+                )
+            )
+
+            return min(qmax, max(qmin, output_zp + zp_shift))
+
+        values = list(map(calculate_lut_value, range(qmin, qmax + 1)))
+        lut = relay.const(values, dtype=dtype)
+
+        # We baked the requantization into the LUT, so we don't requantize the identity operator
+        identity = ethosu_ops.ethosu_identity(
+            ifm=params.ifm.tensor,
+            lut=lut,
+            ifm_scale=input_scale,
+            ifm_zero_point=input_zp,
+            ofm_scale=input_scale,
+            ofm_zero_point=input_zp,
+            activation="LUT",
+        )
+
+        return identity
+
+
+class HardSwishRewriter(DFPatternCallback):
+    """Convert ethosu.hard_swish composite function to add operation with LUT."""
+
+    def __init__(self):
+        super().__init__(require_type=True, rewrite_once=True)
+        self.params_class = ethosu_patterns.HardSwishParams
+        self.pattern = wildcard().has_attr({"Composite": self.params_class.composite_name})(
+            wildcard()
+        )
+
+    def callback(self, pre: tvm.relay.Expr, post: tvm.relay.Expr, node_map: tvm.ir.container.Map):
+        params = self.params_class(post.op.body)
+        params.ifm.tensor = post.args[0]
+
+        # The calculation of the LUT values is similar to that in Vela
+        # convert_hardswish_to_lut(op, arch, nng)
+        # (https://review.mlplatform.org/plugins/gitiles/ml/ethos-u/ethos-u-vela/+/refs/tags/3.2.0/ethosu/vela/tflite_graph_optimiser.py#719)  # pylint: disable=line-too-long
+        input_scale = np.double(params.ifm.q_params.scale_f32)
+        input_zp = int(params.ifm.q_params.zero_point)
+        hires_input_scale = (1 / 128) * input_scale
+
+        output_scale = np.double(params.ofm.q_params.scale_f32)
+        output_zp = int(params.ofm.q_params.zero_point)
+        output_scale, output_shift = scaling.quantise_scale(hires_input_scale / output_scale)
+        output_scale_16 = fp_math.downscale_multiplier_int32_to_int16(output_scale)
+        output_shift = 31 - output_shift
+        output_shift = -output_shift if output_shift < 0 else 0
+
+        dtype = params.ifm.dtype
+        qmin, qmax = np.iinfo(dtype).min, np.iinfo(dtype).max
+
+        def calculate_relu_multiplier(inp, input_scale):
+            rmultiplier = np.double(3 / 32768)
+            rscale, rshift = scaling.quantise_scale(input_scale / rmultiplier)
+            rscale_16 = fp_math.downscale_multiplier_int32_to_int16(rscale)
+
+            rvalue = np.int16(inp)
+            if rshift < 31:
+                rvalue = fp_math.shift_left16(rvalue, 30 - rshift)
+                rvalue = fp_math.saturating_rounding_mul16(rvalue, rscale_16)
+                rvalue = fp_math.shift_left16(rvalue, 1)
+            elif rshift > 31:
+                rvalue = fp_math.saturating_rounding_mul16(rvalue, rscale_16)
+                rvalue = fp_math.rounding_divide_by_pot(rvalue, rshift - 31)
+            else:
+                rvalue = fp_math.saturating_rounding_mul16(rvalue, rscale_16)
+
+            rvalue = (rvalue + (1 << 15)) >> 1
+            return rvalue
+
+        def calculate_lut_values(i):
+            hires_input_value = (i - input_zp) * 128
+            preshift_input_value = fp_math.saturating_rounding_mul16(
+                hires_input_value, output_scale_16
+            )
+            relu_value = calculate_relu_multiplier(hires_input_value, hires_input_scale)
+            lut_result = fp_math.saturating_mul16(relu_value, preshift_input_value)
+            lut_result = fp_math.rounding_divide_by_pot(lut_result, output_shift) + output_zp
+            return min(qmax, max(qmin, lut_result))
+
+        values = list(map(calculate_lut_values, range(-128, 128)))
+        lut = relay.const(values, dtype=dtype)
+
+        # We baked the requantization into the LUT, so we don't requantize the identity operator
+        identity = ethosu_ops.ethosu_identity(
+            ifm=params.ifm.tensor,
+            lut=lut,
+            ifm_scale=input_scale,
+            ifm_zero_point=input_zp,
+            ofm_scale=input_scale,
+            ofm_zero_point=input_zp,
+            activation="LUT",
+        )
+
+        return identity
 
 
 class Conv2DRewriter(DFPatternCallback):
@@ -337,22 +444,6 @@ class Conv2DRewriter(DFPatternCallback):
         return ethosu_conv2d
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeConv2D:
-    """This is the pass that wraps the Conv2DRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(Conv2DRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
-
-
 class Conv2DTransposeRewriter(DFPatternCallback):
     """Convert conv2d_transpose related composite functions into
     ethosu_conv2d_transpose operators."""
@@ -416,22 +507,6 @@ class Conv2DTransposeRewriter(DFPatternCallback):
 
         # Remove additional padding by 'cropping' back to expected size
         return relay.strided_slice(reduced_op, (0, 0, 0, 0), ofm_shape)
-
-
-@ir.transform.module_pass(opt_level=1)
-class LegalizeConv2DTranspose:
-    """This is the pass that wraps the Conv2DTransposeRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(Conv2DTransposeRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
 
 
 class DepthwiseConv2DRewriter(DFPatternCallback):
@@ -508,22 +583,6 @@ class DepthwiseConv2DRewriter(DFPatternCallback):
         return ethosu_depthwise_conv2d
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeDepthwiseConv2D:
-    """This is the pass that wraps the DepthwiseConv2DRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(DepthwiseConv2DRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
-
-
 class PoolingRewriter(DFPatternCallback):
     """Convert ethosu.avgpool2d and ethosu.maxpool2d composite functions to
     ethosu_pooling operators"""
@@ -559,6 +618,15 @@ class PoolingRewriter(DFPatternCallback):
         # Activations requiring LUT is currently not supported, so setting it to an empty list
         lut = relay.const([], dtype="int8")
 
+        # If ethosu.avgpool2d has strides which are not supported by the NPU, convert
+        # ethosu.avgpool2d composite functions to ethosu_pooling operator with stride=[1, 1].
+        # Since the spatial dimensions of ifm and the pooling kernel coincide and the padding
+        # is [0, 0, 0, 0], the application of the pooling kernel will be done only once,
+        # which will give us the desired output
+        strides = params.strides
+        if params.strides[0] > 3 or params.strides[1] > 3:
+            strides = [1, 1]
+
         return ethosu_ops.ethosu_pooling(
             ifm=post.args[0],
             lut=lut,
@@ -569,7 +637,8 @@ class PoolingRewriter(DFPatternCallback):
             ofm_zero_point=params.ofm.q_params.zero_point,
             pool_shape=params.pool_shape,
             ofm_channels=params.ofm.shape[channels_map[str(params.ofm.layout)]],
-            strides=params.strides,
+            ofm_dtype=params.ofm.dtype,
+            strides=strides,
             padding=params.padding,
             activation=activation,
             clip_min=clip_min,
@@ -590,22 +659,6 @@ class MaxPoolingRewriter(PoolingRewriter):
         )
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeMaxPooling:
-    """This is the pass that wraps the MaxPoolingRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(MaxPoolingRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
-
-
 class AvgPoolingRewriter(PoolingRewriter):
     def __init__(self):
         super().__init__(
@@ -614,22 +667,6 @@ class AvgPoolingRewriter(PoolingRewriter):
                 wildcard().has_attr({"Composite": ethosu_patterns.AvgPool2DParams.composite_name})
             )(wildcard()),
         )
-
-
-@ir.transform.module_pass(opt_level=1)
-class LegalizeAvgPooling:
-    """This is the pass that wraps the AvgPoolingRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(AvgPoolingRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
 
 
 class BinaryElementwiseRewriter(DFPatternCallback):
@@ -758,22 +795,6 @@ class AddRewriter(BinaryElementwiseRewriter):
         )
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeAdd:
-    """This is the pass that wraps the AddRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(AddRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
-
-
 class SubRewriter(BinaryElementwiseRewriter):
     def __init__(self):
         super().__init__(
@@ -782,22 +803,6 @@ class SubRewriter(BinaryElementwiseRewriter):
                 wildcard(), wildcard()
             ),
         )
-
-
-@ir.transform.module_pass(opt_level=1)
-class LegalizeSub:
-    """This is the pass that wraps the SubRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(SubRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
 
 
 class MulRewriter(BinaryElementwiseRewriter):
@@ -810,22 +815,6 @@ class MulRewriter(BinaryElementwiseRewriter):
         )
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeMul:
-    """This is the pass that wraps the MulRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(MulRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
-
-
 class MinRewriter(BinaryElementwiseRewriter):
     def __init__(self):
         super().__init__(
@@ -834,22 +823,6 @@ class MinRewriter(BinaryElementwiseRewriter):
                 wildcard(), wildcard()
             ),
         )
-
-
-@ir.transform.module_pass(opt_level=1)
-class LegalizeMin:
-    """This is the pass that wraps the MinRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(MinRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
 
 
 class MaxRewriter(BinaryElementwiseRewriter):
@@ -862,22 +835,6 @@ class MaxRewriter(BinaryElementwiseRewriter):
         )
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeMax:
-    """This is the pass that wraps the MaxRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(MaxRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
-
-
 class ShlRewriter(BinaryElementwiseRewriter):
     def __init__(self):
         super().__init__(
@@ -886,22 +843,6 @@ class ShlRewriter(BinaryElementwiseRewriter):
                 wildcard(), wildcard()
             ),
         )
-
-
-@ir.transform.module_pass(opt_level=1)
-class LegalizeShl:
-    """This is the pass that wraps the ShlRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(ShlRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
 
 
 class StridedSliceRewriter(DFPatternCallback):
@@ -918,32 +859,23 @@ class StridedSliceRewriter(DFPatternCallback):
     ) -> tvm.relay.Expr:
 
         slice_input = post.args[0]
+
+        # TODO(lhutton1) For an unknown reason compilation will fail for strides of 4
+        # dimensions, so we cannot use params.strides as this will sometimes give
+        # strides as [1, 1, 1, 1]. Since we only support strides of 1, hardcoding this
+        # value for now.
+        strides = [1]
+
         params = ethosu_patterns.StridedSliceParams(post.op.body)
         strided_slice = relay.op.strided_slice(
             slice_input,
             params.begin,
             params.end,
-            strides=params.strides,
+            strides=strides,
             axes=params.axes,
             slice_mode=params.slice_mode,
         )
         return strided_slice
-
-
-@ir.transform.module_pass(opt_level=1)
-class LegalizeStridedSlice:
-    """This is the pass that wraps StridedSliceRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(StridedSliceRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
 
 
 class ReshapeRewriter(DFPatternCallback):
@@ -964,22 +896,6 @@ class ReshapeRewriter(DFPatternCallback):
         return relay.op.reshape(reshape_input, newshape=new_shape)
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeReshape:
-    """This is the pass that wraps ReshapeRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(ReshapeRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
-
-
 class NoOpRewriter(DFPatternCallback):
     """This pass adds an idenity operator to reshape and strided slice to avoid a no op
     without a consumer"""
@@ -996,22 +912,6 @@ class NoOpRewriter(DFPatternCallback):
         if pre.checked_type.dtype == "int32":
             return post
         return ethosu_ops.ethosu_identity(ifm=post, lut=relay.const([], dtype="int8"))
-
-
-@ir.transform.module_pass(opt_level=1)
-class LegalizeNoOps:
-    """This is the pass that wraps RewriteNoOps"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(NoOpRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
 
 
 class UnaryElementwiseRewriter(DFPatternCallback):
@@ -1085,28 +985,10 @@ class AbsRewriter(UnaryElementwiseRewriter):
         )
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeAbs:
-    """This is the pass that wraps the AbsRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(AbsRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
-
-
 class MeanRewriter(DFPatternCallback):
-    """Convert ethosu.mean composite functions to to an equivalent legalization:
-    - Case 1 (axis == [1, 2] and keepsdims == True):
-        ethosu_depthwise_conv2d + ethosu_binary_elementwise
-    - Case 2 (ifm qparams == ofm qparams): ethosu_pooling
-    - Case 3 (else): ethosu_depthwise_conv2d
+    """Convert ethosu.mean composite functions to an equivalent legalization:
+    - Case 1 (ifm qparams == ofm qparams): ethosu_pooling
+    - Case 2 (else): ethosu_depthwise_conv2d
     """
 
     def __init__(self):
@@ -1149,56 +1031,7 @@ class MeanRewriter(DFPatternCallback):
             filter_height = 1
             reduced_op = relay.reshape(reduced_op, ifm_shape)
 
-        if axis == [1, 2] and params.keepdims:
-            weight_scale = 1
-            weight_values = np.ones([out_channels, filter_height, filter_width, in_channels])
-            scale_bias = vela_api.pack_biases(
-                biases=np.zeros(ifm_shape[-1]),
-                ifm_scale=params.ifm.q_params.scale_f32,
-                ifm_dtype=np.dtype(params.ifm.dtype),
-                weight_scales=np.array([weight_scale], dtype=np.float),
-                ofm_scale=params.ofm.q_params.scale_f32,
-                is_activation_tanh_or_sigmoid=False,
-            )
-
-            reduced_op = ethosu_ops.ethosu_depthwise_conv2d(
-                ifm=reduced_op,
-                weight=relay.const(weight_values, params.ifm.dtype),
-                scale_bias=relay.const(scale_bias, "uint8"),
-                lut=lut,
-                ifm_scale=float(params.ifm.q_params.scale_f32),
-                ifm_zero_point=int(params.ifm.q_params.zero_point),
-                weight_zero_point=0,
-                ofm_scale=float(params.ofm.q_params.scale_f32),
-                ofm_zero_point=int(params.ofm.q_params.zero_point),
-                kernel_shape=(filter_height, filter_width),
-                ofm_channels=out_channels,
-                ofm_dtype="int16",
-            )
-
-            n = int(filter_height * filter_width)
-            eps = 1 / (256 * (n + 1)) if n % 2 == 0 else 0
-
-            scalar_tensor = relay.const(np.ones([1, 1, 1, 1], dtype="int16"), dtype="int16")
-
-            reduced_op = ethosu_ops.ethosu_binary_elementwise(
-                ifm=reduced_op,
-                ifm2=scalar_tensor,
-                lut=lut,
-                operator_type="MUL",
-                ifm_scale=float(params.ofm.q_params.scale_f32),
-                ifm_zero_point=int(params.ofm.q_params.zero_point),
-                ifm2_scale=1 / (n - eps),
-                ifm2_zero_point=0,
-                ofm_scale=float(params.ofm.q_params.scale_f32),
-                ofm_zero_point=int(params.ofm.q_params.zero_point),
-                ifm_channels=out_channels,
-                ifm2_channels=out_channels,
-                reversed_operands=False,
-                ofm_dtype="int8",
-                rounding_mode="NATURAL",
-            )
-        elif (
+        if (
             params.ifm.q_params.scale_f32 == params.ofm.q_params.scale_f32
             and params.ifm.q_params.zero_point == params.ofm.q_params.zero_point
         ):
@@ -1212,11 +1045,12 @@ class MeanRewriter(DFPatternCallback):
                 ofm_zero_point=0,
                 pool_shape=(filter_height, filter_width),
                 ofm_channels=out_channels,
+                ofm_dtype=params.ofm.dtype,
                 rounding_mode="TRUNCATE",
             )
         else:
             weight_scale = 1 / (filter_height * filter_width)
-            weight_values = np.ones([out_channels, filter_height, filter_width, in_channels])
+            weight_values = np.ones([out_channels, filter_height, filter_width, 1])
             bias = -1 * int(params.ifm.q_params.zero_point) * filter_height * filter_width
 
             scale_bias = vela_api.pack_biases(
@@ -1240,6 +1074,7 @@ class MeanRewriter(DFPatternCallback):
                 kernel_shape=(filter_height, filter_width),
                 ofm_channels=out_channels,
                 rounding_mode="NATURAL",
+                ofm_dtype=params.ofm.dtype,
             )
 
         # Reshape to original ofm shape
@@ -1249,20 +1084,86 @@ class MeanRewriter(DFPatternCallback):
         return reduced_op
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeMean:
-    """This is the pass that wraps the MeanRewriter"""
+class SumRewriter(DFPatternCallback):
+    """
+    Convert ethosu.sum composite functions to pooling operations
+    """
 
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(MeanRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
+    def __init__(self):
+        super().__init__(require_type=True)
+        self.pattern = (
+            wildcard().has_attr({"Composite": ethosu_patterns.SumParams.composite_name})
+        )(wildcard())
 
-    def __call__(self, *args, **kwargs):
-        pass
+    def callback(
+        self, pre: tvm.relay.Expr, post: tvm.relay.Expr, node_map: tvm.ir.container.Map
+    ) -> tvm.relay.Expr:
+
+        params = ethosu_patterns.SumParams(post.op.body)
+
+        ifm_shape = params.ifm.shape
+        ofm_shape = params.ofm.shape
+        lut = relay.const([], "int8")
+        reduced_op = post.args[0]
+
+        # Enforce 4d input
+        if len(ifm_shape) == 3:
+            ifm_shape = [1, params.height, params.width, ifm_shape[2]]
+            reduced_op = relay.reshape(reduced_op, ifm_shape)
+
+        activation_map = {"clip": "CLIP"}
+        if params.activation:
+            activation = activation_map[params.activation.op.name]
+            clip_min = int(params.activation.attrs.a_min)
+            clip_max = int(params.activation.attrs.a_max)
+        else:
+            activation = "NONE"
+            clip_min = 0
+            clip_max = 0
+
+        reduced_op = ethosu_ops.ethosu_pooling(
+            ifm=reduced_op,
+            lut=lut,
+            pooling_type="SUM",
+            ifm_scale=float(params.ifm.q_params.scale_f32),
+            ifm_zero_point=int(params.ifm.q_params.zero_point),
+            ofm_scale=float(params.ofm.q_params.scale_f32),
+            ofm_zero_point=0,
+            pool_shape=(1, 1),
+            ofm_channels=1,
+            ofm_dtype="int32",
+            activation=activation,
+            clip_min=clip_min,
+            clip_max=clip_max,
+            ifm_layout=params.ifm.layout,
+            ofm_layout=params.ofm.layout,
+            rounding_mode="NATURAL",
+        )
+
+        # Convert tensor dtype from int32 to int8
+        scalar_tensor = relay.const(np.ones([1, 1, 1, 1], dtype="int32"), dtype="int32")
+        reduced_op = ethosu_ops.ethosu_binary_elementwise(
+            ifm=reduced_op,
+            ifm2=scalar_tensor,
+            lut=lut,
+            operator_type="MUL",
+            ifm_scale=0.0,
+            ifm_zero_point=0,
+            ifm2_scale=0.0,
+            ifm2_zero_point=0,
+            ofm_scale=0.0,
+            ofm_zero_point=int(params.ofm.q_params.zero_point),
+            ifm_channels=1,
+            ifm2_channels=1,
+            reversed_operands=False,
+            ofm_dtype="int8",
+        )
+
+        # Reshape to original ofm shape
+        if len(ofm_shape) < 4:
+            reduced_op = relay.reshape(reduced_op, ofm_shape)
+
+        return reduced_op
 
 
 class ConcatRewriter(DFPatternCallback):
@@ -1283,28 +1184,12 @@ class ConcatRewriter(DFPatternCallback):
         # Find the tensors that are inputs to the concat and the scales and zero points
         concat_args = list()
         for arg in post.args:
-            if isinstance(arg, tvm.relay.expr.Call):
+            if isinstance(arg, (tvm.relay.expr.Call, tvm.relay.expr.TupleGetItem)):
                 concat_args.append(arg)
 
         axis = post.op.body.attrs.axis
         concat = relay.op.concatenate(relay.Tuple(concat_args), axis=axis)
         return concat
-
-
-@ir.transform.module_pass(opt_level=1)
-class LegalizeConcat:
-    """This is the pass that wraps ConcatRewriter"""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(ConcatRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
 
 
 class RequantizeRewriter(DFPatternCallback):
@@ -1331,23 +1216,8 @@ class RequantizeRewriter(DFPatternCallback):
             ifm_zero_point=int(params.ifm.q_params.zero_point),
             ofm_scale=float(params.ofm.q_params.scale_f32),
             ofm_zero_point=int(params.ofm.q_params.zero_point),
+            rounding_mode="NATURAL",
         )
-
-
-@ir.transform.module_pass(opt_level=1)
-class LegalizeRequantize:
-    """This is the pass that wraps RequantizeRewriter."""
-
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(RequantizeRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
-
-    def __call__(self, *args, **kwargs):
-        pass
 
 
 class Resize2dRewriter(DFPatternCallback):
@@ -1414,6 +1284,7 @@ class Resize2dRewriter(DFPatternCallback):
             ofm_zero_point=int(params.ofm.q_params.zero_point),
             pool_shape=pool_shape,
             ofm_channels=in_channels,
+            ofm_dtype=params.ofm.dtype,
             strides=[1, 1],
             padding=padding,
             upscale="NEAREST",
@@ -1429,58 +1300,385 @@ class Resize2dRewriter(DFPatternCallback):
         return total_padding
 
 
-@ir.transform.module_pass(opt_level=1)
-class LegalizeResize2d:
-    """This is the pass that wraps Resize2dRewriter"""
+class ExpandDimsRewriter(DFPatternCallback):
+    """Legalize expand dims to a reshape operator."""
 
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
-        for global_var, func in mod.functions.items():
-            func = rewrite(Resize2dRewriter(), func)
-            mod.update_func(global_var, func)
-        return mod
+    def __init__(self):
+        super().__init__(require_type=True, rewrite_once=True)
+        self.pattern = (
+            wildcard().has_attr({"Composite": ethosu_patterns.ExpandDimsParams.composite_name})
+        )(None)
 
-    def __call__(self, *args, **kwargs):
-        pass
+    def callback(
+        self, pre: tvm.relay.Expr, post: tvm.relay.Expr, node_map: tvm.ir.container.Map
+    ) -> tvm.relay.Expr:
+        params = ethosu_patterns.ExpandDimsParams(post.op.body)
+        return relay.op.reshape(post.args[0], newshape=params.output.shape)
 
 
-@ir.transform.module_pass(opt_level=1)
+class SqueezeRewriter(DFPatternCallback):
+    """Legalize squeeze to a reshape operator."""
+
+    def __init__(self):
+        super().__init__(require_type=True, rewrite_once=True)
+        self.pattern = (
+            wildcard().has_attr({"Composite": ethosu_patterns.SqueezeParams.composite_name})
+        )(None)
+
+    def callback(
+        self, pre: tvm.relay.Expr, post: tvm.relay.Expr, node_map: tvm.ir.container.Map
+    ) -> tvm.relay.Expr:
+        params = ethosu_patterns.SqueezeParams(post.op.body)
+        return relay.op.reshape(post.args[0], newshape=params.output.shape)
+
+
+class FullyConnectedRewriter(DFPatternCallback):
+    """Legalize Fully Connected (with bias and clip) to an NPU operator"""
+
+    def __init__(self):
+        super().__init__(require_type=True)
+        self.pattern = (
+            wildcard().has_attr({"Composite": ethosu_patterns.FullyConnectedParams.composite_name})
+        )(wildcard())
+
+    def callback(self, pre, post, node_map):
+        params = ethosu_patterns.FullyConnectedParams(post.op.body)
+        params.ifm.tensor = post.args[0]
+
+        # IFM reshapes
+        ifm = post.args[0]
+        if len(params.ifm.shape) != 4 or not params.ifm.shape[1] == params.ifm.shape[2] == 1:
+            ifm = relay.reshape(ifm, (1, 1, 1, params.ifm.shape[-1]))
+
+        # Weight transformations
+        weights_values = params.weights.values
+        weights_values_ohwi = np.expand_dims(weights_values, axis=(1, 2))
+        if params.activation:
+            activation = "CLIP"
+            clip_min = int(params.activation.attrs.a_min)
+            clip_max = int(params.activation.attrs.a_max)
+        else:
+            activation = "NONE"
+            clip_min = 0
+            clip_max = 0
+        bias_values = (
+            params.biases.tensor.data.asnumpy()
+            if params.biases
+            else np.zeros((params.ofm.shape[-1]))
+        )
+        scale_bias = vela_api.pack_biases(
+            biases=bias_values,
+            ifm_scale=params.ifm.q_params.scale_f32,
+            ifm_dtype=np.dtype(params.ifm.dtype),
+            weight_scales=params.weights.q_params.scale_f32,
+            ofm_scale=params.ofm.q_params.scale_f32,
+            is_activation_tanh_or_sigmoid=False,
+        )
+        ethosu_fc = ethosu_ops.ethosu_conv2d(
+            ifm=ifm,
+            weight=relay.const(weights_values_ohwi, params.weights.values.dtype),
+            scale_bias=relay.const(scale_bias, "uint8"),
+            lut=relay.const([], dtype="int8"),
+            ifm_scale=float(params.ifm.q_params.scale_f32),
+            ifm_zero_point=int(params.ifm.q_params.zero_point),
+            weight_zero_point=int(params.weights.q_params.zero_point),
+            ofm_scale=float(params.ofm.q_params.scale_f32),
+            ofm_zero_point=int(params.ofm.q_params.zero_point),
+            kernel_shape=[1, 1],
+            ofm_channels=params.weights.shape[0],
+            strides=(1, 1),
+            padding=(0, 0, 0, 0),
+            dilation=(1, 1),
+            activation=activation,
+            clip_min=clip_min,
+            clip_max=clip_max,
+            upscale="NONE",
+            ifm_layout="NHWC",
+            ofm_layout="NHWC",
+        )
+
+        if len(params.ofm.shape) != 4 or not params.ofm.shape[1] == params.ofm.shape[2] == 1:
+            ethosu_fc = relay.reshape(ethosu_fc, params.ofm.shape)
+        return ethosu_fc
+
+
+class MatMulRewriter(DFPatternCallback):
+    """Legalize matrix multiplication to an NPU operator"""
+
+    def __init__(self):
+        super().__init__(require_type=True)
+        self.pattern = (
+            wildcard().has_attr({"Composite": ethosu_patterns.MatMulParams.composite_name})
+        )(wildcard(), wildcard())
+
+    def callback(self, pre, post, node_map):
+        params = ethosu_patterns.MatMulParams(post.op.body)
+        ifm = post.args[0]
+        ifm2 = post.args[1]
+        lut = relay.const([], dtype="int8")
+        activation_map = {"clip": "CLIP"}
+        if params.activation:
+            activation = activation_map[params.activation.op.name]
+            clip_min = int(params.activation.attrs.a_min)
+            clip_max = int(params.activation.attrs.a_max)
+        else:
+            activation = "NONE"
+            clip_min = 0
+            clip_max = 0
+
+        # Reshape ifm to NHWC
+        ifm = relay.reshape(ifm, (1, 1, *params.ifm.shape))
+        # Split the second matrix to get columns
+        columns = list(relay.op.split(ifm2, params.ofm.shape[-1], axis=0))
+
+        res_columns = []
+        for column in columns:
+            ifm2 = relay.reshape(column, (1, 1, 1, params.ifm.shape[-1]))
+            # Multiplying the first matrix by a column
+            ethosu_binary_elementwise = ethosu_ops.ethosu_binary_elementwise(
+                ifm=ifm,
+                ifm2=ifm2,
+                lut=lut,
+                operator_type="MUL",
+                ifm_zero_point=int(params.ifm.q_params.zero_point),
+                ifm_scale=0.0,
+                ifm2_zero_point=int(params.weights.q_params.zero_point),
+                ifm2_scale=0.0,
+                ofm_scale=0.0,
+                ofm_zero_point=0,
+                ifm_channels=params.ifm.shape[-1],
+                ifm2_channels=params.ifm.shape[-1],
+                reversed_operands=False,
+                ofm_dtype="int32",
+            )
+
+            # Use reduce sum to get result column
+            reduce_sum = ethosu_ops.ethosu_pooling(
+                ifm=ethosu_binary_elementwise,
+                lut=lut,
+                pooling_type="SUM",
+                ifm_zero_point=0,
+                ifm_scale=float(params.weights.q_params.scale_f32)
+                * float(params.ifm.q_params.scale_f32),
+                ofm_scale=float(params.ofm.q_params.scale_f32),
+                ofm_zero_point=0,
+                pool_shape=(1, 1),
+                ofm_channels=1,
+                ofm_dtype="int32",
+                activation=activation,
+                clip_min=clip_min,
+                clip_max=clip_max,
+                rounding_mode="NATURAL",
+            )
+
+            # Convert tensor dtype from int32 to int8
+            scalar_tensor = relay.const(np.ones([1, 1, 1, 1], dtype="int32"), dtype="int32")
+            reduce_sum = ethosu_ops.ethosu_binary_elementwise(
+                ifm=reduce_sum,
+                ifm2=scalar_tensor,
+                lut=lut,
+                operator_type="MUL",
+                ifm_scale=0.0,
+                ifm_zero_point=0,
+                ifm2_scale=0.0,
+                ifm2_zero_point=0,
+                ofm_scale=0.0,
+                ofm_zero_point=int(params.ofm.q_params.zero_point),
+                ifm_channels=1,
+                ifm2_channels=1,
+                reversed_operands=False,
+                ofm_dtype="int8",
+            )
+
+            res_columns.append(reduce_sum)
+
+        # Concatenate result columns
+        concat = relay.op.concatenate(relay.Tuple(res_columns), axis=3)
+        return relay.reshape(concat, params.ofm.shape)
+
+
+class PadRewriter(DFPatternCallback):
+    """Convert ethos-u.pad2d composite function to ethosu_depthwise_conv2d
+    operator"""
+
+    def __init__(self):
+        super().__init__(require_type=True)
+        self.pattern = (
+            wildcard().has_attr({"Composite": ethosu_patterns.PadParams.composite_name})
+        )(wildcard())
+
+    def callback(
+        self, pre: tvm.relay.Expr, post: tvm.relay.Expr, node_map: tvm.ir.container.Map
+    ) -> tvm.relay.Expr:
+        params = ethosu_patterns.PadParams(post.op.body)
+        params.ifm.tensor = post.args[0]
+        channels_map = {
+            "NHWC": 3,
+        }
+        w_h, w_w = (1, 1)
+        # OHWI format for the ethosu_depthwise_conv2d kernel weights
+        weight_shape = (params.ifm.shape[-1], w_h, w_w, 1)
+        weights = relay.const(np.full(weight_shape, 1), params.ifm.dtype)
+        scale_bias = vela_api.pack_biases(
+            biases=np.zeros(params.ifm.shape[-1]),
+            ifm_scale=params.ifm.q_params.scale_f32,
+            ifm_dtype=np.dtype(params.ifm.dtype),
+            weight_scales=np.array(1.0, dtype=np.float32),
+            ofm_scale=params.ofm.q_params.scale_f32,
+            is_activation_tanh_or_sigmoid=False,
+        )
+
+        return ethosu_ops.ethosu_depthwise_conv2d(
+            ifm=post.args[0],
+            weight=weights,
+            scale_bias=relay.const(scale_bias, "uint8"),
+            lut=relay.const([], "int8"),
+            ifm_scale=float(params.ifm.q_params.scale_f32),
+            ifm_zero_point=int(params.ifm.q_params.zero_point.item()),
+            weight_zero_point=0,
+            ofm_scale=float(params.ofm.q_params.scale_f32),
+            ofm_zero_point=int(params.ofm.q_params.zero_point.item()),
+            kernel_shape=(w_h, w_w),
+            ofm_channels=params.ofm.shape[channels_map[str(params.ofm.layout)]],
+            strides=(1, 1),
+            padding=params.padding,
+            dilation=(1, 1),
+            activation="NONE",
+            clip_min=0,
+            clip_max=0,
+            upscale="NONE",
+            ifm_layout=str(params.ifm.layout),
+            ofm_layout=str(params.ofm.layout),
+            ofm_dtype=str(params.ofm.dtype),
+        )
+
+
+class ChannelPadRewriter(DFPatternCallback):
+    """Convert ethos-u.channel-pad composite function to the Relay concatenate operation"""
+
+    def __init__(self):
+        super().__init__(require_type=True)
+        self.pattern = (
+            wildcard().has_attr({"Composite": ethosu_patterns.ChannelPadParams.composite_name})
+        )(wildcard())
+
+    def callback(
+        self, pre: tvm.relay.Expr, post: tvm.relay.Expr, node_map: tvm.ir.container.Map
+    ) -> tvm.relay.Expr:
+        params = ethosu_patterns.ChannelPadParams(post.op.body)
+        params.ifm.tensor = post.args[0]
+
+        concat_args = list()
+        lut = relay.const([], dtype="int8")
+        # pad channels before
+        if params.ch_padding[0] > 0:
+            shape1 = list(params.ifm.shape)
+            shape1[3] = params.ch_padding[0].value
+            pad_channels = relay.Constant(
+                tvm.nd.array(
+                    np.full(
+                        shape=shape1,
+                        fill_value=int(params.ifm.q_params.zero_point),
+                        dtype=params.ifm.dtype,
+                    )
+                )
+            )
+            identity1 = ethosu_ops.ethosu_identity(
+                ifm=pad_channels,
+                lut=lut,
+                ifm_scale=float(params.ifm.q_params.scale_f32),
+                ifm_zero_point=int(params.ifm.q_params.zero_point),
+                ofm_scale=float(params.ofm.q_params.scale_f32),
+                ofm_zero_point=int(params.ofm.q_params.zero_point),
+            )
+            concat_args.append(identity1)
+
+        identity2 = ethosu_ops.ethosu_identity(
+            ifm=params.ifm.tensor,
+            lut=lut,
+            ifm_scale=float(params.ifm.q_params.scale_f32),
+            ifm_zero_point=int(params.ifm.q_params.zero_point),
+            ofm_scale=float(params.ofm.q_params.scale_f32),
+            ofm_zero_point=int(params.ofm.q_params.zero_point),
+        )
+        concat_args.append(identity2)
+
+        # pad channels after
+        if params.ch_padding[1] > 0:
+            shape3 = list(params.ifm.shape)
+            shape3[3] = params.ch_padding[1].value
+            pad_channels3 = relay.Constant(
+                tvm.nd.array(
+                    np.full(
+                        shape=shape3,
+                        fill_value=int(params.ifm.q_params.zero_point),
+                        dtype=params.ifm.dtype,
+                    )
+                )
+            )
+            identity3 = ethosu_ops.ethosu_identity(
+                ifm=pad_channels3,
+                lut=lut,
+                ifm_scale=float(params.ifm.q_params.scale_f32),
+                ifm_zero_point=int(params.ifm.q_params.zero_point),
+                ofm_scale=float(params.ofm.q_params.scale_f32),
+                ofm_zero_point=int(params.ofm.q_params.zero_point),
+            )
+            concat_args.append(identity3)
+
+        return relay.op.concatenate(relay.Tuple(concat_args), axis=3)
+
+
+@util.create_npu_function_pass(opt_level=1)
 class LegalizeEthosU:
     """This is the pass to call graph-rewrites to perform graph transformation
     in a way such that the operations are replaced with hardware/codegen supported
     operations.
     """
 
-    def transform_module(
-        self, mod: tvm.ir.IRModule, ctx: tvm.ir.transform.PassContext
-    ) -> tvm.ir.IRModule:
+    def transform_npu_function(self, _, func: relay.Function) -> relay.Function:
         """This is the method that replaces the operations with hardware/codegen supported
         operations.
         """
-        mod = LegalizeSplit()(mod)
-        mod = LegalizeConv2D()(mod)
-        mod = LegalizeConv2DTranspose()(mod)
-        mod = LegalizeDepthwiseConv2D()(mod)
-        mod = LegalizeMaxPooling()(mod)
-        mod = LegalizeAvgPooling()(mod)
-        mod = LegalizeAdd()(mod)
-        mod = LegalizeSub()(mod)
-        mod = LegalizeMul()(mod)
-        mod = LegalizeMin()(mod)
-        mod = LegalizeMax()(mod)
-        mod = LegalizeShl()(mod)
-        mod = LegalizeAbs()(mod)
-        mod = LegalizeTanh()(mod)
-        mod = LegalizeMean()(mod)
-        mod = LegalizeConcat()(mod)
-        mod = LegalizeSigmoid()(mod)
-        mod = LegalizeRequantize()(mod)
-        mod = LegalizeResize2d()(mod)
-        mod = LegalizeReshape()(mod)
-        mod = LegalizeStridedSlice()(mod)
-        mod = LegalizeNoOps()(mod)
-        return mod
+        rewriters = [
+            PartitionedSplitRewriter(),
+            FullyConnectedRewriter(),
+            MatMulRewriter(),
+            SplitRewriter(),
+            ChannelPadRewriter(),
+            Conv2DRewriter(),
+            Conv2DTransposeRewriter(),
+            DepthwiseConv2DRewriter(),
+            MaxPoolingRewriter(),
+            AvgPoolingRewriter(),
+            PadRewriter(),
+            AddRewriter(),
+            SubRewriter(),
+            MulRewriter(),
+            MinRewriter(),
+            MaxRewriter(),
+            ShlRewriter(),
+            AbsRewriter(),
+            TanhRewriter(),
+            HardSwishRewriter(),
+            LeakyReLURewriter(),
+            MeanRewriter(),
+            SumRewriter(),
+            SoftmaxRewriter(),
+            ConcatRewriter(),
+            SigmoidRewriter(),
+            RequantizeRewriter(),
+            Resize2dRewriter(),
+            ExpandDimsRewriter(),
+            SqueezeRewriter(),
+            ReshapeRewriter(),
+            StridedSliceRewriter(),
+            NoOpRewriter(),
+        ]
+        for rewriter in rewriters:
+            func = rewrite(rewriter, func)
+
+        return func
 
     def __call__(self, *args, **kwargs):
         # pylint is unable figure out the decorated

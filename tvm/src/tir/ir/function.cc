@@ -27,14 +27,6 @@
 
 namespace tvm {
 namespace tir {
-
-LinkedParam::LinkedParam(int64_t id, ::tvm::runtime::NDArray param) {
-  auto n = make_object<LinkedParamNode>();
-  n->id = id;
-  n->param = param;
-  data_ = std::move(n);
-}
-
 // Get the function type of a PrimFunc
 PrimFunc::PrimFunc(Array<tir::Var> params, Stmt body, Type ret_type,
                    Map<tir::Var, Buffer> buffer_map, DictAttrs attrs, Span span) {
@@ -93,36 +85,29 @@ TensorIntrin::TensorIntrin(PrimFunc desc, PrimFunc impl) {
   data_ = std::move(n);
 }
 
-void TensorIntrin::Register(String name, TensorIntrin intrin) {
+void TensorIntrin::Register(String name, TensorIntrin intrin, bool override) {
   TensorIntrinManager* manager = TensorIntrinManager::Global();
-  CHECK_EQ(manager->reg.count(name), 0)
-      << "ValueError: TensorIntrin '" << name << "' has already been registered";
+  if (!override) {
+    CHECK_EQ(manager->reg.count(name), 0)
+        << "ValueError: TensorIntrin '" << name << "' has already been registered";
+  }
   manager->reg.Set(name, intrin);
 }
 
-TensorIntrin TensorIntrin::Get(String name) {
+Optional<TensorIntrin> TensorIntrin::Get(String name, bool allow_missing) {
   const TensorIntrinManager* manager = TensorIntrinManager::Global();
   auto it = manager->reg.find(name);
-  CHECK(it != manager->reg.end()) << "ValueError: TensorIntrin '" << name << "' is not registered";
-  return manager->reg.at(name);
+  if (it == manager->reg.end()) {
+    if (allow_missing) {
+      return NullOpt;
+    } else {
+      LOG(FATAL) << "ValueError: TensorIntrin '" << name << "' is not registered";
+    }
+  }
+  return (*it).second;
 }
 
 TVM_REGISTER_NODE_TYPE(TensorIntrinNode);
-
-TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
-    .set_dispatch<PrimFuncNode>([](const ObjectRef& ref, ReprPrinter* p) {
-      // TODO(tvm-team) redirect to Text printer once we have a good text format.
-      auto* node = static_cast<const PrimFuncNode*>(ref.get());
-      p->stream << "PrimFunc(" << node->params << ") ";
-      if (node->attrs.defined()) {
-        p->stream << "attrs=" << node->attrs;
-      }
-      p->stream << " {\n";
-      p->indent += 2;
-      p->Print(node->body);
-      p->indent -= 2;
-      p->stream << "}\n";
-    });
 
 TVM_REGISTER_GLOBAL("tir.PrimFunc")
     .set_body_typed([](Array<tir::Var> params, Stmt body, Type ret_type,

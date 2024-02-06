@@ -1,24 +1,30 @@
 /***************************************************************************************************
- * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
@@ -69,6 +75,7 @@ public:
   struct Conv2dProblem {
 
     int64_t n, h, w, c, p, q, k, r, s;
+    int64_t groups;
     int64_t pad_h, pad_w;
     int64_t stride_h, stride_w;
     int64_t dilation_h, dilation_w;
@@ -108,7 +115,7 @@ public:
     cutlass::gemm::GemmCoord eq_gemm_size(library::ConvKind const &conv_kind) const {
 
       switch (conv_kind) {
-        case library::ConvKind::kFprop: return cutlass::gemm::GemmCoord(int(n * p * q), int(k), int(r * s * c));
+        case library::ConvKind::kFprop: return cutlass::gemm::GemmCoord(int(n * p * q), int(k), int(r * s * c / groups));
         case library::ConvKind::kDgrad: return cutlass::gemm::GemmCoord(int(n * h * w), int(c), int(k * r * s));
         case library::ConvKind::kWgrad: return cutlass::gemm::GemmCoord(int(k), int(r * s * c), int(n * p * q));
         default : throw std::runtime_error("Invalid Conv Operator (fprop, dgrad, wgrad)");
@@ -130,7 +137,7 @@ public:
     std::vector<int> extent_b(library::ConvKind const &conv_kind) const {
 
       switch (conv_kind) {
-        case library::ConvKind::kFprop: return {int(k), int(r), int(s), int(c)};
+        case library::ConvKind::kFprop: return {int(k), int(r), int(s), int(c / groups)};
         case library::ConvKind::kDgrad: return {int(k), int(r), int(s), int(c)};
         case library::ConvKind::kWgrad: return {int(n), int(h), int(w), int(c)};
         default : throw std::runtime_error("Invalid Conv Operator (fprop, dgrad, wgrad)");
@@ -222,6 +229,7 @@ public:
     /// Conv device allocations
     DeviceAllocation *A;
     DeviceAllocation *B;
+    DeviceAllocation *reordered_B;
     DeviceAllocation *C;
     DeviceAllocation *Computed;
     DeviceAllocation *Reference;
@@ -264,6 +272,7 @@ public:
     Conv2dWorkspace()
         : A(nullptr),
           B(nullptr),
+          reordered_B(nullptr),
           C(nullptr),
           Computed(nullptr),
           Reference(nullptr) {}
@@ -311,10 +320,10 @@ public:
         stride_activations.push_back(int(problem.h) * int(problem.w) *
                                      int(problem.c));
 
-        stride_filters.push_back(int(problem.c));
-        stride_filters.push_back(int(problem.s) * int(problem.c));
+        stride_filters.push_back(int(problem.c / problem.groups));
+        stride_filters.push_back(int(problem.s) * int(problem.c / problem.groups));
         stride_filters.push_back(int(problem.r) * int(problem.s) *
-                                 int(problem.c));
+                                 int(problem.c / problem.groups));
 
         stride_output.push_back(int(problem.k));
         stride_output.push_back(int(problem.q) * int(problem.k));

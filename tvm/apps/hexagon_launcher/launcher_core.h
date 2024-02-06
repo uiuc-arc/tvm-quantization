@@ -83,18 +83,19 @@ struct OutputConfig {
 struct Model {
   Model(tvm::runtime::Module executor, tvm::runtime::Module module, std::string json);
 
-  tvm::runtime::Module graph_executor;
+  tvm::runtime::Module model_executor;
   tvm::runtime::Module graph_module;
   std::string graph_json;
 
   static tvm::Device device() { return tvm::Device{static_cast<DLDeviceType>(kDLHexagon), 0}; }
-
   static tvm::Device external() { return tvm::Device{static_cast<DLDeviceType>(kDLCPU), 0}; }
 
   tvm::runtime::PackedFunc run;
 };
 
 struct ExecutionSession {
+  explicit ExecutionSession(bool lwp_json = false) : gen_lwp_json(lwp_json) {}
+
   template <typename T>
   T* alloc(size_t bytes, size_t align = 1) {
     return reinterpret_cast<T*>(alloc_mem(bytes, align));
@@ -112,6 +113,7 @@ struct ExecutionSession {
   virtual bool get_num_outputs(int* num_outputs) = 0;
   virtual bool get_output(int output_idx, tensor_meta* output_meta, int meta_size,
                           void* output_data, int data_size) = 0;
+  bool gen_lwp_json = false;
 };
 
 bool read_model_config(const std::string& file_name, ModelConfig* model_config);
@@ -125,6 +127,7 @@ const tvm::runtime::PackedFunc get_runtime_func(const std::string& name);
 const tvm::runtime::PackedFunc get_module_func(tvm::runtime::Module module,
                                                const std::string& name);
 
+tvm::runtime::Module create_aot_executor(tvm::runtime::Module factory_module, tvm::Device device);
 tvm::runtime::Module create_graph_executor(const std::string& graph_json,
                                            tvm::runtime::Module graph_module, tvm::Device device);
 

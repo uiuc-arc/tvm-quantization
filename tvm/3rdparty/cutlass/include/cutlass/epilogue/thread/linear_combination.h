@@ -1,24 +1,30 @@
 /***************************************************************************************************
- * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
@@ -34,6 +40,7 @@
 #include "cutlass/functional.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/epilogue/thread/scale_type.h"
+#include "cutlass/epilogue/thread/linear_combination_params.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -55,7 +62,8 @@ template <
   typename ElementAccumulator_ = ElementOutput_,       ///< Accumulator data type
   typename ElementCompute_ = ElementOutput_,           ///< Data type used to compute linear combination
   ScaleType::Kind Scale = ScaleType::Default,          ///< Control Alpha and Beta scaling
-  FloatRoundStyle Round = FloatRoundStyle::round_to_nearest
+  FloatRoundStyle Round = FloatRoundStyle::round_to_nearest,
+  typename ElementSource_ = ElementOutput_
 >
 class LinearCombination {
 public:
@@ -63,62 +71,77 @@ public:
   using ElementOutput = ElementOutput_;
   using ElementAccumulator = ElementAccumulator_;
   using ElementCompute = ElementCompute_;
+  using ElementC = ElementSource_;
+  using ElementD = ElementOutput_;
 
   static int const kCount = Count;
-
+  static const ScaleType::Kind kScale = Scale;
   using FragmentOutput = Array<ElementOutput, kCount>;
   using FragmentAccumulator = Array<ElementAccumulator, kCount>;
   using ComputeFragment = Array<ElementCompute, kCount>;
 
+  using ParamsBase = LinearCombinationParams;
   static FloatRoundStyle const kRound = Round;
 
   /// Host-constructable parameters structure
-  struct Params {
-
+  struct Params : ParamsBase{
     ElementCompute alpha;                  ///< scales accumulators
     ElementCompute beta;                   ///< scales source tensor
     ElementCompute const *alpha_ptr;       ///< pointer to accumulator scalar - if not null, loads it from memory
     ElementCompute const *beta_ptr;        ///< pointer to source scalar - if not null, loads it from memory
 
-    //
-    // Methods
-    //
-
     CUTLASS_HOST_DEVICE
-    Params(): 
-      alpha(ElementCompute(1)), 
-      beta(ElementCompute(0)), 
-      alpha_ptr(nullptr), 
+    Params():
+      ParamsBase(
+        ElementCompute(1),
+        ElementCompute(0)
+      ),
+      alpha(ElementCompute(1)),
+      beta(ElementCompute(0)),
+      alpha_ptr(nullptr),
       beta_ptr(nullptr) { }
 
     CUTLASS_HOST_DEVICE
     Params(
       ElementCompute alpha,
       ElementCompute beta
-    ): alpha(alpha), beta(beta), alpha_ptr(nullptr), beta_ptr(nullptr) {
-
-    }
+    ):
+      ParamsBase(alpha, beta),
+      alpha(alpha), beta(beta), alpha_ptr(nullptr), beta_ptr(nullptr) { }
 
     CUTLASS_HOST_DEVICE
     Params(
       ElementCompute alpha
-    ): alpha(alpha), beta(0), alpha_ptr(nullptr), beta_ptr(nullptr) {
-
-    }
+    ):
+      ParamsBase(alpha, ElementCompute(0)),
+      alpha(alpha), beta(0), alpha_ptr(nullptr), beta_ptr(nullptr) { }
 
     CUTLASS_HOST_DEVICE
     Params(
       ElementCompute const *alpha_ptr,
       ElementCompute const *beta_ptr
-    ): alpha(0), beta(0), alpha_ptr(alpha_ptr), beta_ptr(beta_ptr) {
-
-    }
+    ):
+      ParamsBase(*alpha_ptr, *beta_ptr),
+      alpha(0), beta(0), alpha_ptr(alpha_ptr), beta_ptr(beta_ptr) { }
 
     CUTLASS_HOST_DEVICE
     Params(
       ElementCompute const *alpha_ptr
-    ): alpha(0), beta(0), alpha_ptr(alpha_ptr), beta_ptr(nullptr) {
+    ):
+      ParamsBase(*alpha_ptr, ElementCompute(0)),
+      alpha(0), beta(0), alpha_ptr(alpha_ptr), beta_ptr(nullptr) { }
 
+    CUTLASS_HOST_DEVICE
+    Params(
+      ParamsBase const& base
+    ): ParamsBase(base), alpha_ptr(nullptr), beta_ptr(nullptr) {
+      #if defined(__CUDA_ARCH__)
+      alpha = reinterpret_cast<ElementCompute const&>(base.alpha_data);
+      beta = reinterpret_cast<ElementCompute const&>(base.beta_data);
+      #else
+      memcpy( alpha, base.alpha_data, sizeof(ElementCompute) );
+      memcpy( beta, base.alpha_data, sizeof(ElementCompute) );
+      #endif
     }
   };
 
@@ -136,7 +159,6 @@ public:
   /// Constructs the function object, possibly loading from pointers in host memory
   CUTLASS_HOST_DEVICE
   LinearCombination(Params const &params) {
-
     alpha_ = (params.alpha_ptr ? *params.alpha_ptr : params.alpha);
     beta_ = (params.beta_ptr ? *params.beta_ptr : params.beta);
   }
@@ -164,7 +186,7 @@ public:
   /// Computes linear scaling: D = alpha * accumulator + beta * source
   CUTLASS_HOST_DEVICE
   FragmentOutput operator()(
-    FragmentAccumulator const &accumulator, 
+    FragmentAccumulator const &accumulator,
     FragmentOutput const &source) const {
 
     // Convert source to interal compute numeric type
@@ -179,7 +201,6 @@ public:
 
     if (Scale == ScaleType::Nothing)
       return destination_converter(converted_accumulator);
-
 
     // Perform binary operations
     ComputeFragment intermediate;
@@ -217,8 +238,61 @@ public:
     ComputeFragment intermediate;
     multiplies<ComputeFragment> mul_accumulator;
 
-    intermediate = mul_accumulator(alpha_, converted_accumulator);    // D = alpha * Accum 
+    intermediate = mul_accumulator(alpha_, converted_accumulator);    // D = alpha * Accum
 
+    return destination_converter(intermediate);
+  }
+
+  //
+  // Specializations for scalar (for use with cute::collective::DefaultEpilogue)
+  //
+  CUTLASS_HOST_DEVICE
+  ElementD operator()(ElementAccumulator const accumulator, ElementC const source) const {
+    // Convert everything to Compute type, do compute, and then store to output type
+    NumericConverter<ElementCompute, ElementAccumulator, Round> accumulator_converter;
+    [[maybe_unused]] NumericConverter<ElementCompute, ElementC, Round> source_converter;
+    NumericConverter<ElementD, ElementCompute, Round> destination_converter;
+
+    // Convert to destination numeric type
+
+    ElementCompute converted_accumulator = accumulator_converter(accumulator);
+    if constexpr (Scale == ScaleType::Nothing) {
+      return destination_converter(converted_accumulator);
+    }
+
+    // Perform binary operations
+    ElementCompute intermediate;
+    multiplies<ElementCompute> multiply;
+    multiply_add<ElementCompute> madd;
+
+    if constexpr (Scale == ScaleType::NoBetaScaling) {
+      intermediate = source_converter(source);
+    }
+    else {
+      intermediate = multiply(beta_, source);                            // X =  beta * C + uniform
+    }
+
+    intermediate = madd(alpha_, converted_accumulator, intermediate);    // D = alpha * Accum + X
+    return destination_converter(intermediate);
+  }
+
+  CUTLASS_HOST_DEVICE
+  ElementD operator()(ElementAccumulator const accumulator) const {
+    // Convert everything to Compute type, do compute, and then store to output type
+    NumericConverter<ElementCompute, ElementAccumulator, Round> accumulator_converter;
+    NumericConverter<ElementD, ElementCompute, Round> destination_converter;
+    ElementCompute converted_accumulator = accumulator_converter(accumulator);
+
+    // Convert to destination numeric type
+    if constexpr (Scale == ScaleType::Nothing) {
+      return destination_converter(converted_accumulator);
+    }
+
+    // Perform binary operations
+    ElementCompute intermediate;
+    multiplies<ElementCompute> multiply;
+
+    intermediate = multiply(alpha_, accumulator);    // D = alpha * Accum
     return destination_converter(intermediate);
   }
 };

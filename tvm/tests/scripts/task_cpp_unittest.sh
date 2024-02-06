@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,46 +16,28 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
-set -u
+set -euxo pipefail
 
-# Python is required by apps/bundle_deploy
-source tests/scripts/setup-pytest-env.sh
+if [ $# -gt 0 ]; then
+    BUILD_DIR="$1"
+elif [ -n "${TVM_BUILD_PATH:-}" ]; then
+    # TVM_BUILD_PATH may contain multiple space-separated paths.  If
+    # so, use the first one.
+    BUILD_DIR=$(IFS=" "; set -- $TVM_BUILD_PATH; echo $1)
+else
+    BUILD_DIR=build
+fi
 
-export LD_LIBRARY_PATH="lib:${LD_LIBRARY_PATH:-}"
+
 # NOTE: important to use abspath, when VTA is enabled.
-export VTA_HW_PATH=`pwd`/3rdparty/vta-hw
+VTA_HW_PATH=$(pwd)/3rdparty/vta-hw
+export VTA_HW_PATH
 
 # to avoid CI thread throttling.
 export TVM_BIND_THREADS=0
 export OMP_NUM_THREADS=1
 
-# Build cpptest suite
-make cpptest -j2
-
-# "make crttest" requires USE_MICRO to be enabled, which is not always the case.
-if grep crttest build/Makefile > /dev/null; then
-    make crttest  # NOTE: don't parallelize, due to issue with build deps.
-fi
-
-cd build && ctest --gtest_death_test_style=threadsafe && cd ..
-
-# Test MISRA-C runtime
-cd apps/bundle_deploy
-rm -rf build
-make test_dynamic test_static
-cd ../..
-
-# Test Arm(R) Cortex(R)-M55 CPU and Ethos(TM)-U55 NPU demo app
-FVP_PATH="/opt/arm/FVP_Corstone_SSE-300"
-
-# TODO(@grant-arm): Remove once ci_cpu docker image has been updated to FVP_Corstone_SSE
-if test ! -d $FVP_PATH; then
-    FVP_PATH="/opt/arm/FVP_Corstone_SSE-300_Ethos-U55"
-fi
-
-if test -d $FVP_PATH && pip3 list | grep vela; then
-    cd apps/microtvm/ethosu
-    ./run_demo.sh --fvp_path $FVP_PATH --cmake_path /opt/arm/cmake/bin/cmake
-    cd ../../..
-fi
+pushd "${BUILD_DIR}"
+# run cpp test executable
+./cpptest
+popd

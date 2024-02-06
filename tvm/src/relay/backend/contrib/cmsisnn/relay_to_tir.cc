@@ -1,4 +1,3 @@
-
 /*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -31,11 +30,45 @@
 #include "../../../transforms/pattern_utils.h"
 #include "buffer_size.h"
 #include "compiler_attrs.h"
+#include "compute_luts.h"
+#include "convolutions.h"
 
 namespace tvm {
 namespace relay {
 namespace contrib {
 namespace cmsisnn {
+
+/*!
+ * \brief This is a helper class to generate tir.Buffers and BufferMap
+ *
+ * The PrimFuncs generated needs Buffers produced to attach information
+ * about the inputs and output tir::Vars. This is helper class to generate
+ * them in the relay to TIR lowering
+ */
+class BufferCreator {
+ public:
+  /*! \brief Creates a tir::Var and tir::Buffer then returns the buffer var to be used by the body
+   */
+  tir::Var CreateBufferVar(String name_hint, DataType dtype) {
+    tir::Var var = tir::Var(name_hint, dtype);
+    tir::Buffer buffer = tir::decl_buffer({}, DataType::Int(dtype.bits()), name_hint + "_");
+    _primfunc_params_.push_back(var);
+    _buffer_map_.Set(var, buffer);
+    _buffer_vars_.Set(name_hint, buffer->data);
+    return buffer->data;
+  }
+  /*! \brief Access already created buffer_var by associated tir::Var name */
+  tir::Var GetBufferVar(String name_hint) { return _buffer_vars_[name_hint]; }
+  /*! \brief Get the BufferMap that maps tir::Var to tir::Buffer */
+  Map<tir::Var, tir::Buffer> GetBufferMap() { return _buffer_map_; }
+  /*! \brief Get the PrimFunc params that is a collection of tir::Vars created in the process */
+  Array<tir::Var> GetPrimFuncParams() { return _primfunc_params_; }
+
+ private:
+  Map<String, tir::Var> _buffer_vars_;
+  Map<tir::Var, tir::Buffer> _buffer_map_;
+  Array<tir::Var> _primfunc_params_;
+};
 
 class RelayToTIRVisitor : public MixedModeMutator {
  public:
@@ -57,32 +90,63 @@ class RelayToTIRVisitor : public MixedModeMutator {
  private:
   inline IntImm ToArg(int32_t value) { return IntImm(DataType::Int(32), value); }
 
-  void CreatePrimFuncForExtern(const GlobalVar& global_var, Array<tir::Var> func_signature,
-                               tvm::Array<PrimExpr> call_extern_args,
-                               std::string context_buffer_name = "NULL",
-                               int context_buffer_size = 0) {
+  //  struct used to allocated const NDArray
+  struct tir_input_constant_buffers {
+    tir::Var buffer_var;
+    tvm::runtime::NDArray ndarray;
+  };
+
+  void CreatePrimFuncForExtern(
+      const GlobalVar& global_var, Array<tir::Var> func_signature,
+      const Map<tir::Var, tir::Buffer>& buffer_map, tvm::Array<PrimExpr> call_extern_args,
+      PrimExpr context_buffer_var = PrimExpr(), int context_buffer_size = 0, int num_bits = 8,
+      std::vector<tir_input_constant_buffers> context_const_buffer_vars = {}) {
     Map<String, ObjectRef> dict_attrs;
     dict_attrs.Set(tvm::attr::kGlobalSymbol, global_var->name_hint);
     dict_attrs.Set(tvm::attr::kTarget, target_);
     dict_attrs.Set("tir.noalias", Bool(true));
 
     tir::Stmt body = tir::Evaluate(
-        tvm::tir::Call(DataType::Int(8), tir::builtin::call_extern(), call_extern_args));
+        tvm::tir::Call(DataType::Int(num_bits), tir::builtin::call_extern(), call_extern_args));
 
     if (context_buffer_size) {
-      tir::Var buffer_var(context_buffer_name,
-                          PointerType(PrimType(DataType::Int(8)), "global.workspace"));
-      body = tir::Allocate(buffer_var, DataType::Int(8), {context_buffer_size}, tir::const_true(),
-                           body);
-      body =
-          tir::AttrStmt(PrimExpr(), tvm::tir::attr::device_type, target_->kind->device_type, body);
-      body = tir::AttrStmt(PrimExpr(), tvm::tir::attr::device_id, 0, body);
+      body = tir::Allocate(Downcast<tir::Var>(context_buffer_var), DataType::Int(num_bits),
+                           {context_buffer_size}, tir::const_true(), body);
     }
 
-    tir::PrimFunc replacement_func(func_signature, body, VoidType(), Map<tir::Var, tir::Buffer>(),
+    for (int i = 0; i < static_cast<int>(context_const_buffer_vars.size()); i++) {
+      int bits = context_const_buffer_vars[i].ndarray.DataType().bits();
+
+      Array<PrimExpr> extents;
+      for (int shape : context_const_buffer_vars[i].ndarray.Shape()) {
+        extents.push_back(PrimExpr(shape));
+      }
+
+      body = tir::AllocateConst(Downcast<tir::Var>(context_const_buffer_vars[i].buffer_var),
+                                DataType::Int(bits), extents, context_const_buffer_vars[i].ndarray,
+                                body);
+    }
+
+    tir::PrimFunc replacement_func(func_signature, body, VoidType(), buffer_map,
                                    DictAttrs(dict_attrs));
+
     ir_module_->Add(global_var, replacement_func);
   }
+
+  auto GetIntMinMax(int bit_width) {
+    const int32_t min =
+        (bit_width == 8) ? std::numeric_limits<int8_t>::min() : std::numeric_limits<int16_t>::min();
+    const int32_t max =
+        (bit_width == 8) ? std::numeric_limits<int8_t>::max() : std::numeric_limits<int16_t>::max();
+    return std::pair(min, max);
+  }
+
+  auto GetClipMinMax(const ClipAttrs* clip_attrs) {
+    return std::pair(static_cast<int32_t>(clip_attrs->a_min),
+                     static_cast<int32_t>(clip_attrs->a_max));
+  }
+
+  auto GetClipMinMax(const Call& clip_op) { return GetClipMinMax(clip_op->attrs.as<ClipAttrs>()); }
 
   void EmitConv2D(const GlobalVar& global_var, const Expr& expr) {
     const CallNode* clip_call = nullptr;
@@ -105,6 +169,22 @@ class RelayToTIRVisitor : public MixedModeMutator {
     } else {
       conv2d_call = requantize_input;
     }
+    int32_t dtype_bits = conv2d_call->args[0]->type_as<TensorTypeNode>()->dtype.bits();
+
+    // Determine bitwidth of buffers based on input dtype
+    int32_t input_bits = 8;
+    int32_t filter_bits = 8;
+    int32_t bias_bits = 32;
+    int32_t output_bits = 8;
+    int32_t context_buffer_bits = 8;
+    bool is_int16 = false;
+    if (dtype_bits == 16) {
+      is_int16 = true;
+      input_bits = 16;
+      bias_bits = 64;
+      output_bits = 16;
+      context_buffer_bits = 16;
+    }
 
     // TIR variables are created in the order they appear in the Relay partitioned function
     // %1 = qnn.conv2d(%input, %weight_const_0, input_zero_point_scalar,
@@ -113,14 +193,23 @@ class RelayToTIRVisitor : public MixedModeMutator {
     // %3 = qnn.requantize(%2, %input_scale_const_4, %cmsisnn_shift_const_5,
     //                     %output_scale_scalar, %output_zero_point_scalar)
     // clip(%3, a_min=%min_scalar, a_max=%max_scalar)
-    tir::Var input("input", DataType::Handle(8));
-    tir::Var filter("filter", DataType::Handle(8));
-    tir::Var multiplier("multiplier", DataType::Handle(32));
-    tir::Var filter_scale("filter_scale", DataType::Handle(32));
-    tir::Var bias("bias", DataType::Handle(32));
-    tir::Var input_scale("input_scale", DataType::Handle(32));
-    tir::Var shift("shift", DataType::Handle(32));
-    tir::Var output("output", DataType::Handle(8));
+    // Position of scales in the global function for Conv2D
+    const int filter_scale_pos = 3;
+    const int input_scale_pos = bias_add_call ? 5 : 4;
+    BufferCreator buffer_creator;
+    tir::Var input = buffer_creator.CreateBufferVar("input", DataType::Handle(input_bits));
+    tir::Var filter = buffer_creator.CreateBufferVar("filter", DataType::Handle(filter_bits));
+    tir::Var multiplier = buffer_creator.CreateBufferVar("multiplier", DataType::Handle(32));
+    if (bias_add_call) {
+      buffer_creator.CreateBufferVar("bias", DataType::Handle(bias_bits));
+    }
+    tir::Var shift = buffer_creator.CreateBufferVar("shift", DataType::Handle(32));
+    tir::Var output = buffer_creator.CreateBufferVar("output", DataType::Handle(output_bits));
+
+    // Relay function contains input_scale and filter_scale as function parameters at the following
+    // locations in the global partitioned function for Conv2D
+    skip_call_args_.insert(filter_scale_pos);
+    skip_call_args_.insert(input_scale_pos);
 
     // Individual arguments to the structs arguments of the CMSIS-NN API are filled into call_extern
     // https://github.com/ARM-software/CMSIS_5/blob/def6f800f95661eb3451d317f7d0dde504f6020d/CMSIS/NN/Source/ConvolutionFunctions/arm_convolve_wrapper_s8.c#L50
@@ -136,17 +225,9 @@ class RelayToTIRVisitor : public MixedModeMutator {
     int32_t dilation_w = qnn::get_const_int(conv2d_attrs->dilation[1]);
     int32_t dilation_h = qnn::get_const_int(conv2d_attrs->dilation[0]);
     int32_t out_channels = qnn::get_const_int(conv2d_attrs->channels);
-    int32_t groups = conv2d_attrs->groups;
     std::string kernel_layout = conv2d_attrs->kernel_layout.c_str();
-    int32_t clip_min, clip_max;
-    if (clip_call) {
-      const ClipAttrs* clip_attrs = clip_call->attrs.as<ClipAttrs>();
-      clip_min = clip_attrs->a_min;
-      clip_max = clip_attrs->a_max;
-    } else {
-      clip_min = -128;
-      clip_max = 127;
-    }
+    const auto [clip_min, clip_max] =
+        clip_call ? GetClipMinMax(GetRef<Call>(clip_call)) : GetIntMinMax(dtype_bits);
 
     tvm::Array<PrimExpr> scalar_args = {ToArg(input_offset), ToArg(output_offset), ToArg(stride_w),
                                         ToArg(stride_h),     ToArg(padding_w),     ToArg(padding_h),
@@ -172,19 +253,21 @@ class RelayToTIRVisitor : public MixedModeMutator {
     int32_t output_c = qnn::get_const_int(output_shape[3]);
 
     int32_t depth_multiplier = -1;
-    int kernel_pos_o = kernel_layout.find("O");
-    if (groups == qnn::get_const_int(input_shape[3]) &&
-        groups == qnn::get_const_int(filter_shape[kernel_pos_o])) {
+    if (IsCMSISNNDepthwise(conv2d_attrs, input_shape, filter_shape)) {
+      // Refer to TVM frontend to know how depth multiplier and out_channels are related
+      // https://github.com/apache/tvm/blob/6ed3ab3e33f8eafa4acaf53b7a671831de7587e9/python/tvm/relay/frontend/tflite.py#L2129
       int kernel_pos_i = kernel_layout.find("I");
-      depth_multiplier = qnn::get_const_int(filter_shape[kernel_pos_i]);
+      int kernel_pos_o = kernel_layout.find("O");
+      int kernel_pos_dm = input_c == 1 ? kernel_pos_o : kernel_pos_i;
+      depth_multiplier = qnn::get_const_int(filter_shape[kernel_pos_dm]);
     }
     scalar_args.push_back(ToArg(depth_multiplier));
 
     // original filter_layout for depthwise is HWOI
-    std::string cmsisnn_api = "arm_convolve_wrapper_s8";
+    std::string cmsisnn_api = is_int16 ? "arm_convolve_wrapper_s16" : "arm_convolve_wrapper_s8";
     bool is_depthwise = depth_multiplier != -1;
     if (is_depthwise) {
-      cmsisnn_api = "arm_depthwise_conv_wrapper_s8";
+      cmsisnn_api = is_int16 ? "arm_depthwise_conv_wrapper_s16" : "arm_depthwise_conv_wrapper_s8";
       int filter_pos_h = kernel_layout.find("H");
       int filter_pos_w = kernel_layout.find("W");
       Array<PrimExpr> depthwise_filter_shape{1, filter_shape[filter_pos_h],
@@ -196,28 +279,32 @@ class RelayToTIRVisitor : public MixedModeMutator {
 
     tvm::Array<PrimExpr> call_ext_args = {tir::StringImm(cmsisnn_api), input, filter, multiplier};
     if (bias_add_call) {
+      tir::Var bias = buffer_creator.GetBufferVar("bias");
       call_ext_args.push_back(bias);
     }
     call_ext_args.push_back(shift);
     call_ext_args.push_back(output);
 
-    std::string context_buffer_name = "NULL";
-    CMSISNNFlags flags = GetCompilerFlags(transform::PassContext::Current());
+    PrimExpr context_buffer_var = tir::StringImm("NULL");
+    Target target = CreateTarget(transform::PassContext::Current());
     size_t context_buffer_size;
     if (is_depthwise) {
       context_buffer_size =
-          DepthwiseConv2dBufferSize(flags, input_n, input_c, output_c, filter_w, filter_h);
+          DepthwiseConv2dBufferSize(is_int16, target, input_n, input_c, output_c, filter_w,
+                                    filter_h, dilation_w, dilation_h, depth_multiplier);
     } else {
-      context_buffer_size =
-          Conv2dBufferSize(flags, padding_w, padding_h, input_n, input_h, input_c, output_h,
-                           output_w, stride_w, stride_h, filter_w, filter_h);
+      context_buffer_size = Conv2dBufferSize(is_int16, target, padding_w, padding_h, input_n,
+                                             input_h, input_c, output_h, output_w, stride_w,
+                                             stride_h, dilation_w, dilation_h, filter_w, filter_h);
     }
 
     if (context_buffer_size) {
-      context_buffer_name = "context_buffer_" + std::to_string(context_buffer_id_++);
+      String context_buffer_name = "context_buffer_" + std::to_string(context_buffer_id_++);
+      context_buffer_var =
+          tir::Var(context_buffer_name,
+                   PointerType(PrimType(DataType::Int(context_buffer_bits)), "global.workspace"));
     }
-    tvm::Array<PrimExpr> context_buffer_args = {tir::StringImm(context_buffer_name),
-                                                ToArg(context_buffer_size)};
+    tvm::Array<PrimExpr> context_buffer_args = {context_buffer_var, ToArg(context_buffer_size)};
 
     scalar_args = tvm::runtime::Concat(context_buffer_args, scalar_args);
     scalar_args = tvm::runtime::Concat(scalar_args, input_shape);
@@ -226,16 +313,9 @@ class RelayToTIRVisitor : public MixedModeMutator {
     scalar_args = tvm::runtime::Concat(scalar_args, output_shape);
     call_ext_args = tvm::runtime::Concat(call_ext_args, scalar_args);
 
-    Array<tir::Var> func_signature{input, filter, multiplier, filter_scale};
-    if (bias_add_call) {
-      func_signature.push_back(bias);
-    }
-    func_signature.push_back(input_scale);
-    func_signature.push_back(shift);
-    func_signature.push_back(output);
-
-    CreatePrimFuncForExtern(global_var, func_signature, call_ext_args, context_buffer_name,
-                            context_buffer_size);
+    CreatePrimFuncForExtern(global_var, buffer_creator.GetPrimFuncParams(),
+                            buffer_creator.GetBufferMap(), call_ext_args, context_buffer_var,
+                            context_buffer_size, context_buffer_bits);
   }
 
   void EmitFullyConnected(const GlobalVar& global_var, const Expr& expr) {
@@ -260,6 +340,14 @@ class RelayToTIRVisitor : public MixedModeMutator {
       fc_call = requantize_input;
     }
 
+    // Extract the size of the input parameter from the call arguments. Other params are based off
+    // the input size
+    int32_t dtype_bits = fc_call->args[0]->type_as<TensorTypeNode>()->dtype.bits();
+    int32_t input_bits = dtype_bits;
+    int32_t filter_bits = 8;
+    int32_t bias_bits = dtype_bits * 4U;
+    int32_t output_bits = dtype_bits;
+
     // TIR variables are created in the order they appear in the Relay partitioned function
     // %1 = qnn.dense(%input, %weight_const_0, input_zero_point_scalar, kernel_zero_point_scalar,
     //                 %input_scale_scalar, %kernel_scale_scalar)
@@ -267,10 +355,13 @@ class RelayToTIRVisitor : public MixedModeMutator {
     // %3 = qnn.requantize(%2, %req_input_scale_scalar, %req_input_zero_point_scalar,
     //                     %output_scale_scalar, %output_zero_point_scalar)
     // clip(%3, a_min=%min_scalar, a_max=%max_scalar)
-    tir::Var input("input", DataType::Handle(8));
-    tir::Var filter("filter", DataType::Handle(8));
-    tir::Var bias("bias", DataType::Handle(32));
-    tir::Var output("output", DataType::Handle(8));
+    BufferCreator buffer_creator;
+    tir::Var input = buffer_creator.CreateBufferVar("input", DataType::Handle(input_bits));
+    tir::Var filter = buffer_creator.CreateBufferVar("filter", DataType::Handle(filter_bits));
+    if (bias_add_call) {
+      buffer_creator.CreateBufferVar("bias", DataType::Handle(bias_bits));
+    }
+    tir::Var output = buffer_creator.CreateBufferVar("output", DataType::Handle(output_bits));
 
     // Individual arguments to the structs arguments of the CMSIS-NN API are filled into call_extern
     // https://github.com/ARM-software/CMSIS_5/blob/def6f800f95661eb3451d317f7d0dde504f6020d/CMSIS/NN/Source/ConvolutionFunctions/arm_convolve_wrapper_s8.c#L50
@@ -283,15 +374,8 @@ class RelayToTIRVisitor : public MixedModeMutator {
     float input_scale = GetScalarFromConstant<float>(requantize_call->args[1]);
     float output_scale = GetScalarFromConstant<float>(requantize_call->args[3]);
     int32_t out_channels = qnn::get_const_int(dense_attrs->units);
-    int32_t clip_min, clip_max;
-    if (clip_call) {
-      const ClipAttrs* clip_attrs = clip_call->attrs.as<ClipAttrs>();
-      clip_min = clip_attrs->a_min;
-      clip_max = clip_attrs->a_max;
-    } else {
-      clip_min = -128;
-      clip_max = 127;
-    }
+    const auto [clip_min, clip_max] =
+        clip_call ? GetClipMinMax(GetRef<Call>(clip_call)) : GetIntMinMax(dtype_bits);
 
     double quantized_multiplier =
         static_cast<double>(input_scale) / static_cast<double>(output_scale);
@@ -314,16 +398,18 @@ class RelayToTIRVisitor : public MixedModeMutator {
 
     Array<PrimExpr> cmsisnn_output_shape{batch_size, 1, 1, out_channels};
 
-    tvm::Array<PrimExpr> call_ext_args = {tir::StringImm("arm_fully_connected_s8"), input, filter};
+    std::string cmsisnn_api =
+        dtype_bits == 16 ? "arm_fully_connected_s16" : "arm_fully_connected_s8";
+
+    tvm::Array<PrimExpr> call_ext_args = {tir::StringImm(cmsisnn_api), input, filter};
     if (bias_add_call) {
-      call_ext_args.push_back(bias);
+      call_ext_args.push_back(buffer_creator.GetBufferVar("bias"));
     }
     call_ext_args.push_back(output);
 
     int context_buffer_size = 0;
-    std::string context_buffer_name = "NULL";
-    tvm::Array<PrimExpr> context_buffer_args = {tir::StringImm(context_buffer_name),
-                                                ToArg(context_buffer_size)};
+    PrimExpr context_buffer_var = tir::StringImm("NULL");
+    tvm::Array<PrimExpr> context_buffer_args = {context_buffer_var, ToArg(context_buffer_size)};
 
     scalar_args = tvm::runtime::Concat(context_buffer_args, scalar_args);
     scalar_args = tvm::runtime::Concat(scalar_args, cmsisnn_input_shape);
@@ -332,40 +418,42 @@ class RelayToTIRVisitor : public MixedModeMutator {
     scalar_args = tvm::runtime::Concat(scalar_args, cmsisnn_output_shape);
     call_ext_args = tvm::runtime::Concat(call_ext_args, scalar_args);
 
-    Array<tir::Var> func_signature{input, filter};
-    if (bias_add_call) {
-      func_signature.push_back(bias);
-    }
-    func_signature.push_back(output);
-    CreatePrimFuncForExtern(global_var, func_signature, call_ext_args, context_buffer_name,
+    CreatePrimFuncForExtern(global_var, buffer_creator.GetPrimFuncParams(),
+                            buffer_creator.GetBufferMap(), call_ext_args, context_buffer_var,
                             context_buffer_size);
   }
 
   void EmitPool2D(const GlobalVar& global_var, const Expr& expr, const String pool_name) {
     Call clip, pool;
-    Call final_call = GetRef<Call>(expr.as<CallNode>());
-    Op final_op = GetRef<Op>(final_call->op.as<OpNode>());
+    Call final_call = Downcast<Call>(expr);
+    Op final_op = Downcast<Op>(final_call->op);
     if (final_op->name == "clip") {
       clip = final_call;
-      Call clip_input = GetRef<Call>(clip->args[0].as<CallNode>());
-      Op clip_input_op = GetRef<Op>(clip_input->op.as<OpNode>());
+      Call clip_input = Downcast<Call>(clip->args[0]);
+      Op clip_input_op = Downcast<Op>(clip_input->op);
       if (clip_input_op->name == "cast") {
-        pool = GetRef<Call>(clip_input->args[0].as<CallNode>());
+        pool = Downcast<Call>(clip_input->args[0]);
       } else {  // max_pool2d
         pool = clip_input;
       }
     } else if (final_op->name == "cast") {
-      pool = GetRef<Call>(final_call->args[0].as<CallNode>());
+      pool = Downcast<Call>(final_call->args[0]);
     } else {  // max_pool2d
       pool = final_call;
     }
 
+    int32_t dtype_bits = final_call->type_as<TensorTypeNode>()->dtype.bits();
+
     // prepare cmsis_nn_pool_params
     int32_t stride_h, stride_w, padding_h, padding_w, pool_size_h, pool_size_w;
-    int32_t clip_min, clip_max;
     std::string cmsisnn_api;
     if (pool_name == "cmsis-nn.qnn_avg_pool2d") {
-      cmsisnn_api = "arm_avgpool_s8";
+      if (dtype_bits == 8) {
+        cmsisnn_api = "arm_avgpool_s8";
+      } else {
+        cmsisnn_api = "arm_avgpool_s16";
+      }
+
       const AvgPool2DAttrs* attrs = pool->attrs.as<AvgPool2DAttrs>();
       stride_h = qnn::get_const_int(attrs->strides[0]);
       stride_w = qnn::get_const_int(attrs->strides[1]);
@@ -374,7 +462,12 @@ class RelayToTIRVisitor : public MixedModeMutator {
       pool_size_h = qnn::get_const_int(attrs->pool_size[0]);
       pool_size_w = qnn::get_const_int(attrs->pool_size[1]);
     } else {
-      cmsisnn_api = "arm_max_pool_s8";
+      if (dtype_bits == 8) {
+        cmsisnn_api = "arm_max_pool_s8";
+      } else {
+        cmsisnn_api = "arm_max_pool_s16";
+      }
+
       const MaxPool2DAttrs* attrs = pool->attrs.as<MaxPool2DAttrs>();
       stride_h = qnn::get_const_int(attrs->strides[0]);
       stride_w = qnn::get_const_int(attrs->strides[1]);
@@ -383,14 +476,9 @@ class RelayToTIRVisitor : public MixedModeMutator {
       pool_size_h = qnn::get_const_int(attrs->pool_size[0]);
       pool_size_w = qnn::get_const_int(attrs->pool_size[1]);
     }
-    if (clip.defined()) {
-      const ClipAttrs* clip_attrs = clip->attrs.as<ClipAttrs>();
-      clip_min = clip_attrs->a_min;
-      clip_max = clip_attrs->a_max;
-    } else {
-      clip_min = -128;
-      clip_max = 127;
-    }
+
+    const auto [clip_min, clip_max] =
+        clip.defined() ? GetClipMinMax(clip) : GetIntMinMax(dtype_bits);
 
     tvm::Array<PrimExpr> scalar_args = {ToArg(stride_h),  ToArg(stride_w), ToArg(padding_h),
                                         ToArg(padding_w), ToArg(clip_min), ToArg(clip_max)};
@@ -403,20 +491,24 @@ class RelayToTIRVisitor : public MixedModeMutator {
     Array<PrimExpr> output_shape = pool->type_as<TensorTypeNode>()->shape;
     Array<PrimExpr> cmsisnn_output_shape{1, output_shape[1], output_shape[2], output_shape[3]};
 
-    tir::Var input("input", DataType::Handle(8));
-    tir::Var output("output", DataType::Handle(8));
+    BufferCreator buffer_creator;
+    tir::Var input = buffer_creator.CreateBufferVar("input", DataType::Handle(dtype_bits));
+    tir::Var output = buffer_creator.CreateBufferVar("output", DataType::Handle(dtype_bits));
     tvm::Array<PrimExpr> call_ext_args = {tir::StringImm(cmsisnn_api), input, output};
 
     int context_buffer_size = 0;
-    std::string context_buffer_name = "NULL";
-    if (pool_name == "cmsisnn.qnn_avg_pool2d") {
-      CMSISNNFlags flags = GetCompilerFlags(transform::PassContext::Current());
+    PrimExpr context_buffer_var = tir::StringImm("NULL");
+    if (pool_name == "cmsis-nn.qnn_avg_pool2d") {
+      Target target = CreateTarget(transform::PassContext::Current());
       int32_t input_c = qnn::get_const_int(input_shape[3]);
-      context_buffer_size = AvgPoolBufferSize(flags, input_c);
-      context_buffer_name = "context_buffer_" + std::to_string(context_buffer_id_++);
+      context_buffer_size = AvgPoolBufferSize(target, input_c);
+      if (context_buffer_size) {
+        std::string context_buffer_name = "context_buffer_" + std::to_string(context_buffer_id_++);
+        context_buffer_var = tir::Var(context_buffer_name,
+                                      PointerType(PrimType(DataType::Int(8)), "global.workspace"));
+      }
     }
-    tvm::Array<PrimExpr> context_buffer_args = {tir::StringImm(context_buffer_name),
-                                                ToArg(context_buffer_size)};
+    tvm::Array<PrimExpr> context_buffer_args = {context_buffer_var, ToArg(context_buffer_size)};
 
     scalar_args = tvm::runtime::Concat(context_buffer_args, scalar_args);
     scalar_args = tvm::runtime::Concat(scalar_args, cmsisnn_input_shape);
@@ -424,9 +516,8 @@ class RelayToTIRVisitor : public MixedModeMutator {
     scalar_args = tvm::runtime::Concat(scalar_args, cmsisnn_output_shape);
     call_ext_args = tvm::runtime::Concat(call_ext_args, scalar_args);
 
-    Array<tir::Var> func_signature{input, output};
-
-    CreatePrimFuncForExtern(global_var, func_signature, call_ext_args, context_buffer_name,
+    CreatePrimFuncForExtern(global_var, buffer_creator.GetPrimFuncParams(),
+                            buffer_creator.GetBufferMap(), call_ext_args, context_buffer_var,
                             context_buffer_size);
   }
 
@@ -435,6 +526,7 @@ class RelayToTIRVisitor : public MixedModeMutator {
     const CallNode* softmax_call = quantize_call->args[0].as<CallNode>();
     const CallNode* dequant_call = softmax_call->args[0].as<CallNode>();
     const float quant_scale = GetScalarFromConstant<float>(dequant_call->args[1]);
+    const auto bit_width = quantize_call->type_as<TensorTypeNode>()->dtype.bits();
 
     // assuming layout as NHWC
     auto shape = quantize_call->type_as<TensorTypeNode>()->shape;
@@ -447,40 +539,134 @@ class RelayToTIRVisitor : public MixedModeMutator {
 
     // calculate multiplier and shift for CMSIS-NN softmax API
     // Note: TensorFlow Lite Micro assumptions
-    // Output zero point and scale are fixed to -128 and 1 / 256
+    // Output zero point and scale are fixed to -128 and 1 / 256 in the case of an int8 operator
+    // or to 0 and 1 / 32768 in the case of an int16 operator
     // kScaledDiffIntegerBits, kInputBits, kBeta are described on the following github page
     // https://github.com/tensorflow/tflite-micro/blob/d97cd0908d8cf5021e9d86f05a49888bee28c2a4/tensorflow/lite/micro/kernels/softmax_common.cc#L47
-    double beta_multiplier = (kBeta * quant_scale * (1 << (31 - kInputBits)));
-    beta_multiplier = std::min<double>(beta_multiplier, (1ll << 31) - 1.0);
-    auto mult_shift_pair = tvm::relay::qnn::GetFixedPointMultiplierShift(beta_multiplier);
-    int32_t mult = std::get<0>(mult_shift_pair);
-    int32_t shift = std::get<1>(mult_shift_pair);
-    int32_t diff_min = (1 << kScaledDiffIntegerBits) - 1;
-    diff_min <<= (31 - kScaledDiffIntegerBits);
-    diff_min >>= shift;
-    diff_min *= -1;
 
-    auto in_var = tir::Var("input", DataType::Handle(8));
-    auto out_var = tir::Var("output", DataType::Handle(8));
+    int32_t mult;
+    int32_t shift;
+    int32_t diff_min = 0;
 
-    Array<tir::Var> func_signature{in_var, out_var};
+    std::vector<tir_input_constant_buffers> softmax_params(2);
+    Device dev{DLDeviceType::kDLCPU, 0};
 
-    tvm::Array<PrimExpr> args = {
-        tir::StringImm("arm_softmax_s8"),
-        in_var,
-        ToArg(num_rows),
-        ToArg(row_size),
-        ToArg(mult),
-        ToArg(shift),
-        ToArg(diff_min),
-        out_var,
-    };
+    if (bit_width == 8) {
+      double beta_multiplier = (kBeta * quant_scale * (1 << (31 - kInputBits)));
+      beta_multiplier = std::min<double>(beta_multiplier, (1ll << 31) - 1.0);
+      auto mult_shift_pair = tvm::relay::qnn::GetFixedPointMultiplierShift(beta_multiplier);
+      mult = std::get<0>(mult_shift_pair);
+      shift = std::get<1>(mult_shift_pair);
+      diff_min = (1 << kScaledDiffIntegerBits) - 1;
+      diff_min <<= (31 - kScaledDiffIntegerBits);
+      diff_min >>= shift;
+      diff_min *= -1;
+    } else {  // bit_width == 16
+      double scale_beta_rescale = quant_scale * kBeta / (10.0 / 65535.0);
+      auto mult_shift_pair = tvm::relay::qnn::GetFixedPointMultiplierShift(scale_beta_rescale);
+      mult = std::get<0>(mult_shift_pair);
+      shift = std::get<1>(mult_shift_pair);
 
-    CreatePrimFuncForExtern(global_var, func_signature, args);
+      const int kLUTEntries = 513;
+      int16_t softmax_s16_exp_lut[kLUTEntries];
+      int16_t softmax_s16_one_by_one_lut[kLUTEntries];
+
+      const int range_int16 =
+          std::numeric_limits<int16_t>::max() - std::numeric_limits<int16_t>::min();
+      int exp_zero_point = std::numeric_limits<int16_t>::max();
+      float exp_scale = 10.0f / range_int16;
+
+      int one_by_one_zero_point = std::numeric_limits<int16_t>::min();
+      float one_by_one_scale = 1.0f / range_int16;
+
+      int lut_value_zero_point = 0;
+      float lut_value_scale = 2.0f / range_int16;
+
+      CalculateLUTInt16(
+          exp_zero_point, exp_scale, lut_value_zero_point, lut_value_scale,
+          [](float key) { return std::exp(key); }, kLUTEntries, softmax_s16_exp_lut);
+      CalculateLUTInt16(
+          one_by_one_zero_point, one_by_one_scale, lut_value_zero_point, lut_value_scale,
+          [](float key) { return 1.0f / (1.0f + key); }, kLUTEntries, softmax_s16_one_by_one_lut);
+
+      // first LUT
+      softmax_params[0].buffer_var =
+          tir::Var("exp_lut", PointerType(PrimType(DataType::Int(bit_width)), "global.workspace"));
+      softmax_params[0].ndarray =
+          runtime::NDArray::Empty({kLUTEntries}, DataType::Int(bit_width), dev);
+      softmax_params[0].ndarray.CopyFromBytes(softmax_s16_exp_lut, sizeof(int16_t) * kLUTEntries);
+
+      // second LUT
+      softmax_params[1].buffer_var = tir::Var(
+          "one_by_one_lut", PointerType(PrimType(DataType::Int(bit_width)), "global.workspace"));
+      softmax_params[1].ndarray =
+          runtime::NDArray::Empty({kLUTEntries}, DataType::Int(bit_width), dev);
+      softmax_params[1].ndarray.CopyFromBytes(softmax_s16_one_by_one_lut,
+                                              sizeof(int16_t) * kLUTEntries);
+    }
+
+    BufferCreator buffer_creator;
+    tir::Var in_var = buffer_creator.CreateBufferVar("input", DataType::Handle(bit_width));
+    tir::Var out_var = buffer_creator.CreateBufferVar("output", DataType::Handle(bit_width));
+
+    if (bit_width == 8) {
+      tvm::Array<PrimExpr> args = {
+          tir::StringImm("arm_softmax_s" + std::to_string(bit_width)),
+          in_var,
+          ToArg(num_rows),
+          ToArg(row_size),
+          ToArg(mult),
+          ToArg(shift),
+          ToArg(diff_min),
+          out_var,
+      };
+
+      CreatePrimFuncForExtern(global_var, buffer_creator.GetPrimFuncParams(),
+                              buffer_creator.GetBufferMap(), args);
+    } else {  // bit_width == 16
+      tvm::Array<PrimExpr> args = {
+          tir::StringImm("arm_softmax_s" + std::to_string(bit_width)),
+          in_var,
+          ToArg(num_rows),
+          ToArg(row_size),
+          ToArg(mult),
+          ToArg(shift),
+          softmax_params[0].buffer_var,
+          softmax_params[1].buffer_var,
+          out_var,
+      };
+
+      CreatePrimFuncForExtern(global_var, buffer_creator.GetPrimFuncParams(),
+                              buffer_creator.GetBufferMap(), args, PrimExpr(), 0, 16,
+                              softmax_params);
+    }
+  }
+
+  struct BinaryElementwiseClipPattern {
+    Call binary_op;
+    Optional<Call> clip_op;
+  };
+
+  BinaryElementwiseClipPattern ParseBinaryElementwiseOpClipPattern(const Expr& expr) {
+    BinaryElementwiseClipPattern pattern;
+    Call final_call = Downcast<Call>(expr);
+    const OpNode* final_op = final_call->op.as<OpNode>();
+    if (final_op->name == "clip") {
+      pattern.clip_op = final_call;
+      pattern.binary_op = Downcast<Call>(final_call->args[0]);
+    } else {
+      pattern.binary_op = final_call;
+      pattern.clip_op = Optional<Call>{nullptr};
+    }
+    return pattern;
   }
 
   void EmitMul(const GlobalVar& global_var, const Expr& expr) {
-    auto* mul_call = expr.as<CallNode>();
+    const auto& pattern = ParseBinaryElementwiseOpClipPattern(expr);
+    Call mul_call = pattern.binary_op;
+    const auto bit_width = mul_call->type_as<TensorTypeNode>()->dtype.bits();
+    const auto [output_min, output_max] =
+        pattern.clip_op ? GetClipMinMax(pattern.clip_op.value()) : GetIntMinMax(bit_width);
 
     const float input_0_scale = GetScalarFromConstant<float>(mul_call->args[2]);
     const int32_t input_0_zero_point = GetScalarFromConstant<int32_t>(mul_call->args[3]);
@@ -498,14 +684,18 @@ class RelayToTIRVisitor : public MixedModeMutator {
 
     PrimExpr tensor_size = mul_call->type_as<TensorTypeNode>()->Size();
 
-    tir::Var input_0("input_0", DataType::Handle(8));
-    tir::Var input_1("input_1", DataType::Handle(8));
-    tir::Var output("output", DataType::Handle(8));
-
-    Array<tir::Var> func_signature{input_0, input_1, output};
+    BufferCreator buffer_creator;
+    tir::Var input_0 = buffer_creator.CreateBufferVar("input_0", DataType::Handle(bit_width));
+    tir::Var input_1;
+    if (mul_call->args[0].same_as(mul_call->args[1])) {
+      input_1 = input_0;
+    } else {
+      input_1 = buffer_creator.CreateBufferVar("input_1", DataType::Handle(bit_width));
+    }
+    tir::Var output = buffer_creator.CreateBufferVar("output", DataType::Handle(bit_width));
 
     tvm::Array<PrimExpr> args = {
-        tir::StringImm("arm_elementwise_mul_s8"),
+        tir::StringImm("arm_elementwise_mul_s" + std::to_string(bit_width)),
         input_0,
         input_1,
         ToArg(-input_0_zero_point),
@@ -514,16 +704,22 @@ class RelayToTIRVisitor : public MixedModeMutator {
         ToArg(output_zero_point),
         ToArg(output_multiplier),
         ToArg(output_shift),
-        ToArg(std::numeric_limits<int8_t>::min()),
-        ToArg(std::numeric_limits<int8_t>::max()),
+        ToArg(output_min),
+        ToArg(output_max),
         tensor_size,
     };
 
-    CreatePrimFuncForExtern(global_var, func_signature, args);
+    CreatePrimFuncForExtern(global_var, buffer_creator.GetPrimFuncParams(),
+                            buffer_creator.GetBufferMap(), args);
   }
 
   void EmitAdd(const GlobalVar& global_var, const Expr& expr) {
-    auto* add_call = expr.as<CallNode>();
+    const auto& pattern = ParseBinaryElementwiseOpClipPattern(expr);
+    Call add_call = pattern.binary_op;
+    const auto bit_width = add_call->type_as<TensorTypeNode>()->dtype.bits();
+
+    const auto [output_min, output_max] =
+        pattern.clip_op ? GetClipMinMax(pattern.clip_op.value()) : GetIntMinMax(bit_width);
 
     const float input_0_scale = GetScalarFromConstant<float>(add_call->args[2]);
     const int32_t input_0_zero_point = GetScalarFromConstant<int32_t>(add_call->args[3]);
@@ -532,9 +728,10 @@ class RelayToTIRVisitor : public MixedModeMutator {
     const float output_scale = GetScalarFromConstant<float>(add_call->args[6]);
     const int32_t output_zero_point = GetScalarFromConstant<int32_t>(add_call->args[7]);
 
-    const int32_t left_shift = 20;
+    const int32_t left_shift = (bit_width == 16) ? 15 : 20;
     const int32_t input_0_offset = -input_0_zero_point;
     const int32_t input_1_offset = -input_1_zero_point;
+    const int32_t output_offset = output_zero_point;
 
     const float max_input_scale = std::max(input_0_scale, input_1_scale);
     const double twice_max_input_scale = 2 * static_cast<double>(max_input_scale);
@@ -560,14 +757,18 @@ class RelayToTIRVisitor : public MixedModeMutator {
 
     PrimExpr tensor_size = add_call->type_as<TensorTypeNode>()->Size();
 
-    tir::Var input_0("input_0", DataType::Handle(8));
-    tir::Var input_1("input_1", DataType::Handle(8));
-    tir::Var output("output", DataType::Handle(8));
-
-    Array<tir::Var> func_signature{input_0, input_1, output};
+    BufferCreator buffer_creator;
+    tir::Var input_0 = buffer_creator.CreateBufferVar("input_0", DataType::Handle(bit_width));
+    tir::Var input_1;
+    if (add_call->args[0].same_as(add_call->args[1])) {
+      input_1 = input_0;
+    } else {
+      input_1 = buffer_creator.CreateBufferVar("input_1", DataType::Handle(bit_width));
+    }
+    tir::Var output = buffer_creator.CreateBufferVar("output", DataType::Handle(bit_width));
 
     tvm::Array<PrimExpr> args = {
-        tir::StringImm("arm_elementwise_add_s8"),
+        tir::StringImm("arm_elementwise_add_s" + std::to_string(bit_width)),
         input_0,
         input_1,
         ToArg(input_0_offset),
@@ -578,62 +779,135 @@ class RelayToTIRVisitor : public MixedModeMutator {
         ToArg(input_1_shift),
         ToArg(left_shift),
         output,
-        ToArg(output_zero_point),
+        ToArg(output_offset),
         ToArg(output_multiplier),
         ToArg(output_shift),
-        ToArg(std::numeric_limits<int8_t>::min()),
-        ToArg(std::numeric_limits<int8_t>::max()),
+        ToArg(output_min),
+        ToArg(output_max),
         tensor_size,
     };
 
-    CreatePrimFuncForExtern(global_var, func_signature, args);
+    CreatePrimFuncForExtern(global_var, buffer_creator.GetPrimFuncParams(),
+                            buffer_creator.GetBufferMap(), args);
+  }
+
+  // Removes kCompiler attribute from the partitioned functions that are not supported by this
+  // RelayToTIR
+  Call CallToFuncWithoutCompilerAttr(GlobalVar new_global_var, Call call, Function func) {
+    Function new_func = WithoutAttr(std::move(func), attr::kCompiler);
+    ir_module_->Update(new_global_var, new_func);
+    return Call(new_global_var, call->args, call->attrs, call->type_args, call->span);
+  }
+
+  Expr VisitExpr_(const LetNode* op) final {
+    auto pre_visit = [this](const LetNode* op) {
+      Expr var = this->VisitExpr(op->var);
+      Expr value = this->VisitExpr(op->value);
+      // outlineable function no longer needs let binding
+      if (this->CanOutlineExpr(value)) {
+        this->memo_[var] = value;
+      }
+    };
+    auto post_visit = [this](const LetNode* op) {
+      // Rely on the Memoizer to cache pre-visit values
+      Expr value = this->VisitExpr(op->value);
+      Expr body = this->VisitExpr(op->body);
+      auto expr = GetRef<Expr>(op);
+      // drop the let binding
+      if (this->CanOutlineExpr(value)) {
+        this->memo_[expr] = this->VisitExpr(op->body);
+      } else {
+        Var var = Downcast<Var>(this->VisitExpr(op->var));
+        if (var.same_as(op->var) && value.same_as(op->value) && body.same_as(op->body)) {
+          this->memo_[expr] = expr;
+        } else {
+          this->memo_[expr] = Let(var, value, body);
+        }
+      }
+    };
+    ExpandANormalForm(op, pre_visit, post_visit);
+    return memo_[GetRef<Expr>(op)];
+  }
+
+  bool CanOutlineExpr(const Expr& expr) {
+    // TODO(@lhutton1): This behaviour is similar to the OutlineCompilerFunctions pass
+    // we could reuse this functionality by separating outlining and lowering in this
+    // pass.
+    if (!expr->IsInstance<FunctionNode>()) {
+      return false;
+    }
+    const auto* func = expr.as<FunctionNode>();
+    auto codegen_name = func->GetAttr<String>(attr::kCompiler);
+    if (!codegen_name.defined() || codegen_name != "cmsis-nn") {
+      return false;
+    }
+    return true;
   }
 
   Expr Rewrite_(const CallNode* pre, const Expr& post) override {
-    if (const CallNode* call = post.as<CallNode>()) {
-      auto* func = call->op.as<FunctionNode>();
-      if (func == nullptr) {
-        return post;
-      }
+    if (const auto* call = post.as<CallNode>()) {
+      if (CanOutlineExpr(call->op)) {
+        const auto* func = call->op.as<FunctionNode>();
+        ICHECK(func) << "Expected function node but was " << call->op->GetTypeKey();
+        const auto codegen_name = func->GetAttr<String>(attr::kCompiler);
+        auto global_func_name = func->GetAttr<String>(tvm::attr::kGlobalSymbol);
+        GlobalVar new_global_var(global_func_name.value());
 
-      auto codegen_name = func->GetAttr<String>(attr::kCompiler);
-      if (codegen_name.defined() && codegen_name == "cmsis-nn") {
         const CallNode* inner_call = func->body.as<CallNode>();
-        const FunctionNode* composite_func = inner_call->op.as<FunctionNode>();
-        auto comp_name = composite_func->GetAttr<String>(attr::kComposite);
-        auto func_name = func->GetAttr<String>(::tvm::attr::kGlobalSymbol);
+        if (!inner_call) {
+          return CallToFuncWithoutCompilerAttr(new_global_var, GetRef<Call>(call),
+                                               GetRef<Function>(func));
+        }
 
-        GlobalVar new_global_var(func_name.value());
+        const FunctionNode* composite_func = inner_call->op.as<FunctionNode>();
+        if (!composite_func) {
+          return CallToFuncWithoutCompilerAttr(new_global_var, GetRef<Call>(call),
+                                               GetRef<Function>(func));
+        }
+
+        auto comp_name = composite_func->GetAttr<String>(attr::kComposite);
         new_global_var->checked_type_ = composite_func->checked_type();
 
         if (comp_name == "cmsis-nn.qnn_softmax") {
           EmitSoftMax(new_global_var, composite_func->body);
-        }
-        if (comp_name == "cmsis-nn.qnn_mul") {
+        } else if (comp_name == "cmsis-nn.qnn_mul") {
           EmitMul(new_global_var, composite_func->body);
-        }
-        if (comp_name == "cmsis-nn.qnn_add") {
+        } else if (comp_name == "cmsis-nn.qnn_add") {
           EmitAdd(new_global_var, composite_func->body);
-        }
-        if (comp_name == "cmsis-nn.qnn_conv2d") {
+        } else if (comp_name == "cmsis-nn.qnn_conv2d") {
           EmitConv2D(new_global_var, composite_func->body);
-        }
-        if (comp_name == "cmsis-nn.qnn_fully_connected") {
+        } else if (comp_name == "cmsis-nn.qnn_fully_connected") {
           EmitFullyConnected(new_global_var, composite_func->body);
-        }
-        if (comp_name == "cmsis-nn.qnn_avg_pool2d" || comp_name == "cmsis-nn.qnn_max_pool2d") {
+        } else if (comp_name == "cmsis-nn.qnn_avg_pool2d" ||
+                   comp_name == "cmsis-nn.qnn_max_pool2d") {
           EmitPool2D(new_global_var, composite_func->body, comp_name.value());
+        } else {
+          return CallToFuncWithoutCompilerAttr(new_global_var, GetRef<Call>(call),
+                                               GetRef<Function>(func));
         }
 
+        // Drop out the redundant arguments, and the arg_types from the global function call
         Array<Expr> args;
+        Array<Type> arg_types;
+        auto* func_type = new_global_var->checked_type_.as<FuncTypeNode>();
+        int arg_id = -1;
         for (const auto& arg : call->args) {
+          ++arg_id;
+          if (std::find(skip_call_args_.begin(), skip_call_args_.end(), arg_id) !=
+              skip_call_args_.end()) {
+            continue;
+          }
           args.push_back(VisitExpr(arg));
+          arg_types.push_back(func_type->arg_types[arg_id]);
         }
-
+        if (arg_types.size() != func_type->arg_types.size()) {
+          new_global_var->checked_type_ =
+              FuncType(arg_types, func_type->ret_type, {}, func_type->type_constraints);
+        }
+        skip_call_args_.clear();
         return Call(new_global_var, args, call->attrs, call->type_args, call->span);
       }
     }
-
     return post;
   }
 
@@ -641,7 +915,10 @@ class RelayToTIRVisitor : public MixedModeMutator {
   static constexpr int32_t kScaledDiffIntegerBits = 5;
   static constexpr int32_t kInputBits = 5;
   static constexpr double kBeta = 1.0;
+  /*! \brief Unique id for context buffer needed by CMSIS-NN layers. */
   int32_t context_buffer_id_;
+  /*! \brief Skip arguments in the call to global partitioned function. */
+  std::unordered_set<int32_t> skip_call_args_;
   IRModule ir_module_;
   Target target_;
 };

@@ -1,3 +1,4 @@
+
 name: Ping Reviewers
 on:
   schedule:
@@ -10,6 +11,7 @@ concurrency:
 
 jobs:
   ping:
+    if: github.repository == 'apache/tvm'
     runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v2
@@ -18,4 +20,4 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eux
-          python tests/scripts/ping_reviewers.py --wait-time-minutes 10080
+          python ci/scripts/github/ping_reviewers.py --wait-time-minutes 10080 || echo failed

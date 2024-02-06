@@ -16,14 +16,16 @@
 # under the License.
 """Pad the data by constant value """
 from __future__ import absolute_import as _abs
+
 import tvm
 from tvm import te
-from ..utils import equal_const_int
+
 from .. import tag
+from ..utils import equal_const_int
 
 
 @tvm.te.tag_scope(tag=tag.INJECTIVE + ",pad")
-def pad(data, pad_before, pad_after=None, pad_value=0.0, name="PadInput"):
+def pad(data, pad_before, pad_after=None, pad_value=0.0, name="PadInput", attrs=None):
     """Pad Input with zeros.
 
     Parameters
@@ -51,11 +53,9 @@ def pad(data, pad_before, pad_after=None, pad_value=0.0, name="PadInput"):
     n = len(data.shape)
     pad_after = pad_after if pad_after else pad_before
     if len(pad_before) != n:
-        raise ValueError(
-            "Input dimension and pad_before dismatch : %d vs %d" % (n, len(pad_before))
-        )
+        raise ValueError(f"Input dimension and pad_before dismatch : {n} vs {len(pad_before)}")
     if len(pad_after) != n:
-        raise ValueError("Input dimension and pad_after dismatch : %d vs %d" % (n, len(pad_before)))
+        raise ValueError(f"Input dimension and pad_after dismatch : {n} vs {len(pad_after)}")
     ana = tvm.arith.Analyzer()
     dshape = []
     for dim in data.shape:
@@ -85,7 +85,7 @@ def pad(data, pad_before, pad_after=None, pad_value=0.0, name="PadInput"):
             return tvm.tir.if_then_else(not_zero, data(*index_tuple), pad_value)
         return data(*index_tuple)
 
-    return te.compute(out_shape, _pad, name=name)
+    return te.compute(out_shape, _pad, name=name, attrs=attrs)
 
 
 @tvm.te.tag_scope(tag=tag.INJECTIVE + ",pad")
@@ -117,11 +117,9 @@ def mirror_pad(data, pad_before, pad_after=None, mode="SYMMETRIC", name="MirrorP
     n = len(data.shape)
     pad_after = pad_after if pad_after else pad_before
     if len(pad_before) != n:
-        raise ValueError(
-            "Input dimension and pad_before dismatch : %d vs %d" % (n, len(pad_before))
-        )
+        raise ValueError(f"Input dimension and pad_before dismatch : {n} vs {len(pad_before)}")
     if len(pad_after) != n:
-        raise ValueError("Input dimension and pad_after dismatch : %d vs %d" % (n, len(pad_before)))
+        raise ValueError(f"Input dimension and pad_after dismatch : {n} vs {len(pad_after)}")
     ana = tvm.arith.Analyzer()
     out_shape = tuple(ana.simplify(data.shape[i] + pad_before[i] + pad_after[i]) for i in range(n))
     assert mode in ("SYMMETRIC", "REFLECT")

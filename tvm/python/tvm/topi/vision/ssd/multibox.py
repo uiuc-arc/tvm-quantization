@@ -137,17 +137,17 @@ def multibox_prior(data, sizes=(1,), ratios=(1,), steps=(-1, -1), offsets=(0.5, 
 
 
 @hybrid.script
-def _hybridy_transform_loc(box, pred_loc, variance, clip):
+def _hybrid_transform_loc(anchor, pred_loc, variance, clip, batch_idx, anchor_idx):
     """Transform prior anchor box to output box through location predictions."""
-    al = box[0]
-    at = box[1]
-    ar = box[2]
-    ab = box[3]
+    al = anchor[0, anchor_idx, 0]
+    at = anchor[0, anchor_idx, 1]
+    ar = anchor[0, anchor_idx, 2]
+    ab = anchor[0, anchor_idx, 3]
 
-    px = pred_loc[0]
-    py = pred_loc[1]
-    pw = pred_loc[2]
-    ph = pred_loc[3]
+    px = pred_loc[batch_idx, 0]
+    py = pred_loc[batch_idx, 1]
+    pw = pred_loc[batch_idx, 2]
+    ph = pred_loc[batch_idx, 3]
 
     vx = variance[0]
     vy = variance[1]
@@ -172,7 +172,15 @@ def _hybridy_transform_loc(box, pred_loc, variance, clip):
 
 
 @hybrid.script
-def hybrid_multibox_transform_loc(cls_prob, loc_pred, anchor, clip, threshold, variances):
+def hybrid_multibox_transform_loc(
+    cls_prob,
+    loc_pred,
+    anchor,
+    clip,
+    threshold,
+    variances,
+    keep_background,
+):
     """Hybrid routing for transform location in multibox_detection operator.
 
     Parameters
@@ -195,6 +203,9 @@ def hybrid_multibox_transform_loc(cls_prob, loc_pred, anchor, clip, threshold, v
     variances : tvm.nd.NDArray
         Variances to be decoded from box regression output.
 
+    keep_background : tvm.tir.const
+        Whether to keep boxes detected as background or not.
+
     Returns
     -------
     out_loc : tvm.te.Tensor or numpy NDArray
@@ -206,10 +217,17 @@ def hybrid_multibox_transform_loc(cls_prob, loc_pred, anchor, clip, threshold, v
     batch_size = cls_prob.shape[0]
     num_classes = cls_prob.shape[1]
     num_anchors = cls_prob.shape[2]
-    box_coord = allocate((4,), loc_pred.dtype)
-    pred_coord = allocate((4,), loc_pred.dtype)
+    pred_coord = allocate(
+        (
+            batch_size,
+            4,
+        ),
+        loc_pred.dtype,
+    )
     out_loc = output_tensor((batch_size, num_anchors, 6), loc_pred.dtype)
     valid_count = output_tensor((batch_size,), "int32")
+
+    start_cls_idx = 0 if keep_background else 1
 
     for i in parallel(batch_size):
         valid_count[i] = 0
@@ -217,22 +235,20 @@ def hybrid_multibox_transform_loc(cls_prob, loc_pred, anchor, clip, threshold, v
             # Find the predicted class id and probability
             score = -1.0
             cls_id = 0
-            for k in range(num_classes):
-                if k > 0:
-                    temp = cls_prob[i, k, j]
-                    cls_id = k if temp > score else cls_id
-                    score = max(temp, score)
+            for k in range(start_cls_idx, num_classes):
+                temp = cls_prob[i, k, j]
+                cls_id = k if temp > score else cls_id
+                score = max(temp, score)
             if cls_id > 0 and score < threshold:
                 cls_id = 0
             # [id, prob, xmin, ymin, xmax, ymax]
-            # Remove background, restore original id
-            if cls_id > 0:
-                out_loc[i, valid_count[i], 0] = cls_id - 1.0
+            # Remove background if 'keep_background=False', restore original id
+            if keep_background or cls_id > 0:
+                out_loc[i, valid_count[i], 0] = cls_id - 0.0 if keep_background else cls_id - 1.0
                 out_loc[i, valid_count[i], 1] = score
                 for l in range(4):
-                    box_coord[l] = anchor[0, j, l]
-                    pred_coord[l] = loc_pred[i, j * 4 + l]
-                out_coord = _hybridy_transform_loc(box_coord, pred_coord, variances, clip)
+                    pred_coord[i, l] = loc_pred[i, j * 4 + l]
+                out_coord = _hybrid_transform_loc(anchor, pred_coord, variances, clip, i, j)
                 out_loc[i, valid_count[i], 2] = out_coord[0]
                 out_loc[i, valid_count[i], 3] = out_coord[1]
                 out_loc[i, valid_count[i], 4] = out_coord[2]
@@ -243,7 +259,13 @@ def hybrid_multibox_transform_loc(cls_prob, loc_pred, anchor, clip, threshold, v
 
 
 def multibox_transform_loc(
-    cls_prob, loc_pred, anchor, clip=True, threshold=0.01, variances=(0.1, 0.1, 0.2, 0.2)
+    cls_prob,
+    loc_pred,
+    anchor,
+    clip=True,
+    threshold=0.01,
+    variances=(0.1, 0.1, 0.2, 0.2),
+    keep_background=False,
 ):
     """Location transformation for multibox detection
 
@@ -267,10 +289,14 @@ def multibox_transform_loc(
     variances : tuple of float
         Variances to be decoded from box regression output.
 
+    keep_background : boolean
+        Whether to keep boxes detected as background or not.
+
     Returns
     -------
     ret : tuple of tvm.te.Tensor
     """
+
     return hybrid_multibox_transform_loc(
         cls_prob,
         loc_pred,
@@ -278,6 +304,7 @@ def multibox_transform_loc(
         tvm.tir.const(clip, "bool"),
         tvm.tir.const(threshold, "float32"),
         tvm.runtime.convert(variances),
+        tvm.tir.const(keep_background, "bool"),
     )
 
 

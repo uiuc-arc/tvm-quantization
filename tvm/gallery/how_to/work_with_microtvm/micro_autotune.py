@@ -18,8 +18,8 @@
 """
 .. _tutorial-micro-autotune:
 
-Autotuning with microTVM
-=========================
+6. Model Tuning with microTVM
+=============================
 **Authors**:
 `Andrew Reusch <https://github.com/areusch>`_,
 `Mehrdad Hessar <https://github.com/mehrdadh>`_
@@ -27,11 +27,35 @@ Autotuning with microTVM
 This tutorial explains how to autotune a model using the C runtime.
 """
 
+######################################################################
+#
+#     .. include:: ../../../../gallery/how_to/work_with_microtvm/install_dependencies.rst
+#
+
+
+# You can skip the following section (installing Zephyr) if the following flag is False.
+# Installing Zephyr takes ~20 min.
+import os
+
+use_physical_hw = bool(os.getenv("TVM_MICRO_USE_HW"))
+
+######################################################################
+#
+#     .. include:: ../../../../gallery/how_to/work_with_microtvm/install_zephyr.rst
+#
+
+
+######################################################################
+# Import Python dependencies
+# -------------------------------
+#
+import json
 import numpy as np
 import pathlib
 
 import tvm
 from tvm.relay.backend import Runtime
+import tvm.micro.testing
 
 ####################
 # Defining the model
@@ -77,16 +101,19 @@ params = {"weight": weight_sample}
 # PLATFORM list in this tutorial. You can chose the platform by passing --platform argument when running
 # this tutorial.
 #
+
 RUNTIME = Runtime("crt", {"system-lib": True})
-TARGET = tvm.target.target.micro("host")
+TARGET = tvm.micro.testing.get_target("crt")
 
 # Compiling for physical hardware
 # --------------------------------------------------------------------------
 #  When running on physical hardware, choose a TARGET and a BOARD that describe the hardware. The
 #  STM32L4R5ZI Nucleo target and board is chosen in the example below.
-#
-#    TARGET = tvm.target.target.micro("stm32l4r5zi")
-#    BOARD = "nucleo_l4r5zi"
+if use_physical_hw:
+    BOARD = os.getenv("TVM_MICRO_BOARD", default="nucleo_l4r5zi")
+    SERIAL = os.getenv("TVM_MICRO_SERIAL", default=None)
+    TARGET = tvm.micro.testing.get_target("zephyr", BOARD)
+
 
 #########################
 # Extracting tuning tasks
@@ -97,6 +124,7 @@ TARGET = tvm.target.target.micro("host")
 #
 # Because task extraction involves running the compiler, we first configure the compiler's
 # transformation passes; we'll apply the same configuration later on during autotuning.
+#
 
 pass_context = tvm.transform.PassContext(opt_level=3, config={"tir.disable_vectorize": True})
 with pass_context:
@@ -115,7 +143,6 @@ assert len(tasks) > 0
 # choose other options by choosing from `PLATFORM` list.
 #
 
-
 module_loader = tvm.micro.AutoTvmModuleLoader(
     template_project_dir=pathlib.Path(tvm.micro.get_microtvm_template_projects("crt")),
     project_options={"verbose": False},
@@ -132,30 +159,36 @@ runner = tvm.autotvm.LocalRunner(number=1, repeat=1, timeout=100, module_loader=
 measure_option = tvm.autotvm.measure_option(builder=builder, runner=runner)
 
 # Compiling for physical hardware
-# --------------------------------------------------------------------------
-#    module_loader = tvm.micro.AutoTvmModuleLoader(
-#        template_project_dir=pathlib.Path(tvm.micro.get_microtvm_template_projects("zephyr")),
-#        project_options={
-#            "zephyr_board": BOARD,
-#            "west_cmd": "west",
-#            "verbose": False,
-#            "project_type": "host_driven",
-#        },
-#    )
-#    builder = tvm.autotvm.LocalBuilder(
-#        n_parallel=1,
-#        build_kwargs={"build_option": {"tir.disable_vectorize": True}},
-#        do_fork=False,
-#        build_func=tvm.micro.autotvm_build_func,
-#    )
-#    runner = tvm.autotvm.LocalRunner(number=1, repeat=1, timeout=100, module_loader=module_loader)
-#
-#    measure_option = tvm.autotvm.measure_option(builder=builder, runner=runner)
+if use_physical_hw:
+    module_loader = tvm.micro.AutoTvmModuleLoader(
+        template_project_dir=pathlib.Path(tvm.micro.get_microtvm_template_projects("zephyr")),
+        project_options={
+            "board": BOARD,
+            "verbose": False,
+            "project_type": "host_driven",
+            "serial_number": SERIAL,
+        },
+    )
+    builder = tvm.autotvm.LocalBuilder(
+        n_parallel=1,
+        build_kwargs={"build_option": {"tir.disable_vectorize": True}},
+        do_fork=False,
+        build_func=tvm.micro.autotvm_build_func,
+        runtime=RUNTIME,
+    )
+    runner = tvm.autotvm.LocalRunner(number=1, repeat=1, timeout=100, module_loader=module_loader)
 
-################
+    measure_option = tvm.autotvm.measure_option(builder=builder, runner=runner)
+
+##########################
 # Run Autotuning
-################
-# Now we can run autotuning separately on each extracted task.
+##########################
+# Now we can run autotuning separately on each extracted task on microTVM device.
+#
+
+autotune_log_file = pathlib.Path("microtvm_autotune.log.txt")
+if os.path.exists(autotune_log_file):
+    os.remove(autotune_log_file)
 
 num_trials = 10
 for task in tasks:
@@ -164,7 +197,7 @@ for task in tasks:
         n_trial=num_trials,
         measure_option=measure_option,
         callbacks=[
-            tvm.autotvm.callback.log_to_file("microtvm_autotune.log.txt"),
+            tvm.autotvm.callback.log_to_file(str(autotune_log_file)),
             tvm.autotvm.callback.progress_bar(num_trials, si_prefix="M"),
         ],
         si_prefix="M",
@@ -176,12 +209,12 @@ for task in tasks:
 # For comparison, let's compile and run the graph without imposing any autotuning schedules. TVM
 # will select a randomly-tuned implementation for each operator, which should not perform as well as
 # the tuned operator.
+#
 
 with pass_context:
     lowered = tvm.relay.build(relay_mod, target=TARGET, runtime=RUNTIME, params=params)
 
 temp_dir = tvm.contrib.utils.tempdir()
-
 project = tvm.micro.generate_project(
     str(tvm.micro.get_microtvm_template_projects("crt")),
     lowered,
@@ -190,18 +223,20 @@ project = tvm.micro.generate_project(
 )
 
 # Compiling for physical hardware
-# --------------------------------------------------------------------------
-#    project = tvm.micro.generate_project(
-#        str(tvm.micro.get_microtvm_template_projects("zephyr")),
-#        lowered,
-#        temp_dir / "project",
-#        {
-#            "zephyr_board": BOARD,
-#            "west_cmd": "west",
-#            "verbose": False,
-#            "project_type": "host_driven",
-#        },
-#    )
+if use_physical_hw:
+    temp_dir = tvm.contrib.utils.tempdir()
+    project = tvm.micro.generate_project(
+        str(tvm.micro.get_microtvm_template_projects("zephyr")),
+        lowered,
+        temp_dir / "project",
+        {
+            "board": BOARD,
+            "verbose": False,
+            "project_type": "host_driven",
+            "serial_number": SERIAL,
+            "config_main_stack_size": 4096,
+        },
+    )
 
 project.build()
 project.flash()
@@ -219,12 +254,11 @@ with tvm.micro.Session(project.transport()) as session:
 ##########################
 # Once autotuning completes, you can time execution of the entire program using the Debug Runtime:
 
-with tvm.autotvm.apply_history_best("microtvm_autotune.log.txt"):
+with tvm.autotvm.apply_history_best(str(autotune_log_file)):
     with pass_context:
         lowered_tuned = tvm.relay.build(relay_mod, target=TARGET, runtime=RUNTIME, params=params)
 
 temp_dir = tvm.contrib.utils.tempdir()
-
 project = tvm.micro.generate_project(
     str(tvm.micro.get_microtvm_template_projects("crt")),
     lowered_tuned,
@@ -233,18 +267,20 @@ project = tvm.micro.generate_project(
 )
 
 # Compiling for physical hardware
-# --------------------------------------------------------------------------
-#    project = tvm.micro.generate_project(
-#        str(tvm.micro.get_microtvm_template_projects("zephyr")),
-#        lowered_tuned,
-#        temp_dir / "project",
-#        {
-#            "zephyr_board": BOARD,
-#            "west_cmd": "west",
-#            "verbose": False,
-#            "project_type": "host_driven",
-#        },
-#    )
+if use_physical_hw:
+    temp_dir = tvm.contrib.utils.tempdir()
+    project = tvm.micro.generate_project(
+        str(tvm.micro.get_microtvm_template_projects("zephyr")),
+        lowered_tuned,
+        temp_dir / "project",
+        {
+            "board": BOARD,
+            "verbose": False,
+            "project_type": "host_driven",
+            "serial_number": SERIAL,
+            "config_main_stack_size": 4096,
+        },
+    )
 
 project.build()
 project.flash()

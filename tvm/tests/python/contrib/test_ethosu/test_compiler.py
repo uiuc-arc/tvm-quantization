@@ -19,7 +19,7 @@ import pytest
 pytest.importorskip("ethosu.vela")
 import tvm
 from tvm import relay
-from tvm.relay.backend.contrib.ethosu.tir.compiler import lower_to_tir
+from tvm.relay.backend.contrib.ethosu.tir.compiler import _lower_to_tir
 from . import infra
 
 
@@ -57,10 +57,10 @@ def test_lower_to_tir_arg_count(relay_function, arg_count):
     mod = tvm.IRModule()
     mod["main"] = relay_function()
     mod = relay.transform.InferType()(mod)
-    tir_mod = lower_to_tir(mod["main"])[0]
+    tir_mod = _lower_to_tir(mod["main"])[0]
     primfunc = tir_mod["main"]
     assert len(primfunc.params) == arg_count
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    tvm.testing.main()

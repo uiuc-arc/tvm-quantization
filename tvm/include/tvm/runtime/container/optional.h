@@ -94,6 +94,11 @@ class Optional : public ObjectRef {
     return T(data_);
   }
   /*!
+   * \return The internal object pointer with container type of T.
+   * \note This function do not perform not-null checking.
+   */
+  const ContainerType* get() const { return static_cast<ContainerType*>(data_.get()); }
+  /*!
    * \return The contained value if the Optional is not null
    *         otherwise return the default_value.
    */
@@ -147,6 +152,15 @@ class Optional : public ObjectRef {
   }
   static constexpr bool _type_is_nullable = true;
 };
+
+template <typename ObjectRefType, typename>
+inline Optional<ObjectRefType> ObjectRef::as() const {
+  if (auto* ptr = this->as<typename ObjectRefType::ContainerType>()) {
+    return GetRef<ObjectRefType>(ptr);
+  } else {
+    return NullOptType{};
+  }
+}
 
 }  // namespace runtime
 

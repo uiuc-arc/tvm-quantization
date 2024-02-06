@@ -47,7 +47,7 @@ def make_search_policies(
     verbose,
     load_model_file=None,
     load_log_file=None,
-    adapative_training=False,
+    adaptive_training=False,
 ):
     """Make a list of search policies for a list of search tasks.
     It creates one policy per task.
@@ -71,7 +71,7 @@ def make_search_policies(
     load_log_file: Optional[str]
         Load measurement records from this file. If it is not None, the status of the
         task scheduler, search policies and cost models will be restored according to this file.
-    adapative_training: bool = False
+    adaptive_training: bool = False
         Option used by XGBModel to reduce the model training frequency when there're too
         many logs.
 
@@ -89,7 +89,7 @@ def make_search_policies(
             cost_model = XGBModel(
                 num_warmup_sample=len(tasks) * num_measures_per_round,
                 model_file=load_model_file,
-                adapative_training=adapative_training,
+                adaptive_training=adaptive_training,
             )
             if load_model_file and os.path.isfile(load_model_file):
                 logger.info("TaskScheduler: Load pretrained model...")
@@ -283,7 +283,7 @@ class TaskScheduler:
         tune_option,
         search_policy="default",
         search_policy_params=None,
-        adapative_training=False,
+        adaptive_training=False,
         per_task_early_stopping=None,
     ):
         """Tune a batch of tasks together.
@@ -300,7 +300,7 @@ class TaskScheduler:
             "sketch.random" for SketchPolicy + RandomModel.
         search_policy_params : Optional[Dict[str, Any]]
             The parameters of the search policy
-        adapative_training : bool = False
+        adaptive_training : bool = False
             Option used by XGBModel to reduce the model training frequency when there're
             too many logs.
         per_task_early_stopping : Optional[int]
@@ -347,7 +347,7 @@ class TaskScheduler:
             tune_option.verbose,
             self.load_model_file,
             self.load_log_file,
-            adapative_training,
+            adaptive_training,
         )
 
         # do a round robin first to warm up
@@ -577,17 +577,25 @@ class PrintTableInfo(TaskSchedulerCallback):
             return
 
         _ffi_api.PrintTitle("Task Scheduler")
-        print("|  ID  | Latency (ms) | Speed (GFLOPS) | Trials |")
-        print("-------------------------------------------------")
+        print(
+            "|  ID  "
+            "|                       Task Description                        "
+            "| Latency (ms) | Speed (GFLOPS) | Trials |"
+        )
+        print(
+            "----------------------------------------------------------------"
+            "-------------------------------------------------"
+        )
 
         # content
         for i in range(len(task_scheduler.tasks)):
-            id_str = "%d" % i
+            id_str = f"{i}"
             latency_str = (
                 "%.3f" % (1e3 * task_scheduler.best_costs[i])
                 if task_scheduler.best_costs[i] < 1e9
                 else "-"
             )
+            task_desc = task_scheduler.tasks[i].desc
             speed_str = (
                 "%.2f"
                 % (task_scheduler.tasks[i].compute_dag.flop_ct / task_scheduler.best_costs[i] / 1e9)
@@ -595,8 +603,14 @@ class PrintTableInfo(TaskSchedulerCallback):
                 else "-"
             )
             trials_str = "%d" % (task_scheduler.task_cts[i] * task_scheduler.num_measures_per_round)
-            print("| %4s | %12s | % 14s | %6s |" % (id_str, latency_str, speed_str, trials_str))
-        print("-------------------------------------------------")
+            print(
+                "| %4s | %61s | %12s | % 14s | %6s |"
+                % (id_str, task_desc, latency_str, speed_str, trials_str)
+            )
+        print(
+            "----------------------------------------------------------------"
+            "-------------------------------------------------"
+        )
 
         # overall info
         if all(cost < 1e9 for cost in task_scheduler.best_costs):
@@ -605,12 +619,7 @@ class PrintTableInfo(TaskSchedulerCallback):
             total_latency_str = "-"
         print(
             "Estimated total latency: %s ms\tTrials: %d\tUsed time : %.0f s\tNext ID: %d\t"
-            % (
-                total_latency_str,
-                task_scheduler.ct,
-                time.time() - task_scheduler.tic,
-                task_id,
-            )
+            % (total_latency_str, task_scheduler.ct, time.time() - task_scheduler.tic, task_id)
         )
 
 
@@ -638,10 +647,6 @@ class LogEstimatedLatency(TaskSchedulerCallback):
         with open(self.log_file, "a") as filep:
             filep.write(
                 "ElapsedTime(s)\t%.0f\tEstimatedLatency(ms)\t%s\tTrials\t%d\n"
-                % (
-                    time.time() - task_scheduler.tic,
-                    total_latency_str,
-                    task_scheduler.ct,
-                )
+                % (time.time() - task_scheduler.tic, total_latency_str, task_scheduler.ct)
             )
             filep.flush()

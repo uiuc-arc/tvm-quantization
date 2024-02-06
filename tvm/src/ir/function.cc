@@ -22,13 +22,8 @@
  * \brief The function data structure.
  */
 #include <tvm/ir/function.h>
-#include <tvm/runtime/registry.h>
-// NOTE: reverse dependency on relay, tir/
-// These dependencies do not happen at the interface-level,
-// and are only used in minimum cases where they are clearly marked.
-//
-// Rationale: We calls into the type specific WithAttr function
 #include <tvm/relay/function.h>
+#include <tvm/runtime/registry.h>
 #include <tvm/tir/function.h>
 
 namespace tvm {
@@ -41,8 +36,21 @@ TVM_REGISTER_GLOBAL("ir.BaseFuncWithAttr")
     .set_body_typed([](BaseFunc func, String key, ObjectRef value) -> BaseFunc {
       if (func->IsInstance<tir::PrimFuncNode>()) {
         return WithAttr(Downcast<tir::PrimFunc>(std::move(func)), key, value);
+      }
+      if (const auto* f = runtime::Registry::Get("relay.ir.FuncWithAttr")) {
+        if (Optional<BaseFunc> ret = (*f)(func, key, value)) {
+          return ret.value();
+        }
+      }
+      LOG(FATAL) << "Do not support function type " << func->GetTypeKey();
+    });
+
+TVM_REGISTER_GLOBAL("ir.BaseFuncWithoutAttr")
+    .set_body_typed([](BaseFunc func, String key) -> BaseFunc {
+      if (func->IsInstance<tir::PrimFuncNode>()) {
+        return WithoutAttr(Downcast<tir::PrimFunc>(std::move(func)), key);
       } else if (func->IsInstance<relay::FunctionNode>()) {
-        return WithAttr(Downcast<relay::Function>(std::move(func)), key, value);
+        return WithoutAttr(Downcast<relay::Function>(std::move(func)), key);
       } else {
         LOG(FATAL) << "Do not support function type " << func->GetTypeKey();
         return func;

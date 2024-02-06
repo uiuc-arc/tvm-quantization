@@ -38,7 +38,7 @@ namespace tir {
  *
  * A variable is uniquely identified by its address.
  *
- * Each variable is only binded once in the following nodes:
+ * Each variable is only bound once in the following nodes:
  * - Allocate
  * - For
  * - Let
@@ -104,6 +104,12 @@ class Var : public PrimExpr {
    */
   TVM_DLL explicit Var(String name_hint, Type type_annotation, Span span = Span());
   /*!
+   * \brief Make a new copy of var with same type, but a different nam
+   * \param name The new name to be used.
+   * \return the new Var copy
+   */
+  TVM_DLL Var copy_with_name(const String& name) const;
+  /*!
    * \brief Make a new copy of var with same type, append suffix
    * \param suffix The suffix to be appended.
    * \return the new Var copy
@@ -152,6 +158,13 @@ class SizeVar : public Var {
    */
   TVM_DLL explicit SizeVar(String name_hint = "s", DataType t = DataType::Int(32),
                            Span span = Span());
+  /*!
+   * \brief Constructor which provides a more detailed type annotation.
+   * \param name_hint variable name.
+   * \param type_annotation The type annotation.
+   * \param span The location of this object in the source code.
+   */
+  TVM_DLL explicit SizeVar(String name_hint, Type type_annotation, Span span = Span());
   /*!
    * \brief Get pointer to the internal value.
    * \return the corresponding Variable.
@@ -241,6 +254,8 @@ enum IterVarType : int {
 /*!
  * \brief An iteration variable representing an iteration
  *  over a one dimensional interval.
+ *
+ *  The dtype of the extent of the `dom` of the IterVar must match the dtype of the internal Var.
  */
 class IterVarNode : public Object {
  public:
@@ -255,7 +270,7 @@ class IterVarNode : public Object {
   IterVarType iter_type;
   /*!
    * \brief additional tag on the iteration variable,
-   *  set this if this is binded already to a known thread tag.
+   *  set this if this is bound already to a known thread tag.
    */
   String thread_tag;
   /*!
@@ -293,6 +308,8 @@ class IterVarNode : public Object {
 /*!
  * \brief Iteration Variable,
  *  represents an iteration over an integer interval.
+ *
+ *  The dtype of the extent of the `dom` of the IterVar must match the dtype of the internal Var.
  */
 class IterVar : public ObjectRef {
  public:

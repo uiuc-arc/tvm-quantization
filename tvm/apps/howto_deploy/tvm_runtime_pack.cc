@@ -24,7 +24,7 @@
  *   include in your project.
  *
  *  - Copy this file into your project which depends on tvm runtime.
- *  - Compile with -std=c++14
+ *  - Compile with -std=c++17
  *  - Add the following include path
  *     - /path/to/tvm/include/
  *     - /path/to/tvm/3rdparty/dmlc-core/include/
@@ -64,6 +64,7 @@
 // Graph executor
 #include "../../src/runtime/graph_executor/graph_executor.cc"
 #include "../../src/runtime/graph_executor/graph_executor_factory.cc"
+#include "../../src/runtime/memory/memory_manager.cc"
 
 // Uncomment the following lines to enable RPC
 // #include "../../src/runtime/rpc/rpc_session.cc"

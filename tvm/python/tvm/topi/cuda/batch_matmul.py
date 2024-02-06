@@ -229,7 +229,7 @@ def batch_matmul_cublas(
         b, k, n = get_const_tuple(y.shape)
     if all([isinstance(s, int) for s in [b, m, n, k]]):
         cfg.add_flop(b * m * k * n * 2)
-    return cublas.batch_matmul(x, y, transa=transpose_a, transb=transpose_b)
+    return cublas.batch_matmul(x, y, transa=transpose_a, transb=transpose_b, dtype=out_dtype)
 
 
 @autotvm.register_topi_schedule("batch_matmul_cublas.cuda")
@@ -333,9 +333,6 @@ def schedule_batch_matmul_int8(cfg, outs):
     return s
 
 
-_dp4a = dp4a("shared", "shared", "local")
-
-
 def _schedule_batch_matmul_int8(cfg, s, output):
     input_x, input_y = s[output].op.input_tensors
     if len(input_y.op.input_tensors) == 1 and input_y.op.input_tensors[0] == input_x:
@@ -345,7 +342,7 @@ def _schedule_batch_matmul_int8(cfg, s, output):
     _, N, _ = get_const_tuple(input_y.shape)
 
     k_factor = 4
-    assert K % k_factor == 0, "Input dimension must divide {}".format(k_factor)
+    assert K % k_factor == 0, f"Input dimension must divide {k_factor}"
     if K % 16 == 0:
         k_factor = 16
 
@@ -355,7 +352,7 @@ def _schedule_batch_matmul_int8(cfg, s, output):
     cfg.define_split("tile_k", K // k_factor, num_outputs=2)
     cfg.define_knob("auto_unroll_max_step", [0, 256, 512, 1024])
 
-    batch_matmul_op = s.outputs[0]
+    batch_matmul_op = s[output].op
     s[input_x].compute_inline()
     s[input_y].compute_inline()
 
@@ -368,7 +365,17 @@ def _schedule_batch_matmul_int8(cfg, s, output):
     ko, ki = s[batch_matmul_cache].split(ko, factor=4)
     ko, kt = cfg["tile_k"].apply(s, batch_matmul_cache, ko)
     # dp4a tensorize
-    s[batch_matmul_cache].tensorize(ki, _dp4a)
+
+    target = tvm.target.Target.current(allow_none=False)
+    do_tensorize = "+dotprod" in target.mattr or target.supports_integer_dot_product
+
+    if do_tensorize:
+        dtypes = (input_x.dtype, input_y.dtype)
+        s[batch_matmul_cache].tensorize(ki, dp4a("shared", "shared", "local", dtypes))
+
+    if batch_matmul_op not in s.outputs:
+        s[output].compute_inline()
+        batch_matmul_op = s.outputs[0]
 
     # tile axis
     f, m, n = batch_matmul_op.axis

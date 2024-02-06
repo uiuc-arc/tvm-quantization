@@ -160,6 +160,9 @@ void VulkanDeviceAPI::GetAttr(Device dev, DeviceAttrKind kind, TVMRetValue* rv) 
       *rv = os.str();
       break;
     }
+
+    case kL2CacheSizeBytes:
+      break;
   }
 }
 
@@ -236,6 +239,15 @@ void VulkanDeviceAPI::GetTargetProperty(Device dev, const std::string& property,
   if (property == "max_shared_memory_per_block") {
     *rv = int64_t(prop.max_shared_memory_per_block);
   }
+
+  if (property == "supports_integer_dot_product") {
+    *rv = prop.supports_integer_dot_product;
+  }
+
+  if (property == "supports_cooperative_matrix") {
+    *rv = prop.supports_cooperative_matrix;
+  }
+
   if (property == "device_name") {
     *rv = prop.device_name;
   }
@@ -362,6 +374,7 @@ void VulkanDeviceAPI::CopyDataFromTo(const void* from, size_t from_offset, void*
                       &copy_info);
     });
     stream.Synchronize();
+    stream.ProfilerReset();
     if (!device.coherent_staging) {
       VkMappedMemoryRange mrange;
       mrange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
@@ -408,6 +421,8 @@ void VulkanDeviceAPI::CopyDataFromTo(const void* from, size_t from_offset, void*
       vkCmdCopyBuffer(state->cmd_buffer_, staging_buffer.vk_buf.buffer, to_buf->buffer, 1,
                       &copy_info);
     });
+
+    stream.ProfilerReady();
     // TODO(tulloch): should we instead make the staging buffer a property of the
     // Stream? This would allow us to elide synchronizations here.
     stream.Synchronize();

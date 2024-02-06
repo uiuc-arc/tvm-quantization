@@ -29,6 +29,7 @@
 #include <tvm/tir/transform.h>
 
 #include <unordered_map>
+#include <utility>
 
 #include "../../runtime/thread_storage_scope.h"
 #include "ir_utils.h"
@@ -58,22 +59,57 @@ PrimExpr UpdatePointerStorageScope::VisitExpr_(const VarNode* op) {
   return it->second;
 }
 
-PrimExpr UpdatePointerStorageScope::VisitExpr_(const LoadNode* op) {
-  auto remapped = StmtExprMutator::VisitExpr(op->buffer_var);
-  return Load(op->dtype, Downcast<Var>(remapped), StmtExprMutator::VisitExpr(op->index),
-              StmtExprMutator::VisitExpr(op->predicate));
-}
-
 Stmt UpdatePointerStorageScope::VisitStmt_(const AllocateNode* op) {
-  auto remapped = Downcast<Var>(StmtExprMutator::VisitExpr(op->buffer_var));
-  return Allocate(remapped, op->dtype, op->extents, StmtExprMutator::VisitExpr(op->condition),
-                  StmtExprMutator::VisitStmt(op->body));
+  auto node = Downcast<Allocate>(StmtExprMutator::VisitStmt_(op));
+  if (auto it = new_var_remap_.find(node->buffer_var.get()); it != new_var_remap_.end()) {
+    node.CopyOnWrite()->buffer_var = it->second;
+  }
+  return std::move(node);
 }
 
-Stmt UpdatePointerStorageScope::VisitStmt_(const StoreNode* op) {
-  auto remapped = StmtExprMutator::VisitExpr(op->buffer_var);
-  return Store(Downcast<Var>(remapped), StmtExprMutator::VisitExpr(op->value),
-               StmtExprMutator::VisitExpr(op->index), StmtExprMutator::VisitExpr(op->predicate));
+template <typename Node>
+Node UpdatePointerStorageScope::UpdateBufferAccess(Node node) {
+  auto new_buffer = GetUpdatedBuffer(node->buffer);
+  if (!new_buffer.same_as(node->buffer)) {
+    auto writer = node.CopyOnWrite();
+    writer->buffer = new_buffer;
+  }
+  return node;
+}
+
+Buffer UpdatePointerStorageScope::GetUpdatedBuffer(Buffer buf) {
+  // Use the cached buffer, if it exists.
+  auto key = buf.get();
+  auto it = new_buffer_remap_.find(key);
+  if (it != new_buffer_remap_.end()) {
+    return it->second;
+  }
+
+  // Update the buffer's var, if needed.
+  auto remapped = Downcast<Var>(StmtExprMutator::VisitExpr(buf->data));
+  if (!remapped.same_as(buf->data)) {
+    auto writer = buf.CopyOnWrite();
+    writer->data = remapped;
+  }
+
+  // Update the cache and return
+  new_buffer_remap_[key] = buf;
+  return buf;
+}
+
+Stmt UpdatePointerStorageScope::VisitStmt_(const DeclBufferNode* op) {
+  auto node = Downcast<DeclBuffer>(StmtExprMutator::VisitStmt_(op));
+  return UpdateBufferAccess(node);
+}
+
+PrimExpr UpdatePointerStorageScope::VisitExpr_(const BufferLoadNode* op) {
+  auto node = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
+  return UpdateBufferAccess(node);
+}
+
+Stmt UpdatePointerStorageScope::VisitStmt_(const BufferStoreNode* op) {
+  auto node = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+  return UpdateBufferAccess(node);
 }
 
 }  // namespace tir

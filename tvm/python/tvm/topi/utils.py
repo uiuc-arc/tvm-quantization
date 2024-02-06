@@ -17,14 +17,15 @@
 # pylint: disable=invalid-name
 """Common topi utilities"""
 from __future__ import absolute_import as _abs
+
 from numbers import Integral
+
 import numpy as np
-
-
 import tvm
 from tvm import te
-from tvm.tir import layout, bijective_layout
-from . import tag, cpp
+from tvm.tir import Any, SizeVar, bijective_layout, layout
+
+from . import cpp, tag
 
 
 class InvalidShapeError(ValueError):
@@ -225,9 +226,7 @@ def const_vector(vector, name="const_vector"):
         now = tvm.tir.const(0.0, dtype)
         for ii in range(row):
             now = tvm.tir.Select(
-                tvm.tir.all(idxm(i, row) == ii),
-                tvm.tir.const(vector[ii], dtype),
-                now,
+                tvm.tir.all(idxm(i, row) == ii), tvm.tir.const(vector[ii], dtype), now
             )
         return now
 
@@ -310,14 +309,22 @@ def unravel_index(idx, shape):
     idxd = tvm.tir.indexdiv
     idxm = tvm.tir.indexmod
     indices = []
-    for i in range(len(shape) - 1, -1, -1):
-        indices.append(idxm(idx, shape[i]))
-        idx = idxd(idx, shape[i])
+    for i, dim in enumerate(reversed(shape)):
+        if dim == 0:
+            indices.append(0)
+        elif i == len(shape) - 1:
+            # Assuming the index is in-bounds, the last coordinate is
+            # already less than dim, and doesn't need the be remainder
+            # mod dim.
+            indices.append(idx)
+        else:
+            indices.append(idxm(idx, dim))
+            idx = idxd(idx, dim)
     indices = indices[::-1]
     return indices
 
 
-def const_matrix(matrix, name="const_matrix"):
+def const_matrix(matrix, name="const_matrix", attrs=None):
     """convert a const numpy 2-dimensional matrix to tvm tensor
 
     Parameters
@@ -347,7 +354,10 @@ def const_matrix(matrix, name="const_matrix"):
                 )
         return now
 
-    return te.compute(matrix.shape, select_array, name=name, attrs={"const_matrix": True})
+    if attrs is None:
+        attrs = {"const_matrix": True, "schedule_rule": "None"}
+
+    return te.compute(matrix.shape, select_array, name=name, attrs=attrs)
 
 
 def get_max_power2_factor(n, max_value=None):
@@ -404,10 +414,7 @@ def get_shape(src_shape, src_layout, dst_layout):
     if isinstance(dst_layout, str):
         dst_layout = layout(dst_layout)
 
-    assert len(src_layout) == len(dst_layout), "Incompatible layout %s vs %s" % (
-        src_layout,
-        dst_layout,
-    )
+    assert len(src_layout) == len(dst_layout), f"Incompatible layout {src_layout} vs {dst_layout}"
 
     layout_mapping = bijective_layout(src_layout, dst_layout)
     dst_indices = layout_mapping.forward_index(tvm.runtime.convert(list(range(len(src_layout)))))
@@ -507,3 +514,15 @@ def ceil_div(a, b):
 def swap(arr, axis):
     """swap arr[axis] and arr[-1]"""
     return arr[:axis] + [arr[-1]] + arr[axis + 1 : -1] + [arr[axis]]
+
+
+def is_target(names):
+    """Return True if the name of the current target is one of provided names"""
+    names = [names] if isinstance(names, str) else names
+    target = tvm.target.Target.current(allow_none=False)
+    return any(name in target.keys for name in names)
+
+
+def is_dynamic_shape(shape):
+    """Checks if any part of a shape is dynamic"""
+    return any([isinstance(x, (Any, SizeVar)) for x in shape])

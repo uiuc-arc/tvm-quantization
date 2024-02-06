@@ -23,45 +23,23 @@
  */
 #ifdef TVM_LLVM_VERSION
 
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/Intrinsics.h>
+#if TVM_LLVM_VERSION >= 100
+#include <llvm/IR/IntrinsicsX86.h>
+#endif
+#include <llvm/Support/Casting.h>
 #include <tvm/runtime/registry.h>
 
+#include <string>
+#include <vector>
+
 #include "codegen_cpu.h"
-#include "llvm/MC/MCSubtargetInfo.h"
+#include "llvm_instance.h"
 
 namespace tvm {
 namespace codegen {
-
-namespace {
-bool TargetHasFeature(const llvm::TargetMachine& tm, const std::string& feature) {
-  // MCSubTargetInfo::checkFeatures was added in LLVM 6.0
-#if TVM_LLVM_VERSION >= 60
-  const auto* MCInfo = tm.getMCSubtargetInfo();
-  return MCInfo->checkFeatures(std::string("+") + feature);
-#else
-  return false;
-  // TODO(tulloch) - enable this block, need to figure out how to reimplement
-  // this given visibility constraints, similar to
-  // https://github.com/rust-lang/rust/pull/31709
-
-  // Copied from
-  // https://github.com/llvm-mirror/llvm/blob/5136df4/lib/MC/MCSubtargetInfo.cpp#L78-L88.
-
-  // auto checkFeatures = [&](const std::string FS) {
-  //   llvm::SubtargetFeatures T(FS);
-  //   llvm::FeatureBitset Set, All;
-  //   for (std::string F : T.getFeatures()) {
-  //     llvm::SubtargetFeatures::ApplyFeatureFlag(Set, F, MCInfo->ProcFeatures);
-  //     if (F[0] == '-') {
-  //       F[0] = '+';
-  //     }
-  //     llvm::SubtargetFeatures::ApplyFeatureFlag(All, F, MCInfo->ProcFeatures);
-  //   }
-  //   return (MCInfo->getFeatureBits() & All) == Set;
-  // };
-  // return checkFeatures(MCInfo, std::string("+") + feature);
-#endif
-}
-}  // namespace
 
 class CodeGenX86_64 final : public CodeGenCPU {
  public:
@@ -80,13 +58,12 @@ llvm::Value* CodeGenX86_64::VisitExpr_(const CastNode* op) {
   const auto to = op->dtype;
   if (from.is_float() && to.is_float() && from.bits() == 16 && to.bits() == 32) {
     ICHECK_EQ(from.lanes(), to.lanes());
-    CHECK_NOTNULL(target_machine_);
 
-    const auto has_avx512 = TargetHasFeature(*target_machine_, "avx512f");
+    const auto has_avx512 = llvm_target_->TargetHasCPUFeature("avx512f");
 
     if (from.lanes() >= 16 && has_avx512) {
       return CallVectorIntrin(
-          ::llvm::Intrinsic::x86_avx512_mask_vcvtph2ps_512, 16,
+          llvm::Intrinsic::x86_avx512_mask_vcvtph2ps_512, 16,
           DTypeToLLVMType(DataType::Float(32, from.lanes())),
           {
               MakeValue(tir::Call(DataType::Int(16, from.lanes()), tir::builtin::reinterpret(),
@@ -99,10 +76,10 @@ llvm::Value* CodeGenX86_64::VisitExpr_(const CastNode* op) {
 
 #if TVM_LLVM_VERSION <= 100
     // The intrinsic x86_vcvtph2ps_256 was removed in LLVM 11.
-    const auto has_f16c = TargetHasFeature(*target_machine_, "f16c");
+    const auto has_f16c = llvm_target_->TargetHasCPUFeature("f16c");
 
     if (from.lanes() >= 8 && has_f16c) {
-      return CallVectorIntrin(::llvm::Intrinsic::x86_vcvtph2ps_256, 8,
+      return CallVectorIntrin(llvm::Intrinsic::x86_vcvtph2ps_256, 8,
                               DTypeToLLVMType(DataType::Float(32, from.lanes())),
                               {MakeValue(tir::Call(DataType::Int(16, from.lanes()),
                                                    tir::builtin::reinterpret(), {op->value}))});
@@ -152,10 +129,10 @@ llvm::Value* CodeGenX86_64::CallVectorIntrin(llvm::Intrinsic::ID id, size_t intr
 
 TVM_REGISTER_GLOBAL("tvm.codegen.llvm.target_x86-64")
     .set_body([](const TVMArgs& targs, TVMRetValue* rv) {
-      CodeGenLLVM* cg = new CodeGenX86_64();
-      *rv = static_cast<void*>(cg);
+      *rv = static_cast<void*>(new CodeGenX86_64());
     });
 
 }  // namespace codegen
 }  // namespace tvm
+
 #endif  // TVM_LLVM_VERSION

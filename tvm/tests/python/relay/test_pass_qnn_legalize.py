@@ -23,6 +23,7 @@ from tvm import relay
 from tvm.contrib import graph_executor
 from tvm.relay import transform, analysis
 from tvm.relay.testing.temp_op_attr import TempOpAttr
+from tvm.relay.testing import run_infer_type
 
 
 def alpha_equal(x, y):
@@ -50,7 +51,7 @@ def test_qnn_legalize():
 
     def before():
         x = relay.var("x", shape=(1, 64, 56, 56), dtype="int8")
-        y = relay.qnn.op.requantize(
+        y = relay.qnn.requantize(
             x,
             input_scale=relay.const(1, "float32"),
             input_zero_point=relay.const(0, "int32"),
@@ -64,7 +65,7 @@ def test_qnn_legalize():
     def legalize_qnn_requantize(attrs, inputs, types):
         data = inputs[0]
         data = relay.add(relay.const(0, "int8"), data)
-        y = relay.qnn.op.requantize(
+        y = relay.qnn.requantize(
             data,
             input_scale=relay.const(1, "float32"),
             input_zero_point=relay.const(0, "int32"),
@@ -77,7 +78,7 @@ def test_qnn_legalize():
     def expected():
         x = relay.var("x", shape=(1, 64, 56, 56), dtype="int8")
         y = relay.add(relay.const(0, "int8"), x)
-        z = relay.qnn.op.requantize(
+        z = relay.qnn.requantize(
             y,
             input_scale=relay.const(1, "float32"),
             input_zero_point=relay.const(0, "int32"),
@@ -109,7 +110,7 @@ def test_qnn_legalize_qnn_conv2d():
         kernel_shape = (128, 64, 3, 3)
         data = relay.var("data", shape=data_shape, dtype=data_dtype)
         kernel = relay.var("kernel", shape=kernel_shape, dtype=kernel_dtype)
-        func = relay.qnn.op.conv2d(
+        func = relay.qnn.conv2d(
             data,
             kernel,
             input_zero_point=relay.const(1, "int32"),
@@ -136,11 +137,15 @@ def test_qnn_legalize_qnn_conv2d():
         #############################################################
         # Check transformations for platforms with fast Int8 support.
         #############################################################
-        # Check that Intel VNNI gets picked up.
-        with tvm.target.Target("llvm -mcpu=skylake-avx512"):
-            mod = relay.transform.InferType()(mod)
-            legalized_mod = relay.qnn.transform.Legalize()(mod)
-            assert "cast" in legalized_mod.astext() and "qnn.conv2d" in legalized_mod.astext()
+        # Check that Intel AVX512 (with or w/o VNNI) gets picked up.
+        for target in [
+            "llvm -mtriple=x86_64-linux-gnu -mcpu=skylake-avx512",
+            "llvm -mtriple=x86_64-linux-gnu -mcpu=cascadelake",
+        ]:
+            with tvm.target.Target(target):
+                mod = relay.transform.InferType()(mod)
+                legalized_mod = relay.qnn.transform.Legalize()(mod)
+                assert "cast" in legalized_mod.astext() and "qnn.conv2d" in legalized_mod.astext()
 
         # Since same dtype, there should not be any transformation
         with tvm.target.Target(
@@ -167,8 +172,8 @@ def test_qnn_legalize_qnn_conv2d():
     #############################################################
     # Check transformations for platforms with fast Int8 support.
     #############################################################
-    # Check no transformation for Intel VNNI.
-    with tvm.target.Target("llvm -mcpu=skylake-avx512"):
+    # Check no transformation for Intel AVX512.
+    with tvm.target.Target("llvm -mtriple=x86_64-linux-gnu -mcpu=skylake-avx512"):
         mod = relay.transform.InferType()(mod)
         legalized_mod = relay.qnn.transform.Legalize()(mod)
         assert tvm.ir.structural_equal(mod, legalized_mod)
@@ -207,7 +212,7 @@ def test_qnn_legalize_qnn_dense():
         kernel_shape = (20, 3)
         data = relay.var("data", shape=data_shape, dtype=data_dtype)
         kernel = relay.var("kernel", shape=kernel_shape, dtype=kernel_dtype)
-        func = relay.qnn.op.dense(
+        func = relay.qnn.dense(
             data,
             kernel,
             input_zero_point=relay.const(1, "int32"),
@@ -229,11 +234,15 @@ def test_qnn_legalize_qnn_dense():
         #############################################################
         # Check transformations for platforms with fast Int8 support.
         #############################################################
-        # Check that Intel VNNI gets picked up.
-        with tvm.target.Target("llvm -mcpu=skylake-avx512"):
-            mod = relay.transform.InferType()(mod)
-            legalized_mod = relay.qnn.transform.Legalize()(mod)
-            assert "cast" in legalized_mod.astext() and "qnn.dense" in legalized_mod.astext()
+        # Check that Intel AVX512 (with or w/o VNNI) gets picked up.
+        for target in [
+            "llvm -mtriple=x86_64-linux-gnu -mcpu=skylake-avx512",
+            "llvm -mtriple=x86_64-linux-gnu -mcpu=cascadelake",
+        ]:
+            with tvm.target.Target(target):
+                mod = relay.transform.InferType()(mod)
+                legalized_mod = relay.qnn.transform.Legalize()(mod)
+                assert "cast" in legalized_mod.astext() and "qnn.dense" in legalized_mod.astext()
 
         # Since same dtype, there should not be any transformation
         with tvm.target.Target(
@@ -260,8 +269,8 @@ def test_qnn_legalize_qnn_dense():
     #############################################################
     # Check transformations for platforms with fast Int8 support.
     #############################################################
-    # Check no transformation for Intel VNNI.
-    with tvm.target.Target("llvm -mcpu=skylake-avx512"):
+    # Check no transformation for Intel AVX512.
+    with tvm.target.Target("llvm -mtriple=x86_64-linux-gnu -mcpu=skylake-avx512"):
         mod = relay.transform.InferType()(mod)
         legalized_mod = relay.qnn.transform.Legalize()(mod)
         assert tvm.ir.structural_equal(mod, legalized_mod)
@@ -294,7 +303,98 @@ def test_qnn_legalize_qnn_dense():
         assert "cast" in legalized_mod.astext() and "qnn" in legalized_mod.astext()
 
 
+def test_qnn_legalize_qnn_conv2d_non_scalar_qnn_params():
+    """
+    Test QNN legalization for qnn.conv2d op for Hexagon target when kernel zero point and kernel
+    scale are vectors of scalars.
+    """
+    data_shape = (1, 29, 16, 16)
+    weights_shape = (60, 29, 3, 3)
+    O, I = weights_shape[0], weights_shape[1]
+    data = relay.var("data", shape=data_shape, dtype="uint8")
+    weights = relay.var("weight", shape=weights_shape, dtype="int8")
+    data_zp = relay.const(2)
+    data_scale = relay.const(0.15)
+
+    def before():
+        op = relay.qnn.conv2d(
+            data,
+            weights,
+            input_zero_point=data_zp,
+            kernel_zero_point=relay.const([1] * O),
+            input_scale=data_scale,
+            kernel_scale=relay.const([0.17] * O),
+            padding=[0, 0, 0, 0],
+            channels=O,
+            kernel_size=[3, 3],
+        )
+        return op
+
+    def expected():
+        in_diff = 3
+        out_diff = 4
+        op0 = relay.nn.pad(weights, pad_width=[[0, 0], [0, in_diff], [0, 0], [0, 0]])
+        op1 = relay.nn.pad(data, pad_width=[[0, 0], [0, in_diff], [0, 0], [0, 0]])
+        op2 = relay.nn.pad(op0, pad_width=[[0, out_diff], [0, 0], [0, 0], [0, 0]])
+        op3 = relay.qnn.conv2d(
+            op1,
+            op2,
+            input_zero_point=data_zp,
+            kernel_zero_point=relay.const([1] * O + [0] * out_diff),
+            input_scale=data_scale,
+            kernel_scale=relay.const([0.17] * O + [1.0] * out_diff),
+            padding=[0, 0, 0, 0],
+            channels=(O + out_diff),
+            kernel_size=[3, 3],
+        )
+        op4 = relay.strided_slice(op3, begin=[0, 0, 0, 0], end=[1, 60, 14, 14], strides=[1])
+        return op4
+
+    target = tvm.target.hexagon("v68")
+    with tvm.target.Target(target):
+        a = run_opt_pass(before(), relay.qnn.transform.Legalize())
+        b = run_infer_type(expected())
+        tvm.ir.assert_structural_equal(a, b)
+
+
+def test_qnn_legalize_qnn_dense_non_scalar_qnn_params():
+    """
+    Test QNN legalization for qnn.dense op for Hexagon target when kernel zero point and kernel
+    scale are vectors of scalars.
+    """
+    data_shape = (4, 16)
+    weights_shape = (58, 16)
+    N = weights_shape[0]
+    data = relay.var("data", shape=data_shape, dtype="uint8")
+    weights = relay.var("weight", shape=weights_shape, dtype="int8")
+    data_zp = relay.const(2)
+    data_scale = relay.const(0.15)
+
+    def before():
+        wzp = relay.const([1] * N)
+        wscale = relay.const([0.17] * N)
+        op = relay.qnn.dense(data, weights, data_zp, wzp, data_scale, wscale, units=N)
+        return op
+
+    def expected():
+        diff = 6
+        wzp = relay.const([1] * N + [0] * diff)
+        wscale = relay.const([0.17] * N + [1.0] * diff)
+        op0 = relay.nn.pad(weights, pad_width=[[0, diff], [0, 0]])
+        op1 = relay.qnn.dense(data, op0, data_zp, wzp, data_scale, wscale, units=(N + diff))
+        op2 = relay.strided_slice(op1, begin=[0, 0], end=[data_shape[0], N], strides=[1], axes=None)
+        return op2
+
+    target = tvm.target.hexagon("v68")
+    with tvm.target.Target(target):
+        a = run_opt_pass(before(), relay.qnn.transform.Legalize())
+        b = run_infer_type(expected())
+        tvm.ir.assert_structural_equal(a, b)
+
+
 if __name__ == "__main__":
     test_qnn_legalize()
     test_qnn_legalize_qnn_conv2d()
     test_qnn_legalize_qnn_dense()
+    test_qnn_legalize_qnn_conv2d_non_scalar_qnn_params()
+    test_qnn_legalize_qnn_dense_non_scalar_qnn_params()

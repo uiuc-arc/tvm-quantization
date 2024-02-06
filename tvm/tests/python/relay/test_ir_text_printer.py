@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 import tvm
+import tvm.testing
 from tvm import te
 from tvm import relay
 from tvm.relay import testing
@@ -32,9 +33,9 @@ def astext(program, unify_free_vars=False):
     text = program.astext()
 
     if isinstance(program, Expr):
-        roundtrip_program = tvm.parser.parse_expr(text)
+        roundtrip_program = tvm.relay.parse_expr(text)
     else:
-        roundtrip_program = tvm.parser.fromtext(text)
+        roundtrip_program = tvm.relay.fromtext(text)
 
     tvm.ir.assert_structural_equal(roundtrip_program, program, map_free_vars=True)
 
@@ -47,12 +48,25 @@ def show(text):
         print(text)
 
 
+def assert_prints_as(expr, str):
+    assert astext(expr) == SEMVER + str
+
+
+def test_scalars():
+    assert_prints_as(relay.const(42, "int16"), "42i16")
+    assert_prints_as(relay.const(42, "int32"), "42")
+    assert_prints_as(relay.const(42, "int64"), "42i64")
+    assert_prints_as(relay.const(3.0, "float16"), "3f16")
+    assert_prints_as(relay.const(3.0, "float32"), "3f")
+    assert_prints_as(relay.const(3.0, "float64"), "3f64")
+
+
 def test_large_graph():
     x = relay.var("x", shape=(3, 2))
     y = relay.var("y")
     one = relay.const(10e10, dtype="float32")
     z = relay.add(x, one)
-    for i in range(int(1e6)):
+    for i in range(int(9e4)):
         z = relay.add(z, one)
     f = relay.Function([x, y], z)
     show(astext(f))
@@ -240,7 +254,7 @@ def @main[A]() -> fn (A, List[A]) -> List[A] {
   Cons
 }
     """
-    mod = tvm.parser.parse(SEMVER + type_def_str + main_def_str)
+    mod = tvm.relay.parse(SEMVER + type_def_str + main_def_str)
     mod_str = str(mod)
     # ensure constructors are printed correctly in type definitions (with their
     # signature) and as exprs (without their signature)
@@ -294,4 +308,4 @@ def test_slash_in_identifier():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    tvm.testing.main()

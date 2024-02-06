@@ -159,7 +159,7 @@ def _set_params(mod, input_scale_func, weight_scale_func):
             def _make_const(val):
                 return _expr.const(val, "float32")
 
-            valid_range = 2 ** valid_bit
+            valid_range = 2**valid_bit
             const_params[ndom_scale] = _make_const(scale / valid_range)
             const_params[nclip_min] = _make_const(-(valid_range - 1))
             const_params[nclip_max] = _make_const((valid_range - 1))
@@ -224,14 +224,14 @@ def calibrate(dataset=None):
         elif cfg.calibrate_mode == "percentile":
             input_scale_func = _percentile_scale(mod, dataset)
         else:
-            raise ValueError("Unknown calibrate mode {}".format(cfg.calibrate_mode))
+            raise ValueError(f"Unknown calibrate mode {cfg.calibrate_mode}")
 
         if cfg.weight_scale == "max":
             weight_scale_func = _max_scale
         elif cfg.weight_scale == "power2":
             weight_scale_func = _power2_scale
         else:
-            raise ValueError("Unknown weight scale mode {}".format(cfg.weight_scale))
+            raise ValueError(f"Unknown weight scale mode {cfg.weight_scale}")
 
         return _set_params(mod, input_scale_func, weight_scale_func)
 

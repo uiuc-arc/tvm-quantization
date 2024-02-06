@@ -17,8 +17,8 @@
 """
 Auto-scheduling a Neural Network for ARM CPU
 =============================================
-**Author**: `Thierry Moreau <https://github.com/tmoreau89>_`, \
-            `Lianmin Zheng <https://github.com/merrymercy>_`, \
+**Author**: `Thierry Moreau <https://github.com/tmoreau89>`_, \
+            `Lianmin Zheng <https://github.com/merrymercy>`_, \
             `Chengfan Jia <https://github.com/jcf94/>`_
 
 Auto-tuning for specific devices and workloads is critical for getting the
@@ -45,6 +45,7 @@ Note that this tutorial will not run on Windows or recent versions of macOS. To
 get it to run, you will need to wrap the body of this tutorial in a :code:`if
 __name__ == "__main__":` block.
 """
+
 
 import numpy as np
 import os
@@ -330,7 +331,7 @@ def tune_and_evaluate():
         from tvm.contrib import ndk
 
         filename = "net.so"
-        lib.export_library(tmp.relpath(filename), ndk.create_shared)
+        lib.export_library(tmp.relpath(filename), fcompile=ndk.create_shared)
     else:
         filename = "net.tar"
         lib.export_library(tmp.relpath(filename))

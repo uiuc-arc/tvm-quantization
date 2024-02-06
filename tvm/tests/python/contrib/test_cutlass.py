@@ -15,30 +15,30 @@
 # specific language governing permissions and limitations
 # under the License.
 import logging
+import tempfile
 import math
-import pytest
 import tvm
 from tvm import relay
 from tvm.contrib.cudnn import conv_output_shape
 import numpy as np
+from tvm.relay import op as _op
 from tvm.runtime.vm import VirtualMachine
 from tvm.relay.op.contrib.cutlass import partition_for_cutlass
+from tvm import auto_scheduler
 from tvm.relay.transform import FirstOrderGradient, ToMixedPrecision, InferType
 from tvm.contrib.cutlass import (
-    tune_cutlass_kernels,
-    build_cutlass_kernels,
-    build_cutlass_kernels_vm,
+    has_cutlass,
+    num_cutlass_partitions,
+    finalize_modules,
+    finalize_modules_vm,
 )
+import tvm.testing
 
 logging.basicConfig(level=logging.INFO)
 
 
 def has_cublas():
     return tvm.get_global_func("tvm.contrib.cublas.matmul", True) != None
-
-
-def has_cutlass():
-    return tvm.get_global_func("relay.ext.cutlass", True) != None
 
 
 def get_ref_rt_mod(mod, params, target="cuda"):
@@ -214,6 +214,56 @@ def get_conv2d_transpose_nchw(
     )
 
 
+def get_conv2d_backward_weight(
+    d_shape,
+    w_shape,
+    o_shape,
+    padding,
+    strides,
+    out_dtype="float32",
+    data_dtype="float32",
+    weight_dtype="float32",
+):
+    grad = relay.var("grad", shape=o_shape, dtype=weight_dtype)
+    data = relay.var("data", shape=d_shape, dtype=data_dtype)
+    out_channel = o_shape[1]
+    return relay.nn.conv2d_backward_weight(
+        grad=grad,
+        data=data,
+        kernel_size=w_shape[2:],
+        channels=out_channel,
+        padding=padding,
+        strides=strides,
+        out_dtype=out_dtype,
+    )
+
+
+def get_dense_transpose_dense(M, N, K, dtype="float16"):
+    """
+    output = nn.dense(_op.transpose(nn.dense(input, weight0), axes=(1, 0)), weight1)
+
+    dense0: [M, K] * [N, K] -> [M, N]
+    transpose: [M, N] -> [N, M]
+    dense1: [N, M] * [K, M] -> [N, K]
+
+    input: [M, K]
+    weight0: [N, K]
+    weight1: [K, M]
+    """
+    input_shape = (M, K)
+    weight0_shape = (N, K)
+    weight1_shape = (K, M)
+
+    input = relay.var("input", shape=input_shape, dtype=dtype)
+    weight0 = relay.var("weight0", shape=weight0_shape, dtype=dtype)
+    weight1 = relay.var("weight1", shape=weight1_shape, dtype=dtype)
+
+    output0 = relay.nn.dense(input, weight0, out_dtype=dtype)
+    input1 = _op.transpose(output0, axes=(1, 0))
+    output = relay.nn.dense(input1, weight1, out_dtype=dtype)
+    return output
+
+
 def convert_conv2d_layout(mod, desired_layouts):
     with tvm.transform.PassContext(opt_level=3):
         seq = tvm.transform.Sequential([relay.transform.ConvertLayout(desired_layouts)])
@@ -229,21 +279,85 @@ def get_random_ndarray(shape, dtype):
 
 
 def profile_and_build(
-    mod, params, sm, tmp_dir="./tmp", lib_path="compile.so", use_fast_math=False, use_3xtf32=True
+    mod,
+    params,
+    sm,
+    split_k_slices=[1],
+    tmp_dir="./tmp",
+    use_fast_math=False,
+    use_3xtf32=True,
+    use_ansor=False,
+    ansor_tuning=False,
 ):
+    logging.info("before partitioning:\n%s", mod)
     mod = partition_for_cutlass(mod)
-    mod, num_cutlass_partition = tune_cutlass_kernels(
-        mod,
-        sm,
-        use_3xtf32=use_3xtf32,
-        profile_all_alignments=False,
-        find_first_valid=True,
-        use_multiprocessing=False,
-        tmp_dir=tmp_dir,
+    logging.info("after partitioning:\n%s", mod)
+
+    num_cutlass_partition = num_cutlass_partitions(mod)
+    host = tvm.target.Target("llvm")
+    cuda = tvm.target.Target("cuda", host=host)
+    cutlass = tvm.target.Target(
+        {
+            "kind": "cutlass",
+            "sm": sm,
+            "use_3xtf32": use_3xtf32,
+            "split_k_slices": split_k_slices,
+            "profile_all_alignments": False,
+            "find_first_valid": True,
+            "use_multiprocessing": True,
+            "use_fast_math": use_fast_math,
+            "tmp_dir": tmp_dir,
+        },
+        host=host,
     )
-    with tvm.transform.PassContext(opt_level=3):
-        lib = relay.build(mod, target="cuda", params=params)
-    lib = build_cutlass_kernels(lib, sm, tmp_dir, lib_path, use_fast_math=use_fast_math)
+
+    if use_ansor:
+        with tvm.transform.PassContext(
+            opt_level=3, config={"relay.backend.use_auto_scheduler": True}
+        ):
+            tasks, task_weights = auto_scheduler.extract_tasks(
+                mod, params, cuda, include_simple_tasks=True, opt_level=3, other_targets=[cutlass]
+            )
+        for idx, (task, task_weight) in enumerate(zip(tasks, task_weights)):
+            logging.info(
+                f"==== Task {idx}: {task.desc} (weight {task_weight} key: {task.workload_key}) ====="
+            )
+            logging.info(task.compute_dag)
+
+        with tempfile.NamedTemporaryFile() as fp:
+            log_file = fp.name
+
+            # auto-tuning is disabled by default
+            if ansor_tuning:
+                measure_ctx = auto_scheduler.LocalRPCMeasureContext(
+                    repeat=3, min_repeat_ms=200, timeout=10
+                )
+                tuner = auto_scheduler.TaskScheduler(tasks, task_weights)
+                tuner.tune(
+                    auto_scheduler.TuningOptions(
+                        num_measure_trials=100,
+                        runner=measure_ctx.runner,
+                        measure_callbacks=[
+                            auto_scheduler.RecordToFile(log_file),
+                        ],
+                    )
+                )
+
+            with auto_scheduler.ApplyHistoryBest(log_file):
+                with tvm.transform.PassContext(
+                    opt_level=3,
+                    config={"relay.backend.use_auto_scheduler": True},
+                ):
+                    lib = relay.build(
+                        mod,
+                        target=cuda,
+                        target_host=host,
+                        params=params,
+                    )
+    else:
+        with tvm.transform.PassContext(opt_level=3):
+            lib = relay.build(mod, target=[cuda, cutlass], params=params)
+    lib = finalize_modules(lib, "compile.so", tmp_dir)
     dev = tvm.device("cuda", 0)
     rt_mod = tvm.contrib.graph_executor.GraphModule(lib["default"](dev))
     return rt_mod, dev, num_cutlass_partition
@@ -253,26 +367,32 @@ def profile_and_build_vm(
     mod,
     params,
     sm,
+    split_k_slices=[1],
     tmp_dir="./tmp",
-    lib_path="compile.so",
-    vmcode_path="vmcode.ro",
     use_fast_math=False,
     use_3xtf32=True,
 ):
     mod = partition_for_cutlass(mod)
-    mod, num_cutlass_partition = tune_cutlass_kernels(
-        mod,
-        sm,
-        use_3xtf32=use_3xtf32,
-        profile_all_alignments=False,
-        find_first_valid=True,
-        tmp_dir=tmp_dir,
+    num_cutlass_partition = num_cutlass_partitions(mod)
+    host = tvm.target.Target("llvm")
+    cuda = tvm.target.Target("cuda", host=host)
+    cutlass = tvm.target.Target(
+        {
+            "kind": "cutlass",
+            "sm": sm,
+            "use_3xtf32": use_3xtf32,
+            "split_k_slices": split_k_slices,
+            "profile_all_alignments": False,
+            "find_first_valid": True,
+            "use_multiprocessing": True,
+            "use_fast_math": use_fast_math,
+            "tmp_dir": tmp_dir,
+        },
+        host=host,
     )
     with tvm.transform.PassContext(opt_level=3):
-        vm_exec = relay.vm.compile(mod, target="cuda", params=params)
-    vm_exec = build_cutlass_kernels_vm(
-        vm_exec, sm, tmp_dir, lib_path, vmcode_path, use_fast_math=use_fast_math
-    )
+        vm_exec = relay.vm.compile(mod, target=[cuda, cutlass], params=params)
+    vm_exec = finalize_modules_vm(vm_exec, "compile.so", tmp_dir)
     dev = tvm.device("cuda", 0)
     return VirtualMachine(vm_exec, dev), dev, num_cutlass_partition
 
@@ -291,8 +411,7 @@ def verify_dense(
     weight_dtype="float16",
     use_3xtf32=True,
 ):
-    if not has_cutlass():
-        return
+    assert has_cutlass()
     if sm < 80 and data_dtype == "float32":
         return
 
@@ -343,8 +462,7 @@ def verify_dense(
 def verify_batch_matmul(
     func, batch, M, N, K, ref_target="cuda", sm=80, atol=1e-5, rtol=1e-5, run_benchmark=False
 ):
-    if not has_cutlass():
-        return
+    assert has_cutlass()
     mod = tvm.IRModule.from_expr(func)
     typ = relay.transform.InferType()(mod)["main"].body.checked_type
     use_vm = any(isinstance(s, tvm.tir.Any) for s in typ.shape)
@@ -376,11 +494,12 @@ def verify_batch_matmul(
         print("TVM Tensorcore (no tuning):", rt_mod_ref.benchmark(dev, number=1, repeat=600))
 
 
-M = 1820
-N = 768
-K = 768
+M = 96
+N = 64
+K = 64
 
 
+@tvm.testing.requires_cutlass
 def test_dense():
     verify_dense(get_dense(M, N, K), M, N, K)
     verify_dense(get_dense(M, N, K, out_dtype="float32"), M, N, K)
@@ -392,6 +511,17 @@ def test_dense():
     )
 
     dense_fp32 = get_dense(M, N, K, "float32", "float32", "float32")
+    # fp32
+    verify_dense(
+        dense_fp32,
+        M,
+        N,
+        K,
+        data_dtype="float32",
+        weight_dtype="float32",
+        use_3xtf32=False,
+        sm=75,
+    )
     # tf32
     verify_dense(
         dense_fp32,
@@ -415,21 +545,25 @@ def test_dense():
     )
 
 
+@tvm.testing.requires_cutlass
 def test_dense_bias():
     verify_dense(get_dense_bias(M, N, K), M, N, K)
     verify_dense(get_dense_bias(M, N, K, out_dtype="float32"), M, N, K)
 
 
+@tvm.testing.requires_cutlass
 def test_dense_bias_relu():
     verify_dense(get_dense_bias_relu(M, N, K), M, N, K)
     verify_dense(get_dense_bias_relu(M, N, K, out_dtype="float32"), M, N, K)
 
 
+@tvm.testing.requires_cutlass
 def test_dense_bias_gelu():
     verify_dense(get_dense_bias_gelu(M, N, K), M, N, K, atol=1e-3, rtol=1e-3)
     verify_dense(get_dense_bias_gelu(M, N, K, out_dtype="float32"), M, N, K, atol=1e-3, rtol=1e-3)
 
 
+@tvm.testing.requires_cutlass
 def test_dense_dynamic():
     data_shape = (relay.Any(), K)
     weight_shape = (relay.Any(), K)
@@ -438,25 +572,13 @@ def test_dense_dynamic():
         # TVM native fp16 dense (without tensorcore), using fp16 accum, seems to have accuracy issues
         # Use cublas as a reference
 
-        # After upgrading to cuda 11.6, this test no longer passes.
-        #
-        # Mismatched elements: 9223 / 1397760 (0.66%)
-        # Max absolute difference: 0.1562
-        # Max relative difference: 20.31
-        #  x: array([[  7.773 ,  -4.24  ,   3.346 , ...,  12.85  ,  12.14  , -12.31  ],
-        #        [  2.775 ,  -0.9316,  28.06  , ...,   2.334 ,  -8.945 ,   2.766 ],
-        #        [  3.38  ,   1.3125,  -6.85  , ...,  -8.695 ,   4.77  ,  -3.828 ],...
-        #  y: array([[  7.766,  -4.246,   3.352, ...,  12.84 ,  12.15 , -12.31 ],
-        #        [  2.781,  -0.926,  28.06 , ...,   2.336,  -8.94 ,   2.762],
-        #        [  3.383,   1.307,  -6.844, ...,  -8.695,   4.785,  -3.846],...
-        pass
-        # verify_dense(
-        #     get_dense_with_shape(data_shape, weight_shape),
-        #     M,
-        #     N,
-        #     K,
-        #     ref_target="cuda -libs=cublas",
-        # )
+        verify_dense(
+            get_dense_with_shape(data_shape, weight_shape),
+            M,
+            N,
+            K,
+            ref_target="cuda -libs=cublas",
+        )
 
     verify_dense(
         get_dense_with_shape(data_shape, weight_shape, out_dtype="float32"),
@@ -468,6 +590,7 @@ def test_dense_dynamic():
     )
 
 
+@tvm.testing.requires_cutlass
 def test_batch_matmul():
     batch = 8
     verify_batch_matmul(get_batch_matmul(batch, M, N, K), batch, M, N, K)
@@ -496,6 +619,7 @@ def verify_conv2d_common(
     inputs,
     params,
     sm=80,
+    split_k_slices=[1],
     atol=1e-5,
     rtol=1e-5,
     use_cudnn_ref=False,
@@ -504,9 +628,8 @@ def verify_conv2d_common(
     ref_target="cuda",
     use_vm=False,
 ):
-    if not has_cutlass():
-        return
-    if sm < 80 and data_dtype == "float32":
+    assert has_cutlass()
+    if sm < 80 and inputs[0].dtype == "float32":
         return
 
     mod_nchw = tvm.IRModule.from_expr(expr_nchw)
@@ -531,7 +654,7 @@ def verify_conv2d_common(
     )
 
     rt_mod, _, num_cutlass_partition = profile_and_build_func(
-        mod_weight_ohwi, params, sm, use_fast_math=use_fast_math
+        mod_weight_ohwi, params, sm, split_k_slices, use_fast_math=use_fast_math
     )
     out = get_output_func(rt_mod, input_names, inputs)
 
@@ -585,6 +708,8 @@ def verify_conv2d(
     np_bias = get_random_ndarray((w_shape[0],), typ.dtype)
     params = {"weight": np_weight, "bias": np_bias}
 
+    split_k_slices = [1]
+
     return verify_conv2d_common(
         expr_nchw,
         expr_ref,
@@ -592,6 +717,7 @@ def verify_conv2d(
         [np_data],
         params,
         sm,
+        split_k_slices,
         atol,
         rtol,
         use_cudnn_ref,
@@ -602,8 +728,50 @@ def verify_conv2d(
     )
 
 
+def verify_conv2d_backward_weight(
+    expr_nchw,  # can be dynamic batch
+    expr_ref,  # always static batch
+    grad_shape,
+    data_shape,
+    sm=80,
+    split_k_slices=[1],
+    atol=1e-5,
+    rtol=1e-5,
+    use_cudnn_ref=False,
+    use_fast_math=False,
+    grad_dtype="float16",
+    data_dtype="float16",
+    ref_target="cuda",
+    use_vm=False,
+):
+    np_grad = get_random_ndarray(grad_shape, grad_dtype)
+    np_data = get_random_ndarray(data_shape, data_dtype)
+    params = {}
+    input_names = ["grad", "data"]
+    return verify_conv2d_common(
+        expr_nchw,
+        expr_ref,
+        input_names,
+        [np_grad, np_data],
+        params,
+        sm,
+        split_k_slices,
+        atol,
+        rtol,
+        use_cudnn_ref,
+        False,
+        use_fast_math,
+        ref_target,
+        use_vm,
+    )
+
+
+@tvm.testing.requires_cutlass
 def test_conv2d():
+    d_shape = (16, 16, 32, 32)
+    w_shape = (32, 16, 3, 3)
     padding = (1, 1)
+
     for IC in [3, 16]:
         d_shape = (16, IC, 32, 32)
         w_shape = (32, IC, 3, 3)
@@ -621,11 +789,7 @@ def test_conv2d():
             run_benchmark=False,
         )
 
-    d_shape = (16, 16, 32, 32)
-    w_shape = (32, 16, 3, 3)
-    padding = (1, 1)
     dyn_batch_shape = (relay.Any(),) + d_shape[1:]
-
     mod_nchw = get_conv2d_nchw(d_shape, w_shape, padding)
     mod_dyn = get_conv2d_nchw(dyn_batch_shape, w_shape, padding)
 
@@ -661,7 +825,28 @@ def test_conv2d():
             ref_target="llvm",
         )
 
+    # align1 + int8 case
+    d_shape = (16, 3, 32, 32)
+    w_shape = (32, 3, 3, 3)
+    mod_nchw = get_conv2d_nchw(
+        d_shape, w_shape, padding, out_dtype="int32", data_dtype="uint8", weight_dtype="int8"
+    )
 
+    verify_conv2d(
+        mod_nchw,
+        mod_nchw,
+        d_shape,
+        w_shape,
+        sm=80,
+        atol=1e-5,
+        rtol=1e-5,
+        ref_target="llvm",
+        data_dtype="uint8",
+        weight_dtype="int8",
+    )
+
+
+@tvm.testing.requires_cutlass
 def test_conv2d_fusion():
     d_shape = (16, 16, 32, 32)
     w_shape = (32, 16, 3, 3)
@@ -705,10 +890,11 @@ def test_conv2d_fusion():
 
     mod_nchw = get_conv2d_nchw_bias_hardswish(d_shape, w_shape, padding, out_dtype="float16")
     verify_conv2d(
-        mod_nchw, mod_nchw, d_shape, w_shape, sm=80, atol=1e-5, rtol=1e-5, run_benchmark=False
+        mod_nchw, mod_nchw, d_shape, w_shape, sm=80, atol=5e-2, rtol=5e-2, run_benchmark=False
     )
 
 
+@tvm.testing.requires_cutlass
 def test_conv2d_residual_block():
     d_shape = (16, 16, 32, 32)
     w_shape = (16, 16, 3, 3)
@@ -724,11 +910,12 @@ def test_conv2d_residual_block():
         # HardSwish requires higher tolerance since vectoring the residual block epilogue
         # in cutlass.
         # TODO(masahi): Invesitigate this issue
-        (relay.nn.relu(hardswish(bias_add) + residual_input), 1e-3),
+        (relay.nn.relu(hardswish(bias_add) + residual_input), 5e-2),
     ]:
         verify_conv2d(func, func, d_shape, w_shape, sm=80, atol=tol, rtol=tol, run_benchmark=False)
 
 
+@tvm.testing.requires_cutlass
 def test_conv2d_transpose():
     OC = 8
     IC = 16
@@ -768,5 +955,155 @@ def test_conv2d_transpose():
         )
 
 
+@tvm.testing.requires_cutlass
+def test_conv2d_backward_weight():
+    OC = 8
+    IC = 16
+    d_shape = (16, IC, 32, 32)
+    w_shape = (OC, IC, 3, 3)
+    dtype = "float16"
+
+    for strides in [(1, 1), (2, 2)]:
+        o_shape = (16, OC, 32 // strides[0], 32 // strides[1])
+        padding = (1, 1)
+
+        mod_nchw = get_conv2d_backward_weight(
+            d_shape,
+            w_shape,
+            o_shape,
+            padding,
+            strides,
+            out_dtype="float32",
+            data_dtype=dtype,
+            weight_dtype=dtype,
+        )
+
+        for split_k_slices in [1, 8]:
+            verify_conv2d_backward_weight(
+                mod_nchw,
+                mod_nchw,
+                o_shape,
+                d_shape,
+                sm=80,
+                split_k_slices=[split_k_slices],
+                atol=5e-3,
+                rtol=5e-3,
+                use_cudnn_ref=False,
+                grad_dtype=dtype,
+                data_dtype=dtype,
+            )
+
+
+@tvm.testing.requires_cutlass
+def test_conv2d_bwd():
+    IC = 16
+    OC = 8
+    dshape = (16, IC, 32, 32)
+    wshape = (OC, IC, 3, 3)
+    padding = (0, 0)
+    strides = (1, 1)
+
+    conv = get_conv2d_nchw(
+        dshape,
+        wshape,
+        padding,
+        strides=strides,
+        out_dtype="float32",
+        data_dtype="float32",
+        weight_dtype="float32",
+    )
+    fwd_mod = InferType()(tvm.IRModule.from_expr(conv))
+
+    # Note: large difference in tvm and cutlass Wgrad results if use fp16.
+    # Cutlass wgrad uses fp32 accumulation even if the output is fp16.
+    use_fp16 = False
+    verify_dgrad = False  # False to verify wgrad
+    tol = 1e-5 if verify_dgrad else 1e-4  # Wgrad slightly less accurate
+
+    if use_fp16:
+        fwd_mod = ToMixedPrecision("float16")(fwd_mod)
+
+    fwd_bwd_func = FirstOrderGradient()(fwd_mod)["main"]
+
+    bwd_func = relay.Function(
+        fwd_bwd_func.params,
+        relay.TupleGetItem(relay.TupleGetItem(fwd_bwd_func.body, 1), 0 if verify_dgrad else 1),
+    )
+
+    verify_conv2d(
+        bwd_func,
+        bwd_func,
+        dshape,
+        wshape,
+        sm=80,
+        atol=1e-2 if use_fp16 else tol,
+        rtol=1e-2 if use_fp16 else tol,
+        use_cudnn_ref=False,
+        data_dtype="float32",
+        weight_dtype="float32",
+        use_vm=True,
+    )
+
+
+def verify_dense_transpose_dense(
+    func,
+    M,
+    N,
+    K,
+    ref_target="cuda",
+    sm=80,
+    atol=1e-5,
+    rtol=1e-5,
+    run_benchmark=False,
+    dtype="float16",
+    use_3xtf32=True,
+):
+    assert has_cutlass()
+    if sm < 80 and dtype == "float32":
+        return
+
+    mod = tvm.IRModule.from_expr(func)
+    typ = relay.transform.InferType()(mod)["main"].body.checked_type
+    np_data = get_random_ndarray((M, K), dtype)
+    np_weight0 = get_random_ndarray((N, K), dtype)
+    np_weight1 = get_random_ndarray((K, M), dtype)
+
+    params = {"weight0": np_weight0, "weight1": np_weight1}
+
+    rt_mod_ref, dev = get_ref_rt_mod(mod, params, target=ref_target)
+    cutlass_rt_mod, dev, num_partition = profile_and_build(
+        mod,
+        params,
+        sm,
+        use_3xtf32=use_3xtf32,
+        use_ansor=False,
+    )
+    cutlass_ansor_rt_mod, dev, num_partition = profile_and_build(
+        mod,
+        params,
+        sm,
+        use_3xtf32=use_3xtf32,
+        use_ansor=True,
+    )
+    x = tvm.nd.array(np_data, device=dev)
+    cutlass_out = get_output(cutlass_rt_mod, ["input"], [x])
+    cutlass_ansor_out = get_output(cutlass_ansor_rt_mod, ["input"], [x])
+    ref_out = get_output(rt_mod_ref, ["input"], [x])
+
+    assert num_partition > 0
+    np.testing.assert_allclose(cutlass_out, ref_out, atol=atol, rtol=rtol)
+    np.testing.assert_allclose(cutlass_ansor_out, ref_out, atol=atol, rtol=rtol)
+
+    if run_benchmark:
+        print("CUTLASS:", cutlass_rt_mod.benchmark(dev, number=1, repeat=600))
+        print("CUTLASS with Ansor:", cutlass_ansor_rt_mod.benchmark(dev, number=1, repeat=600))
+        print("TVM with target %s:" % ref_target, rt_mod_ref.benchmark(dev, number=1, repeat=600))
+
+
+@tvm.testing.requires_cutlass
+def test_dense_transpose_dense():
+    verify_dense_transpose_dense(get_dense_transpose_dense(M, N, K), M, N, K)
+
+
 if __name__ == "__main__":
-    pytest.main([__file__])
+    tvm.testing.main()

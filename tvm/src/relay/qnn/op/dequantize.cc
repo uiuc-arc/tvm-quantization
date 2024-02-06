@@ -47,26 +47,30 @@ bool DequantizeRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
 
   const auto input_dtype = data->dtype;
   ICHECK(input_dtype == DataType::Int(8) || input_dtype == DataType::UInt(8) ||
+         input_dtype == DataType::Int(16) || input_dtype == DataType::UInt(16) ||
          input_dtype == DataType::Int(32))
-      << "Input type should be one of the quantized types [unit8, int8, int32] but was "
-      << input_dtype;
+      << "Input type should be one of the quantized types [int8, unit8, int16, uint16, int32] but "
+      << "was " << input_dtype;
 
   const auto* dequantize_attrs = attrs.as<DequantizeAttrs>();
   int axis = dequantize_attrs->axis;
   auto rank = static_cast<int>(data->shape.size());
   axis = (axis < 0) ? ((rank > 0) ? data->shape.size() + axis : 0) : axis;
 
-  // If zero point and scale are scalar then axis doesnt matter.
-  bool scale_is_scalar = (types[1].as<TensorTypeNode>())->shape.size() == 0;
-  bool zp_is_scalar = (types[2].as<TensorTypeNode>())->shape.size() == 0;
+  // If zero point and scale are scalar or have arbitrary rank with one element,
+  // then axis doesn't matter.
+  bool scale_is_scalar = (types[1].as<TensorTypeNode>())->shape.size() == 0 ||
+                         get_const_int((types[1].as<TensorTypeNode>())->Size()) == 1;
+  bool zp_is_scalar = (types[2].as<TensorTypeNode>())->shape.size() == 0 ||
+                      get_const_int((types[2].as<TensorTypeNode>())->Size()) == 1;
 
-  if (!(scale_is_scalar && zp_is_scalar)) {
+  if (!scale_is_scalar || !zp_is_scalar) {
     ICHECK_LT(axis, rank > 0 ? rank : 1) << "axis " << dequantize_attrs->axis << " is out of range";
     ICHECK_GE(axis, 0) << "axis " << dequantize_attrs->axis << " is out of range";
   }
 
   PrimExpr axis_shape;
-  if (rank > 0) {
+  if (!scale_is_scalar || !zp_is_scalar) {
     axis_shape = data->shape[axis];
   } else {
     axis_shape = Integer(1);
@@ -74,18 +78,24 @@ bool DequantizeRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
   // Check and assign types for scale and zero points.
   AssignType(types[1], DataType::Float(32), axis_shape, reporter);  // scale
   AssignType(types[2], DataType::Int(32), axis_shape, reporter);    // zero point
+
   const Array<tvm::PrimExpr> oshape = data->shape;
-  // assign output type, output will always be float 32.
-  reporter->Assign(types[3], TensorType(oshape, DataType::Float(32)));
+  const DataType out_dtype = dequantize_attrs->out_dtype;
+  ICHECK(out_dtype == DataType::Float(16) || out_dtype == DataType::Float(32))
+      << "Output type should be one of [float16, float32] but was " << out_dtype;
+  // assign output type.
+  reporter->Assign(types[3], TensorType(oshape, out_dtype));
   return true;
 }
 
-Expr MakeDequantize(Expr data, Expr input_scale, Expr input_zero_point, int axis) {
+Expr MakeDequantize(Expr data, Expr input_scale, Expr input_zero_point, int axis,
+                    DataType out_dtype) {
   // real_value = scale * (quantized_value - zero_point)
   // A more detailed explanation can be found here -
   // https://github.com/google/gemmlowp/blob/master/doc/quantization.md
   auto attrs = make_object<DequantizeAttrs>();
   attrs->axis = axis;
+  attrs->out_dtype = out_dtype;
   static const Op& op = Op::Get("qnn.dequantize");
   return Call(op, {data, input_scale, input_zero_point}, Attrs(attrs), {});
 }
@@ -122,7 +132,14 @@ Expr DequantizeLower(const Expr& input_tensor, const Expr& input_scale,
 
   auto shift = Subtract(Cast(input_tensor, DataType::Int(32)), expanded_input_zero_point);
   auto scaled_output = Multiply(Cast(shift, DataType::Float(32)), expanded_input_scale);
-  return scaled_output;
+
+  const DataType out_dtype = attrs->out_dtype;
+  if (out_dtype.is_float() && out_dtype.bits() == 32) return scaled_output;
+
+  double min_val = tvm::min_value(out_dtype).as<FloatImmNode>()->value;
+  double max_val = tvm::max_value(out_dtype).as<FloatImmNode>()->value;
+  auto clamped_output = Clip(scaled_output, min_val, max_val);
+  return Cast(clamped_output, out_dtype);
 }
 
 Expr DequantizeQnnCanonicalize(const Attrs& attrs, const Array<Expr>& new_args,

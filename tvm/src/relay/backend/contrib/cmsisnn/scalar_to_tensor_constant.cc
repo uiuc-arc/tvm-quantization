@@ -67,19 +67,14 @@ class ScalarToTensorConstantMutator : public MixedModeMutator {
     Expr final_call = post;
     call = post.as<CallNode>();
 
-    // Create a new variable argument that is of the same shape as the neighbouring argument
-    // in the binary op. This needs to be done only when one of the arguments is a scalar.
+    // Substitute scalar variable with a tensor variable.
     if (call->op.as<OpNode>()) {
       final_call = ReplaceScalarWithTensorVariable(GetRef<Call>(call));
     }
 
-    if (auto* glob_var_node = call->op.as<GlobalVarNode>()) {
-      GlobalVar global_var = GetRef<GlobalVar>(glob_var_node);
+    if (auto opt = call->op.as<GlobalVar>()) {
+      GlobalVar global_var = opt.value();
       Function func = Downcast<Function>(mod_->Lookup(global_var));
-      auto compiler_name = func->GetAttr<String>(::tvm::relay::attr::kCompiler);
-      if (!compiler_name.defined() || compiler_name != "cmsis-nn") {
-        return final_call;
-      }
       auto new_body = VisitExpr(func->body);
       if (new_body.same_as(func->body)) {
         return final_call;
@@ -88,65 +83,82 @@ class ScalarToTensorConstantMutator : public MixedModeMutator {
                                      FreeTypeVars(new_body, mod_), func->attrs);
       mod_->Update(global_var, new_func);
       final_call = Call(global_var, call->args);
+      final_call->span = call->span;
     }
 
-    // Substitute scalar constant with a tensor constant in the call to composite function
-    // comprising partitioned binary ops. Shape of the new constant should be same as its
-    // neighbouring tensor's shape.
-    if (auto* func_node = call->op.as<FunctionNode>()) {
-      Function func = GetRef<Function>(func_node);
-      auto func_name = func->GetAttr<String>(attr::kComposite);
-      if (func_name.defined() &&
-          (func_name == "cmsis-nn.qnn_add" || func_name == "cmsis-nn.qnn_mul")) {
-        final_call = ReplaceScalarWithTensorConstant(GetRef<Call>(call), func);
-      }
+    // Substitute scalar constant with tensor constant in the call to composite function.
+    if (auto func = call->op.as<Function>()) {
+      final_call = ReplaceScalarWithTensorConstant(GetRef<Call>(call), func.value());
     }
 
     return final_call;
   }
 
-  // Replaces scalar variable with a tensor variable with same shape as that of the neibouring
-  // operand tensor in a binary op
+  // Checks if expr can undergo scalar to tensor replacement
+  bool WorthyOfScalarToTensorReplacement(const Expr& expr) {
+    if (const CallNode* call = expr.as<CallNode>()) {
+      if (const OpNode* opnode = call->op.as<OpNode>()) {
+        if (opnode->name == "qnn.add" || opnode->name == "qnn.mul") {
+          return true;
+        }
+      }
+    }
+    if (const FunctionNode* func = expr.as<FunctionNode>()) {
+      auto func_name = func->GetAttr<String>(attr::kComposite);
+      if (func_name.defined() &&
+          (func_name == "cmsis-nn.qnn_add" || func_name == "cmsis-nn.qnn_mul")) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Replaces scalar variable with a tensor variable with same shape as that of the neighbouring
+  // operand tensor in a binary op (add or multiply supported via CMSIS-NN path). This applies only
+  // to 1st and 2nd arguments of the ops.
   Call ReplaceScalarWithTensorVariable(Call call) {
-    const OpNode* opnode = call->op.as<OpNode>();
-    if (opnode == nullptr) {
+    // Returns if the operands of the binary operator come from the same input.
+    if (!WorthyOfScalarToTensorReplacement(call) || call->args.size() < 2) {
       return call;
     }
-    String op_name = opnode->name;
-    Array<Expr> new_args;
-    for (uint32_t i = 0; i < call->args.size(); ++i) {
-      Expr arg = call->args[i];
-      new_args.push_back(arg);
-      if (!arg->checked_type_.defined()) {
+    Array<Expr> new_args(call->args);
+    for (uint32_t i = 0; i < 2; ++i) {
+      Expr scalar_arg = call->args[i];
+      if (!scalar_arg->IsInstance<VarNode>() || !scalar_arg->checked_type_.defined() ||
+          !scalar_arg->checked_type_->IsInstance<TensorTypeNode>()) {
         continue;
       }
-      auto* arg_type = arg->type_as<TensorTypeNode>();
-      if (arg_type->shape.size() != 0 || arg.as<ConstantNode>()) {
+      Array<PrimExpr> scalar_shape = scalar_arg->type_as<TensorTypeNode>()->shape;
+      if (scalar_shape.size() != 0) {
         continue;
       }
-      String arg_name = arg.as<VarNode>()->name_hint();
       int tensor_arg_id = (i + 1) % 2;
       Expr tensor_arg = call->args[tensor_arg_id];
       if (!tensor_arg->checked_type_.defined()) {
         continue;
       }
-      TensorType tensor_type = GetRef<TensorType>(tensor_arg->type_as<TensorTypeNode>());
-      new_args.Set(i, Var(arg_name, tensor_type));
+      String arg_name = scalar_arg.as<VarNode>()->name_hint();
+      new_args.Set(i, Var(arg_name, tensor_arg->checked_type_));
     }
-    return Call(call->op, new_args, call->attrs, {});
+    return Call(call->op, new_args, call->attrs, {}, call->span);
   }
 
-  // Makes tensor constant of same shape as tensor_arg with values from scalar_arg
+  // Replaces scalar constant with a tensor constant with same shape as that of the neighbouring
+  // operand tensor in a binary op (add or multiply supported via CMSIS-NN path). This applies only
+  // to 1st and 2nd arguments of the ops.
   Call ReplaceScalarWithTensorConstant(Call call, Function func) {
-    Array<Expr> new_args;
-    for (uint32_t i = 0; i < call->args.size(); ++i) {
-      new_args.push_back(call->args[i]);
+    // Returns if the operands of the binary operator come from the same input.
+    if (!WorthyOfScalarToTensorReplacement(func) || call->args.size() < 2) {
+      return call;
+    }
+    Array<Expr> new_args(call->args);
+    for (uint32_t i = 0; i < 2; ++i) {
       Expr scalar_arg = call->args[i];
       if (!scalar_arg->checked_type_.defined()) {
         continue;
       }
       Array<PrimExpr> scalar_shape = scalar_arg->type_as<TensorTypeNode>()->shape;
-      if (scalar_shape.size() != 0 || scalar_arg.as<ConstantNode>() == nullptr) {
+      if (scalar_shape.size() != 0 || !scalar_arg->IsInstance<ConstantNode>()) {
         continue;
       }
       int tensor_arg_id = (i + 1) % 2;
@@ -169,7 +181,13 @@ class ScalarToTensorConstantMutator : public MixedModeMutator {
     auto new_body = VisitExpr(func->body);
     Function new_func = WithFields(func, FreeVars(new_body), new_body, func->ret_type,
                                    FreeTypeVars(new_body, mod_), func->attrs);
-    return Call(new_func, new_args);
+
+    // Updating new_func parameters could result into uniquification of function parameters.
+    // Call arguments need to be aligned to the number of arguments expected by new_func.
+    if (new_args[0].same_as(new_args[1])) {
+      new_args.erase(new_args.begin());
+    }
+    return Call(new_func, new_args, Attrs(), {}, call->span);
   }
 
  private:
@@ -177,14 +195,22 @@ class ScalarToTensorConstantMutator : public MixedModeMutator {
 };
 
 IRModule ScalarToTensorConstant(const IRModule& mod) {
-  auto mutator = ScalarToTensorConstantMutator(mod);
-  Function main_func = Downcast<Function>(mod->Lookup("main"));
-  auto new_main_body = mutator.VisitExpr(main_func->body);
-  if (!new_main_body.same_as(main_func->body)) {
-    auto main_var = mod->GetGlobalVar("main");
-    auto new_main_func = Function(main_func->params, new_main_body, main_func->ret_type,
-                                  main_func->type_params, main_func->attrs);
-    mod->Update(main_var, new_main_func);
+  for (auto gv : mod->GetGlobalVars()) {
+    Function func = Downcast<Function>(mod->Lookup(gv));
+
+    // only mutate CMSIS-NN external functions
+    auto compiler_name = func->GetAttr<String>(attr::kCompiler);
+    if (!compiler_name.defined() || compiler_name != "cmsis-nn") {
+      continue;
+    }
+
+    auto mutator = ScalarToTensorConstantMutator(mod);
+    auto new_func_body = mutator.VisitExpr(func->body);
+    if (!new_func_body.same_as(func->body)) {
+      Function new_func =
+          Function(func->params, new_func_body, func->ret_type, func->type_params, func->attrs);
+      mod->Update(gv, new_func);
+    }
   }
   return mod;
 }

@@ -1,24 +1,30 @@
 /***************************************************************************************************
- * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
@@ -29,9 +35,49 @@
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// Gets a CUDA device
+cudaDeviceProp GetCudaDevice() {
+
+  cudaError_t err;
+
+  int cudaDeviceId;
+  err = cudaGetDevice(&cudaDeviceId);
+  if (cudaSuccess != err) {
+    std::cerr << "*** Error: Could not detect active GPU device ID"
+              << " [" << cudaGetErrorString(err) << "]" << std::endl;
+    exit(1);
+  }
+
+  cudaDeviceProp deviceProperties;
+  err = cudaGetDeviceProperties(&deviceProperties, cudaDeviceId);
+
+  return deviceProperties;
+}
+
+/// Prints device properties
+std::ostream &operator<<(std::ostream &out, cudaDeviceProp const &deviceProperties) {
+
+  int deviceMajorMinor = deviceProperties.major * 10 + deviceProperties.minor;
+  if (deviceMajorMinor) {
+    int32_t clock_MHz = deviceProperties.clockRate / 1000;
+    out << "GPU(compute_"
+      << deviceMajorMinor << ", "
+      << deviceProperties.multiProcessorCount << " SMs @ " << clock_MHz << " MHz)";
+  }
+  else {
+    out << "No CUDA device.";
+  }
+
+  return out;
+}
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
 /// Sets flags for Unit test
 void FilterArchitecture() {
   // Default flags can be overwritten by --gtest_filter from commandline
+
+  int const kMaxDevice = 999;
+
   cudaError_t err;
 
   int cudaDeviceId;
@@ -51,7 +97,6 @@ void FilterArchitecture() {
   }
 
   int deviceMajorMinor = deviceProperties.major * 10 + deviceProperties.minor;
-  int const kMaxDevice = 999;
 
   // Defines text filters for each GEMM kernel based on minimum supported compute capability
   struct {
@@ -72,6 +117,7 @@ void FilterArchitecture() {
     { "SM70*",                      70, 75},
     { "SM75*",                      75, kMaxDevice},
     { "SM80*",                      80, kMaxDevice},
+    { "SM90*",                      90, 90        },
     { 0, 0, false }
   };
 

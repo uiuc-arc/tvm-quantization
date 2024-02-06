@@ -33,6 +33,7 @@
 #include <utility>
 #include <vector>
 
+#include "block_config.h"
 #include "cascader_options.h"
 #include "common.h"
 #include "graph.h"
@@ -70,6 +71,21 @@ std::vector<std::vector<T>> EnumerateCombinations(std::vector<std::vector<T>> va
   return new_combs;
 }
 
+float GetTransferEfficiency(const Tensor& tensor, const std::vector<int>& block_shape,
+                            const MemoryRegion& memory) {
+  // The block_shape represents the shape of the data transfer required for each job. This is used
+  // to calculate how much of the block_shape is contiguous in memory (source memory for a read or
+  // destination memory for a write) and subsequently calculate how efficient each memory burst is.
+  const auto& shape = tensor->GetShape();
+  int burst_length = block_shape[block_shape.size() - 1];
+  if (block_shape[block_shape.size() - 1] == shape[shape.size() - 1]) {
+    burst_length *= block_shape[block_shape.size() - 2];
+  }
+
+  burst_length *= tensor->GetDataType().bytes();
+  return static_cast<float>(memory->burst_length) / std::min(burst_length, memory->burst_length);
+}
+
 std::vector<bool> GetCascadableAxes(const Part& part) {
   std::vector<bool> cascadable_axes(part->GetOutputTensor()->GetShape().size());
   // Check all the propagators to see if an output axis is projected into any
@@ -89,7 +105,9 @@ std::vector<bool> GetCascadableAxes(const Part& part) {
   return cascadable_axes;
 }
 
-std::vector<StripeConfig> GenerateOutputStripeConfigs(const Part& part, int stripe_factors) {
+std::vector<StripeConfig> GenerateOutputStripeConfigs(const Part& part, int stripe_factors,
+                                                      bool enable_striping,
+                                                      bool multi_dimensional) {
   // If stripe_factors is <= 0, then we won't produce any StripeConfigs
   if (stripe_factors <= 0) {
     return std::vector<StripeConfig>();
@@ -118,7 +136,7 @@ std::vector<StripeConfig> GenerateOutputStripeConfigs(const Part& part, int stri
     auto axis = output_shape[i];
     auto axis_align = part->GetStripeAlignHint()[i];
     std::set<int> axis_splits;  // Note this is a set to remove duplicate splits
-    if (!cascadable_axes[i]) {
+    if (!cascadable_axes[i] || (!enable_striping)) {
       axis_splits.insert(axis);
     } else {
       for (float factor : factors) {
@@ -130,11 +148,29 @@ std::vector<StripeConfig> GenerateOutputStripeConfigs(const Part& part, int stri
     }
     splits.push_back(std::vector<int>(axis_splits.begin(), axis_splits.end()));
   }
-  // Now calculate all the possible combinations of splits for each dimension
-  // to give us all the possible stripe shapes. For example, if we had two axes
-  // both with possible splits in {128, 64, 32, 1}, the stripe shapes would be:
-  // (128, 128), (128, 64), (128, 32) ... (1, 64), (1, 32), (1, 1)
-  auto stripe_shapes = EnumerateCombinations<int>(splits);
+
+  std::vector<std::vector<int>> stripe_shapes;
+  if (multi_dimensional) {
+    // Now calculate all the possible combinations of splits for each dimension
+    // to give us all the possible stripe shapes. For example, if we had two axes
+    // both with possible splits in {128, 64, 32, 1}, the stripe shapes would be:
+    // (128, 128), (128, 64), (128, 32) ... (1, 64), (1, 32), (1, 1)
+    stripe_shapes = EnumerateCombinations<int>(splits);
+  } else {
+    // Only consider splitting a single axis
+    int axis = 0;
+    for (const auto& split : splits) {
+      for (const auto& axis_split : split) {
+        std::vector<int> stripe_shape = output_shape;
+        if (stripe_shape[axis] != axis_split) {
+          stripe_shape[axis] = axis_split;
+          stripe_shapes.push_back(stripe_shape);
+        }
+      }
+      axis++;
+    }
+    stripe_shapes.push_back(output_shape);
+  }
   auto offset = std::vector<int>(output_dims);
   std::vector<StripeConfig> stripe_configs;
   // Calculate the possible axis orderings such that each axis has the opportunity
@@ -265,6 +301,42 @@ int GetInteriorMemoryUsage(const std::vector<TensorConfig>& input_configs,
   return memory_usage;
 }
 
+/**
+ * \brief Returns a hint estimating the number of cycles required for
+ * the copy specified by tensor_config.
+ *
+ * \param tensor_config  The tensor configuration to estimate.
+ * \return mem2mem_cycles Total estimated cycles.
+ * \return initial_mem2mem_cycles Estimated cycles for the first block.
+ */
+std::pair<int, int> GetCopyCyclesHint(const TensorConfig& tensor_config) {
+  Tensor tensor = tensor_config->GetTensor();
+  MemoryRegion home_region = tensor_config->GetHomeRegion();
+  MemoryRegion copy_region = tensor_config->GetCopyRegion();
+  int initial_mem2mem_cycles = 0;
+  int mem2mem_cycles = 0;
+
+  // This Tensor needs to be copied - Count stripes for this config
+  for (const auto& stripe_config : tensor_config->GetStripeConfigs()) {
+    std::map<std::vector<int>, int> input_blocks = CountStripes(stripe_config, true);
+    bool first_block = true;
+    for (const auto& block : input_blocks) {
+      int bytes_transferred = mul_reduce(block.first) * tensor->GetDataType().bytes() *
+                              tensor->GetCompressionRatio() * block.second;
+      int read_cycles = bytes_transferred * home_region->read_bandwidth + home_region->read_latency;
+      int write_cycles = bytes_transferred * copy_region->write_bandwidth;
+
+      if (first_block) {
+        first_block = false;
+        initial_mem2mem_cycles += std::max(read_cycles, write_cycles);
+      }
+      mem2mem_cycles += std::max(read_cycles, write_cycles);
+    }
+  }
+
+  return {mem2mem_cycles, initial_mem2mem_cycles};
+}
+
 std::vector<Plan> GenerateSinglePlans(
     const Part& part, const std::vector<StripeConfig>& output_stripe_configs,
     const std::unordered_map<Tensor, std::vector<MemoryRegion>, ObjectPtrHash, ObjectPtrEqual>&
@@ -322,6 +394,7 @@ std::vector<Plan> GenerateSinglePlans(
         int bandwidth_cycles = 0;
         int compute_cycles = 0;
         int mem2mem_cycles = 0;
+        int initial_mem2mem_cycles = 0;
 
         // Pick the correct performance info based on the BufferMode
         PerformanceInfo perf_info;
@@ -332,32 +405,36 @@ std::vector<Plan> GenerateSinglePlans(
         }
         // Calculate the bandwidth cycles by multiplying the bytes read/written by the
         // bandwidth of the memories
+        BlockConfig block_config = perf_info->block_config;
         for (size_t i = 0; i < input_configs.size(); i++) {
-          bandwidth_cycles +=
-              perf_info->read_bytes[i] / input_configs[i]->GetCopyRegion()->read_bandwidth;
+          Tensor tensor = input_configs[i]->GetTensor();
+          MemoryRegion copy_region = input_configs[i]->GetCopyRegion();
+
           if (input_configs[i]->DoCopy()) {
-            // This Tensor needs to be copied - Count stripes for this config
-            Tensor tensor = input_configs[i]->GetTensor();
-            for (const auto& stripe_config : input_configs[i]->GetStripeConfigs()) {
-              std::map<std::vector<int>, int> input_blocks = CountStripes(stripe_config, true);
-              for (const auto& block : input_blocks) {
-                int bytes_transferred = mul_reduce(block.first) * tensor->GetDataType().bytes() *
-                                        tensor->GetCompressionRatio() * block.second;
-                int read_cycles =
-                    bytes_transferred * input_configs[i]->GetHomeRegion()->read_bandwidth;
-                int write_cycles =
-                    bytes_transferred * input_configs[i]->GetCopyRegion()->write_bandwidth;
-                mem2mem_cycles += std::max(read_cycles, write_cycles);
-              }
-            }
+            std::pair<int, int> ret = GetCopyCyclesHint(input_configs[i]);
+            mem2mem_cycles += ret.first;
+            initial_mem2mem_cycles += ret.second;
           }
+          float read_efficiency =
+              GetTransferEfficiency(tensor, block_config->GetInputBlockShape(), copy_region);
+          bandwidth_cycles +=
+              (perf_info->read_bytes[i] / copy_region->read_bandwidth) * read_efficiency;
         }
+        MemoryRegion write_region = output_config->GetCopyRegion();
+        float write_efficiency = GetTransferEfficiency(
+            output_config->GetTensor(), block_config->GetOutputBlockShape(), write_region);
+
         bandwidth_cycles +=
-            perf_info->write_bytes / output_config->GetCopyRegion()->write_bandwidth;
+            perf_info->write_bytes / write_region->write_bandwidth * write_efficiency;
         compute_cycles = perf_info->compute_cycles;
         // Take the max of compute and bandwidth cycles as we assume compute cycles
         // can hide memory latency
         int cycles = std::max(std::max(compute_cycles, bandwidth_cycles), mem2mem_cycles);
+        if (cycles > mem2mem_cycles) {
+          // NPU cycles are the bottleneck - add initial mem2mem transfer cycles
+          cycles += initial_mem2mem_cycles;
+        }
+
         int memory_usage =
             GetInteriorMemoryUsage(input_configs, output_config, options->cascade_region);
         plans.push_back(Plan(tensor_configs, open_configs, output_config, part_group,
@@ -399,7 +476,8 @@ std::unordered_map<std::vector<Part>, std::vector<Plan>> GenerateGraphPlans(
     // output of a Plan. The number generated is a function of stripe_factors and the number of
     // cascadable dimensions in the Part.
     std::vector<StripeConfig> stripe_configs =
-        GenerateOutputStripeConfigs(part, options->stripe_factors);
+        GenerateOutputStripeConfigs(part, options->stripe_factors, options->enable_striping,
+                                    options->enable_multi_dimensional_striping);
     // Check to see if the output Tensor is part of any existing open Plans
     if (stripe_configs_by_tensor.find(part->GetOutputTensor()) != stripe_configs_by_tensor.end()) {
       // If there are other open Plans which have this Part's output Tensor as an input, then
@@ -453,10 +531,12 @@ std::unordered_map<std::vector<Part>, std::vector<Plan>> GenerateGraphPlans(
     // and plans_by_config maps.
     for (const auto& part_group : new_part_groups) {
       if (closed_plans.find(part_group) != closed_plans.end()) {
-        closed_plans[part_group] = ParetoCullPlans(closed_plans.at(part_group), 32);
+        closed_plans[part_group] = ParetoCullPlans(
+            closed_plans.at(part_group), options->max_closed_plans, options->disable_pareto_plans);
       }
       for (const auto& it : open_plans[part_group]) {
-        auto pareto_plans = ParetoCullPlans(it.second, 8);
+        auto pareto_plans =
+            ParetoCullPlans(it.second, options->max_open_plans, options->disable_pareto_plans);
         for (const auto& plan : pareto_plans) {
           for (const auto& open_config : plan->GetOpenConfigs()) {
             if (open_config != plan->GetOutputConfig()) {
@@ -477,11 +557,13 @@ std::unordered_map<std::vector<Part>, std::vector<Plan>> GenerateGraphPlans(
 }
 
 TVM_REGISTER_GLOBAL("contrib.ethosu.cascader.GenerateOutputStripeConfigs")
-    .set_body_typed([](Part part, int stripe_factors) {
+    .set_body_typed([](Part part, int stripe_factors, bool enable_striping,
+                       bool multi_dimensional) {
       if (stripe_factors < 0) {
         return Array<StripeConfig>();
       }
-      return Array<StripeConfig>(GenerateOutputStripeConfigs(part, stripe_factors));
+      return Array<StripeConfig>(
+          GenerateOutputStripeConfigs(part, stripe_factors, enable_striping, multi_dimensional));
     });
 
 TVM_REGISTER_GLOBAL("contrib.ethosu.cascader.GenerateSinglePlans")
@@ -521,6 +603,12 @@ TVM_REGISTER_GLOBAL("contrib.ethosu.cascader.GenerateGraphPlans")
         tclosed_plans.Set(part_arr, plan_arr);
       }
       return tclosed_plans;
+    });
+
+TVM_REGISTER_GLOBAL("contrib.ethosu.cascader.GetCopyCyclesHint")
+    .set_body_typed([](TensorConfig tensor_config) {
+      std::pair<int, int> ret = GetCopyCyclesHint(tensor_config);
+      return Array<Integer>({ret.first, ret.second});
     });
 
 }  // namespace cascader

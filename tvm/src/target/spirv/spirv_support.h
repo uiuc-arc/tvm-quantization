@@ -262,6 +262,34 @@ struct SPIRVSupport {
    * attempting to create a 64-bit int.
    */
   bool supports_int64{false};
+
+  /*!
+   * \brief Whether the driver supports operations involving integer dot product.
+   *
+   * Vulkan extension: VK_KHR_shader_integer_dot_product
+   * SPV Extension name: SPV_KHR_integer_dot_product
+   * SPV Capability: spv::CapabilityDotProductKHR,
+   *                 spv::CapabilityDotProductInput4x8BitPackedKHR);
+   *
+   * If support is present, can perform integer dot product operations.  If
+   * support is not present, codegen will throw exception on
+   * attempting to perform integer dot product.
+   */
+  bool supports_integer_dot_product{false};
+
+  /*!
+   * \brief  Whether the driver supports operations involving cooperative matrix.
+   *
+   * Vulkan extension: VK_NV_cooperative_matrix
+   * SPV Extension name: SPV_NV_cooperative_matrix
+   * SPV Capability: spv::CapabilityCooperativeMatrixNV
+   *
+   * If support is present, can perform cooperative matrix operations.  If
+   * support is not present, codegen will throw exception on
+   * attempting to perform cooperative matrix.
+   */
+
+  bool supports_cooperative_matrix{false};
 };
 
 }  // namespace codegen

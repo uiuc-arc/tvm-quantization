@@ -1,24 +1,30 @@
 /***************************************************************************************************
- * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
@@ -34,25 +40,8 @@
 #endif
 
 #if defined(__CUDACC_RTC__)
-/* All floating-point numbers can be put in one of these categories.  */
-enum
-  {
-    FP_NAN =
-# define FP_NAN 0
-      FP_NAN,
-    FP_INFINITE =
-# define FP_INFINITE 1
-      FP_INFINITE,
-    FP_ZERO =
-# define FP_ZERO 2
-      FP_ZERO,
-    FP_SUBNORMAL =
-# define FP_SUBNORMAL 3
-      FP_SUBNORMAL,
-    FP_NORMAL =
-# define FP_NORMAL 4
-      FP_NORMAL
-  };
+
+#include "cutlass/floating_point_nvrtc.h"
 
 // F16C extensions are not meaningful when compiling for NVRTC which only accommodates device code.
 #undef CUTLASS_ENABLE_F16C
@@ -73,6 +62,7 @@ enum
 #include <cuda_fp16.h>
 
 #include "cutlass/cutlass.h"
+#include "cutlass/float8.h"
 #include "cutlass/platform/platform.h"
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -366,8 +356,7 @@ struct alignas(2) half_t {
   //
 
   /// Default constructor
-  CUTLASS_HOST_DEVICE
-  half_t() : storage(0) { }
+  half_t() = default;
 
   /// Reinterpret cast from CUDA's half type
   CUTLASS_HOST_DEVICE
@@ -389,6 +378,18 @@ struct alignas(2) half_t {
   /// Floating point conversion
   CUTLASS_HOST_DEVICE
   explicit half_t(double x): half_t(float(x)) {
+
+  }
+
+  /// float_e4m3_t conversion
+  CUTLASS_HOST_DEVICE
+  explicit half_t(float_e4m3_t x): half_t(float(x)) {
+
+  }
+
+  /// float_e5m2_t conversion
+  CUTLASS_HOST_DEVICE
+  explicit half_t(float_e5m2_t x): half_t(float(x)) {
 
   }
 
@@ -612,19 +613,19 @@ struct numeric_limits<cutlass::half_t> {
   /// Returns smallest finite value
   static cutlass::half_t epsilon() { return cutlass::half_t::bitcast(0x1800); }
 
-  /// Returns smallest finite value
+  /// Returns maximum rounding error
   static cutlass::half_t round_error() { return cutlass::half_t(0.5f); }
 
-  /// Returns smallest finite value
+  /// Returns positive infinity value
   static cutlass::half_t infinity() { return cutlass::half_t::bitcast(0x7c00); }
 
-  /// Returns smallest finite value
+  /// Returns quiet NaN value
   static cutlass::half_t quiet_NaN() { return cutlass::half_t::bitcast(0x7fff); }
 
-  /// Returns smallest finite value
+  /// Returns signaling NaN value
   static cutlass::half_t signaling_NaN() { return cutlass::half_t::bitcast(0x7fff); }
 
-  /// Returns smallest finite value
+  /// Returns smallest positive subnormal value
   static cutlass::half_t denorm_min() { return cutlass::half_t::bitcast(0x0001); }
 };
 }  // namespace std
@@ -674,23 +675,23 @@ struct numeric_limits<cutlass::half_t> {
   CUTLASS_HOST_DEVICE
   static cutlass::half_t epsilon() { return cutlass::half_t::bitcast(0x1800); }
 
-  /// Returns smallest finite value
+  /// Returns maximum rounding error
   CUTLASS_HOST_DEVICE
   static cutlass::half_t round_error() { return cutlass::half_t(0.5f); }
 
-  /// Returns smallest finite value
+  /// Returns positive infinity value
   CUTLASS_HOST_DEVICE
   static cutlass::half_t infinity() { return cutlass::half_t::bitcast(0x7c00); }
 
-  /// Returns smallest finite value
+  /// Returns quiet NaN value
   CUTLASS_HOST_DEVICE
   static cutlass::half_t quiet_NaN() { return cutlass::half_t::bitcast(0x7fff); }
 
-  /// Returns smallest finite value
+  /// Returns signaling NaN value
   CUTLASS_HOST_DEVICE
   static cutlass::half_t signaling_NaN() { return cutlass::half_t::bitcast(0x7fff); }
 
-  /// Returns smallest finite value
+  /// Returns smallest positive subnormal value
   CUTLASS_HOST_DEVICE
   static cutlass::half_t denorm_min() { return cutlass::half_t::bitcast(0x0001); }
 };

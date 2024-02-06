@@ -68,7 +68,12 @@ _reg.register_injective_schedule("adv_index")
 
 
 # concatenate
-_reg.register_schedule("concatenate", strategy.schedule_concatenate)
+@_reg.register_compute("concatenate")
+def compute_concat(attrs, inputs, output_type):
+    return [topi.concatenate(inputs, attrs.axis)]
+
+
+_reg.register_strategy("concatenate", strategy.concatenate_strategy)
 
 # sliding_window
 @_reg.register_compute("sliding_window")
@@ -89,22 +94,15 @@ def compute_strided_set(attrs, inputs, output_type):
 _reg.register_injective_schedule("strided_set")
 
 # layout_transform
-_reg.register_injective_schedule("layout_transform")
+_reg.register_strategy("layout_transform", strategy.layout_transform_strategy)
 _reg.register_pattern("layout_transform", OpPattern.INJECTIVE)
 _reg.register_injective_schedule("auto_scheduler_layout_transform")
 _reg.register_pattern("auto_scheduler_layout_transform", OpPattern.INJECTIVE)
+_reg.register_injective_schedule("meta_schedule_layout_transform")
+_reg.register_pattern("meta_schedule_layout_transform", OpPattern.INJECTIVE)
 
 # argwhere
 _reg.register_strategy("argwhere", strategy.argwhere_strategy)
-
-# scatter
-@_reg.register_compute("scatter")
-def compute_scatter(attrs, inputs, output_type):
-    """Compute definition of scatter"""
-    return [topi.scatter(inputs[0], inputs[1], inputs[2], attrs.axis)]
-
-
-_reg.register_strategy("scatter", strategy.scatter_strategy)
 
 # sparse_fill_empty_rows
 @_reg.register_compute("sparse_fill_empty_rows")
@@ -140,14 +138,76 @@ def compute_reshape(attrs, inputs, output_type):
 
 _reg.register_strategy("sparse_reshape", strategy.sparse_reshape_strategy)
 
-# scatter_add
-@_reg.register_compute("scatter_add")
-def compute_scatter_add(attrs, inputs, output_type):
-    """Compute definition of scatter_add"""
-    return [topi.scatter_add(inputs[0], inputs[1], inputs[2], attrs.axis)]
+# stft
+@_reg.register_compute("stft")
+def compute_stft(attrs, inputs, output_type):
+    """Compute definition of stft"""
+    return topi.stft(
+        inputs[0],
+        attrs.n_fft,
+        attrs.hop_length,
+        attrs.win_length,
+        attrs.window,
+        attrs.normalized,
+        attrs.onesided,
+        output_type.shape,
+    )
 
 
-_reg.register_strategy("scatter_add", strategy.scatter_add_strategy)
+_reg.register_strategy("stft", strategy.stft_strategy)
+
+
+@script
+def _stft_shape_func(data, n_fft, hop_length, onesided):
+    output_shape = output_tensor((4,), "int64")
+    output_shape[0] = int64(data.shape[0])
+    if onesided:
+        output_shape[1] = int64(int64(n_fft) // int64(2)) + int64(1)
+    else:
+        output_shape[1] = int64(n_fft)
+    output_shape[2] = int64(int64(data.shape[1] - n_fft) // int64(hop_length)) + int64(1)
+    output_shape[3] = int64(2)
+    return output_shape
+
+
+@_reg.register_shape_func("stft", True)
+def stft_shape_func(attrs, inputs, _):
+    """
+    Shape func for stft.
+    """
+    return [
+        _stft_shape_func(
+            inputs[0], convert(attrs.n_fft), convert(attrs.hop_length), convert(attrs.onesided)
+        )
+    ]
+
+
+# DFT
+@_reg.register_compute("dft")
+def compute_dft(attrs, inputs, _):
+    """Compute definition of DFT"""
+    return topi.dft(
+        inputs[0],
+        inputs[1],
+        attrs.inverse,
+    )
+
+
+_reg.register_strategy("dft", strategy.dft_strategy)
+
+
+# trilu
+_reg.register_strategy("trilu", strategy.trilu_strategy)
+
+
+# scatter_elements
+@_reg.register_compute("scatter_elements")
+def compute_scatter_elements(attrs, inputs, output_type):
+    """Compute definition of scatter_elements"""
+    return [topi.scatter_elements(inputs[0], inputs[1], inputs[2], attrs.axis, attrs.reduction)]
+
+
+_reg.register_strategy("scatter_elements", strategy.scatter_elements_strategy)
 
 # scatter_nd
 @_reg.register_compute("scatter_nd")
@@ -200,10 +260,10 @@ _reg.register_shape_func("invert_permutation", False, elemwise_shape_func)
 @script
 def _arange_shape_func(start, stop, step):
     out = output_tensor((1,), "int64")
-    if step[0] < 0:
-        out[0] = int64(ceil_div((int64(start[0]) - int64(stop[0])), int64(-step[0])))
+    if step[()] < 0:
+        out[0] = int64(ceil_div((int64(start[()]) - int64(stop[()])), int64(-step[()])))
     else:
-        out[0] = int64(ceil_div((int64(stop[0]) - int64(start[0])), int64(step[0])))
+        out[0] = int64(ceil_div((int64(stop[()]) - int64(start[()])), int64(step[()])))
     return out
 
 
@@ -299,7 +359,7 @@ def _strided_slice_shape_func_with_axes(data_shape, begin, end, strides, slice_m
             else:
                 cend = cbegin + int64(end[i])
         else:
-            if end[i] > data_shape[i]:
+            if end[i] > data_shape[axes[i]]:
                 cend = dim_size
             else:
                 cend = int64(end[i])
@@ -377,8 +437,6 @@ def _concatenate_shape_func(inputs, axis):
     for i in const_range(ndim):
         if i != axis:
             out[i] = inputs[0][i]
-            for j in const_range(1, len(inputs)):
-                assert out[i] == inputs[j][i], "Dims mismatch in the inputs of concatenate."
         else:
             out[i] = int64(0)
             for j in const_range(len(inputs)):
@@ -395,7 +453,7 @@ def concatenate_shape_func(attrs, inputs, _):
 
 
 @script
-def _reshape_shape_func_input_shape(data_shape, newshape, ndim):
+def _reshape_shape_func_input_shape(data_shape, newshape, ndim, allowzero):
     out = output_tensor((ndim,), "int64")
     src_idx = 0
     dst_idx = 0
@@ -410,13 +468,17 @@ def _reshape_shape_func_input_shape(data_shape, newshape, ndim):
             src_idx += 1
             dst_idx += 1
         elif newshape[i] == 0:
-            out[dst_idx] = data_shape[src_idx]
+            if allowzero:
+                out[dst_idx] = int64(newshape[i])
+            else:
+                out[dst_idx] = data_shape[src_idx]
             src_idx += 1
             dst_idx += 1
         elif newshape[i] == -1:
             assert infer_idx < 0, "One and only one dim can be inferred"
             out[dst_idx] = int64(1)
             infer_idx = i
+            src_idx += 1
             dst_idx += 1
         elif newshape[i] == -2:
             copy = True
@@ -465,7 +527,12 @@ def _reshape_shape_func_input_shape(data_shape, newshape, ndim):
 @_reg.register_shape_func("reshape", False)
 def reshape_shape_func(attrs, inputs, out_ndims):
     newshape = get_const_tuple(attrs.newshape)
-    return [_reshape_shape_func_input_shape(inputs[0], convert(newshape), out_ndims[0])]
+    allowzero = attrs.allowzero
+    return [
+        _reshape_shape_func_input_shape(
+            inputs[0], convert(newshape), out_ndims[0], convert(allowzero)
+        )
+    ]
 
 
 @script
@@ -504,12 +571,12 @@ def take_shape_func(attrs, inputs, out_ndims):
     batch_dims = get_const_int(attrs.batch_dims)
     data_ndim = int(inputs[0].shape[0])
     if inputs[1].shape:
-        indicies_ndim = int(inputs[1].shape[0])
+        indices_ndim = int(inputs[1].shape[0])
     if axis < 0:
         axis += data_ndim
     assert 0 <= axis < data_ndim
     if batch_dims < 0:
-        batch_dims += indicies_ndim
+        batch_dims += indices_ndim
     return [_take_with_axis_shape_func(*inputs, convert(axis), convert(batch_dims), out_ndims[0])]
 
 
@@ -615,8 +682,8 @@ def argwhere_shape_func(attrs, inputs, out_ndims):
     return ValueError("Does not support rank higher than 5 in argwhere")
 
 
-_reg.register_shape_func("scatter", False, elemwise_shape_func)
-_reg.register_shape_func("scatter_add", False, elemwise_shape_func)
+_reg.register_shape_func("scatter_elements", False, elemwise_shape_func)
+_reg.register_shape_func("scatter_nd", False, elemwise_shape_func)
 
 
 @script
@@ -857,7 +924,9 @@ def squeeze_shape_func(attrs, inputs, _):
     keep_axes = []
     remove_axes = []
     if axis is not None:
-        for i in range(inputs[0].shape[0].value):
+        ndim = inputs[0].shape[0].value
+        axis = [i + ndim if i < 0 else i for i in axis]
+        for i in range(ndim):
             if i not in axis:
                 keep_axes.append(i)
             else:

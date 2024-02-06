@@ -1,24 +1,30 @@
 /***************************************************************************************************
- * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
@@ -61,6 +67,7 @@ Conv2dOperationProfiler::Conv2dOperationProfiler(Options const &options):
       {ArgumentTypeID::kInteger, {"s", "filter_s"}, "Filter S dimension of the Conv2d problem space"},
       {ArgumentTypeID::kInteger, {"p", "output_p"}, "Output P dimension of the Conv2d problem space"},
       {ArgumentTypeID::kInteger, {"q", "output_q"}, "Output Q dimension of the Conv2d problem space"},
+      {ArgumentTypeID::kInteger, {"g", "groups"}, "Number of convolution groups"},
       {ArgumentTypeID::kInteger, {"pad_h"}, "Padding in H direction"},
       {ArgumentTypeID::kInteger, {"pad_w"}, "Padding in W direction"},
       {ArgumentTypeID::kInteger, {"stride_h"}, "Stride in H direction"},
@@ -107,8 +114,8 @@ void Conv2dOperationProfiler::print_examples(std::ostream &out) const {
             " --Activation=f16:nhwc --Filter=f16:nhwc --Output=f16 --accumulator-type=f32"
             " --n=32 --h=14 --w=14 --c=8 --k=64 --r=3 --s=3"
             " --pad_h=1 --pad_w=1"
-            " --stride::h=1 --stride::w=1"
-            " --dilation::h=1 --dilation::w=1\n\n";
+            " --stride_h=1 --stride_w=1"
+            " --dilation_h=1 --dilation_w=1\n\n";
 }
 
 #if 0
@@ -225,6 +232,11 @@ Status Conv2dOperationProfiler::initialize_configuration(
   if (!arg_as_int(problem_.s, "s", problem_space, problem)) {
     // default value
     problem_.s = 3;
+  }
+
+  if (!arg_as_int(problem_.groups, "g", problem_space, problem)) {
+    // default value
+    problem_.groups = 1;
   }
 
   if (!arg_as_int(problem_.pad_h, "pad_h", problem_space, problem)) {
@@ -376,7 +388,7 @@ Status Conv2dOperationProfiler::initialize_configuration(
                                                 int(problem_.dilation_w),
                                                 static_cast<conv::Mode>(static_cast<int>(problem_.conv_mode)),
                                                 int(problem_.split_k_slices),
-                                                1 // groups
+                                                int(problem_.groups)
                                               );
   
   conv_workspace_.configuration.split_k_mode = static_cast<conv::SplitKMode>(static_cast<int>(problem_.split_k_mode));
@@ -447,6 +459,8 @@ void Conv2dOperationProfiler::initialize_result_(
   
   set_argument(result, "p", problem_space, problem_.p);
   set_argument(result, "q", problem_space, problem_.q);
+
+  set_argument(result, "g", problem_space, problem_.groups);
 
   set_argument(result, "pad_h", problem_space, problem_.pad_h);
   set_argument(result, "pad_w", problem_space, problem_.pad_w);
@@ -618,6 +632,19 @@ Status Conv2dOperationProfiler::initialize_workspace(
       conv_workspace_.problem_count
     );
 
+    if(problem_.groups == problem_.c && problem_.groups == problem_.k){
+      // Depthwise direct conv kernel needs reorder the filter.
+      conv_workspace_.reordered_B = device_context.allocate_tensor(
+        options,
+        "B",
+        operation_desc.B.element,
+        operation_desc.B.layout,
+        problem_.extent_b(operation_desc.conv_kind),
+        conv_workspace_.configuration.stride_b,
+        conv_workspace_.problem_count
+      );
+    }
+
     conv_workspace_.C = device_context.allocate_tensor(
       options,
       "C",
@@ -731,6 +758,12 @@ bool Conv2dOperationProfiler::verify_cutlass(
   conv_workspace_.arguments.alpha = problem_.alpha.data();
   conv_workspace_.arguments.beta = problem_.beta.data();
   conv_workspace_.arguments.pointer_mode = library::ScalarPointerMode::kHost;
+
+  if (conv_workspace_.reordered_B != nullptr){
+    conv_workspace_.arguments.reordered_B = conv_workspace_.reordered_B->data();
+  }else{
+    conv_workspace_.arguments.reordered_B = nullptr;
+  }
 
   conv_workspace_.Computed->copy_from_device(conv_workspace_.C->data());
   

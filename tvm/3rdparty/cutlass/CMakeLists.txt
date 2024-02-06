@@ -1,26 +1,32 @@
-# Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 #
-# Redistribution and use in source and binary forms, with or without modification, are permitted
-# provided that the following conditions are met:
-#     * Redistributions of source code must retain the above copyright notice, this list of
-#       conditions and the following disclaimer.
-#     * Redistributions in binary form must reproduce the above copyright notice, this list of
-#       conditions and the following disclaimer in the documentation and/or other materials
-#       provided with the distribution.
-#     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
-#       to endorse or promote products derived from this software without specific prior written
-#       permission.
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
 #
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
-# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
-# FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
-# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
-# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
-# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-cmake_minimum_required(VERSION 3.12.4 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 
 if(cutlass_LOADED)
   # If CUTLASS has been previously fetched and loaded, don't do it again.
@@ -31,32 +37,42 @@ else()
 endif()
 
 message(STATUS "CMake Version: ${CMAKE_VERSION}")
+set(IMPLICIT_CMAKE_CXX_STANDARD OFF CACHE BOOL "Do not explicitly specify -std=c++11 if set")
 
-project(CUTLASS VERSION 2.8.0 LANGUAGES CXX)
+project(CUTLASS VERSION 3.0.0 LANGUAGES CXX)
 include(${CMAKE_CURRENT_SOURCE_DIR}/CUDA.cmake)
 
-if (CUDA_VERSION VERSION_LESS 10.2)
-  message(WARNING "CUTLASS ${CUTLASS_VERSION} requires CUDA 10.2 or higher, and strongly recommends CUDA 11.0 or higher.")
-elseif (CUDA_VERSION VERSION_LESS 11.0)
-  message(WARNING "CUTLASS ${CUTLASS_VERSION} support for CUDA ${CUDA_VERSION} is deprecated, please use CUDA 11.0 or higher.")
+if (CUDA_VERSION VERSION_LESS 11.3)
+  message(WARNING "CUTLASS ${CUTLASS_VERSION} requires CUDA 11.4 or higher, and strongly recommends CUDA 11.8 or higher.")
+elseif (CUDA_VERSION VERSION_LESS 11.4)
+  message(WARNING "CUTLASS ${CUTLASS_VERSION} support for CUDA ${CUDA_VERSION} is deprecated, please use CUDA 11.8 or higher.")
+endif()
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7.5)
+  message(FATAL_ERROR "GCC version must be at least 7.5!")
+endif()
+
+if (CUDA_COMPILER MATCHES "[Cc]lang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7.0)
+  message(FATAL_ERROR "Clang 7.0+ required for GPU compilation")
 endif()
 
 find_package(Doxygen QUIET)
 
 #
-# CUTLASS 2.x requires C++11
+# CUTLASS 3.x requires C++17
 #
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 if(CUTLASS_NATIVE_CUDA)
-  set(CMAKE_CUDA_STANDARD 11)
+  set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  list(APPEND CUTLASS_CUDA_NVCC_FLAGS --expt-relaxed-constexpr)
 else()
-  list(APPEND CUTLASS_CUDA_NVCC_FLAGS --std=c++11)
+  list(APPEND CUTLASS_CUDA_NVCC_FLAGS --std=c++17)
 endif()
-
+  
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
   set(CMAKE_INSTALL_PREFIX install CACHE PATH "Default installation location." FORCE)
 endif()
@@ -67,21 +83,24 @@ set(CUTLASS_ENABLE_HEADERS_ONLY OFF CACHE BOOL "Enable only the header library")
 
 if(CUTLASS_ENABLE_HEADERS_ONLY)
   set(CUTLASS_ENABLE_EXAMPLES_INIT OFF)
-  set(CUTLASS_ENABLE_TOOLS_INIT OFF)
+  set(CUTLASS_ENABLE_TOOLS_INIT ON)
+  set(CUTLASS_ENABLE_LIBRARY_INIT OFF)
 else()
   set(CUTLASS_ENABLE_EXAMPLES_INIT ON)
   set(CUTLASS_ENABLE_TOOLS_INIT ON)
+  set(CUTLASS_ENABLE_LIBRARY_INIT ON)
 endif()
 
 set(CUTLASS_TEST_UNIT_ENABLE_WARNINGS OFF CACHE BOOL "Enable warnings on waived unit tests.")
 
 set(CUTLASS_ENABLE_EXAMPLES ${CUTLASS_ENABLE_EXAMPLES_INIT} CACHE BOOL "Enable CUTLASS Examples")
 set(CUTLASS_ENABLE_TOOLS ${CUTLASS_ENABLE_TOOLS_INIT} CACHE BOOL "Enable CUTLASS Tools")
-set(CUTLASS_ENABLE_LIBRARY ${CUTLASS_ENABLE_TOOLS} CACHE BOOL "Enable CUTLASS Library")
-set(CUTLASS_ENABLE_PROFILER ${CUTLASS_ENABLE_TOOLS} CACHE BOOL "Enable CUTLASS Profiler")
+set(CUTLASS_ENABLE_LIBRARY ${CUTLASS_ENABLE_LIBRARY_INIT} CACHE BOOL "Enable CUTLASS Library")
+set(CUTLASS_ENABLE_PROFILER ${CUTLASS_ENABLE_LIBRARY} CACHE BOOL "Enable CUTLASS Profiler")
+set(CUTLASS_ENABLE_PERFORMANCE ${CUTLASS_ENABLE_PROFILER} CACHE BOOL "Enable CUTLASS Proformance")
 
 if(${CMAKE_PROJECT_NAME} STREQUAL ${PROJECT_NAME})
-  set(CUTLASS_ENABLE_TESTS_INIT ${CUTLASS_ENABLE_TOOLS_INIT})
+  set(CUTLASS_ENABLE_TESTS_INIT ${CUTLASS_ENABLE_LIBRARY}})
 else()
   set(CUTLASS_ENABLE_TESTS_INIT OFF)
 endif()
@@ -93,26 +112,14 @@ if (CUTLASS_ENABLE_TESTS)
 endif()
 
 set(CUTLASS_NVCC_ARCHS_SUPPORTED "")
-if (NOT CUDA_VERSION VERSION_LESS 7.5)
-  list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 53)
+if (CUDA_VERSION VERSION_GREATER_EQUAL 11.4 AND NOT CUDA_COMPILER MATCHES "[Cc]lang")
+  list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 70 72 75 80 86 87)
 endif()
-if (NOT CUDA_VERSION VERSION_LESS 8.0)
-  list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 60 61)
+if (CUDA_VERSION VERSION_GREATER_EQUAL 11.8 AND NOT CUDA_COMPILER MATCHES "[Cc]lang")
+  list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 89 90)
 endif()
-if (NOT CUDA_VERSION VERSION_LESS 9.0)
-  list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 70)
-endif()
-if (NOT CUDA_VERSION VERSION_LESS 9.2)
-  list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 72)
-endif()
-if (NOT CUDA_VERSION VERSION_LESS 10.0)
-  list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 75)
-endif()
-if (NOT CUDA_VERSION VERSION_LESS 11.0)
-  list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 80)
-endif()
-if (NOT CUDA_VERSION VERSION_LESS 11.1 AND NOT CUDA_COMPILER MATCHES "[Cc]lang")
-  list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 86)
+if (CUDA_VERSION VERSION_GREATER_EQUAL 12.0 AND NOT CUDA_COMPILER MATCHES "[Cc]lang")
+  list(APPEND CUTLASS_NVCC_ARCHS_SUPPORTED 90a)
 endif()
 set(CUTLASS_NVCC_ARCHS ${CUTLASS_NVCC_ARCHS_SUPPORTED} CACHE STRING "The SM architectures requested.")
 set(CUTLASS_NVCC_ARCHS_ENABLED ${CUTLASS_NVCC_ARCHS} CACHE STRING "The SM architectures to build code for.")
@@ -185,10 +192,8 @@ set(CUTLASS_LIBRARY_OPERATIONS "all" CACHE STRING "Comma delimited list of opera
 set(CUTLASS_LIBRARY_KERNELS "" CACHE STRING "Comma delimited list of kernel name filters. If unspecified, only the largest tile size is enabled. If 'all' is specified, all kernels are enabled.")
 set(CUTLASS_LIBRARY_IGNORE_KERNELS "" CACHE STRING "Comma delimited list of kernel names to exclude from build.")
 
-
 # Test Levels L0, L1, L2
 set(CUTLASS_TEST_LEVEL "0" CACHE STRING "Level of tests to compile.")
-
 
 set(CUTLASS_TEST_ENABLE_CACHED_RESULTS ON CACHE BOOL "Enable caching and reuse of test results in unit tests")
 
@@ -201,14 +206,12 @@ if (CUTLASS_TEST_ENABLE_CACHED_RESULTS)
   list(APPEND CUTLASS_CUDA_NVCC_FLAGS -DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1)
 endif()
 
-
 set(CUTLASS_CONV_UNIT_TEST_RIGOROUS_SIZE_ENABLED ON CACHE BOOL "Enable/Disable rigorous conv problem sizes in conv unit tests")
 
 if (CUTLASS_CONV_UNIT_TEST_RIGOROUS_SIZE_ENABLED)
   message(STATUS "Enable rigorous conv problem sizes in conv unit tests")
   list(APPEND CUTLASS_CUDA_NVCC_FLAGS -DCUTLASS_CONV_UNIT_TEST_RIGOROUS_SIZE_ENABLED=1)
 endif()
-
 
 #
 # CUDA 10.1 introduces "mma" in PTX performing collective matrix multiply operations.
@@ -258,6 +261,7 @@ if (CUTLASS_ENABLE_TENSOR_CORE_MMA)
   list(APPEND CUTLASS_CUDA_FLAGS -DCUTLASS_ENABLE_TENSOR_CORE_MMA=1)
 endif()
 
+
 if (NOT MSVC AND CUTLASS_NVCC_KEEP)
   # MSVC flow handles caching already, but for other generators we handle it here.
   set(CUTLASS_NVCC_KEEP_DIR ${CMAKE_CURRENT_BINARY_DIR}/tmp CACHE PATH "Location to store NVCC scratch files")
@@ -272,6 +276,15 @@ if (CUTLASS_ENABLE_F16C AND NOT CMAKE_CROSSCOMPILING)
     list(APPEND CUTLASS_CUDA_NVCC_FLAGS -Xcompiler=-mf16c)
   elseif((CMAKE_CXX_COMPILER_ID MATCHES "MSVC"))
     list(APPEND CUTLASS_CUDA_NVCC_FLAGS -Xcompiler=/arch:AVX2)
+  endif()
+endif()
+
+if (CUTLASS_ENABLE_OPENMP_TESTS)
+  find_package(OpenMP)
+  if(OpenMP_CXX_FOUND)
+    list(APPEND CUTLASS_CUDA_NVCC_FLAGS -Xcompiler=${OpenMP_CXX_FLAGS})
+  else()
+    message(WARNING "CUTLASS_ENABLE_OPENMP_TESTS set but OpenMP not found.")
   endif()
 endif()
 
@@ -300,10 +313,6 @@ if(CUDA_COMPILER MATCHES "[Cc]lang")
     message(FATAL_ERROR "Clang CUDA compilation requires Clang CXX compilation. Currently CMAKE_CXX_COMPILER is ${CMAKE_CXX_COMPILER_ID}" )
   endif()
 
-  if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7.0)
-    message(FATAL_ERROR "Clang 7.0+ required for GPU compilation")
-  endif()
-
   # There are numerous Clang versions that can work with each CUDA toolkit and the 
   # the checks are not very useful so we are turning them off and using testing to 
   # ensure the various combinations work properly.
@@ -328,6 +337,12 @@ if(CUDA_COMPILER MATCHES "[Cc]lang")
   list(APPEND CUTLASS_CUDA_CLANG_FLAGS -Wl,--disable-new-dtags)
 
   link_libraries(nvidia::cudart)
+  link_libraries(nvidia::cuda_driver)
+endif()
+
+# Support for 128-bit integers if using NVIDIA C++ compiler 
+if (${CMAKE_CXX_COMPILER_ID} MATCHES "PGI" OR ${CMAKE_CXX_COMPILER_ID} MATCHES "NVHPC")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Mint128 ")
 endif()
 
 if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.18)
@@ -338,11 +353,21 @@ if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.18)
 endif()
 
 function(cutlass_apply_cuda_gencode_flags TARGET)
+  set(options)
+  set(oneValueArgs)
+  set(multiValueArgs SM_ARCHS)
+  cmake_parse_arguments(_ "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+  if (__SM_ARCHS)
+    set(ARCHS_ENABLED ${__SM_ARCHS})
+  else()
+    set(ARCHS_ENABLED ${CUTLASS_NVCC_ARCHS_ENABLED})
+  endif()
 
   set(NVCC_FLAGS)
   set(CLANG_FLAGS)
   set(__CMAKE_CUDA_ARCHS)
-  foreach(ARCH ${CUTLASS_NVCC_ARCHS_ENABLED})
+  foreach(ARCH ${ARCHS_ENABLED})
     list(APPEND CLANG_FLAGS --cuda-gpu-arch=sm_${ARCH})
     set(CODES)
     if(CUTLASS_NVCC_EMBED_CUBIN)
@@ -356,21 +381,37 @@ function(cutlass_apply_cuda_gencode_flags TARGET)
     list(JOIN CODES "," CODES_STR)
     list(APPEND NVCC_FLAGS -gencode=arch=compute_${ARCH},code=[${CODES_STR}])
   endforeach()
-
-  if (CUDA_COMPILER MATCHES "[Cc]lang")
-    target_compile_options(
-      ${TARGET}
-      PRIVATE
-      $<$<COMPILE_LANGUAGE:CXX>:${CLANG_FLAGS}>
-      )
-  elseif(CMAKE_VERSION GREATER_EQUAL 3.18)
-    set_property(TARGET ${TARGET} PROPERTY CUDA_ARCHITECTURES ${__CMAKE_CUDA_ARCHS})
+ 
+  if (NOT __SM_ARCHS)
+    if (CUDA_COMPILER MATCHES "[Cc]lang")
+      target_compile_options(
+        ${TARGET}
+        PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:${CLANG_FLAGS}>
+        )
+    elseif(CMAKE_VERSION GREATER_EQUAL 3.18)
+      set_property(TARGET ${TARGET} PROPERTY CUDA_ARCHITECTURES ${__CMAKE_CUDA_ARCHS})
+    else()
+      target_compile_options(
+        ${TARGET}
+        PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${NVCC_FLAGS}>
+        )
+    endif()
   else()
-    target_compile_options(
-      ${TARGET}
-      PRIVATE
-      $<$<COMPILE_LANGUAGE:CUDA>:${NVCC_FLAGS}>
-      )
+    list(JOIN CLANG_FLAGS " " CLANG_FLAGS_STR)
+    list(JOIN NVCC_FLAGS " " STR_NVCC_FLAGS)
+    if (CUDA_COMPILER MATCHES "[Cc]lang")
+      if(${TARGET} MATCHES ".*\.cpp")
+        set_source_files_properties(${TARGET} PROPERTIES COMPILE_FLAGS ${CLANG_FLAGS_STR})
+      endif()
+    elseif(CMAKE_VERSION GREATER_EQUAL 3.18)
+      set_source_files_properties(${TARGET} PROPERTIES CUDA_ARCHITECTURES ${STR_NVCC_FLAGS})
+    else()
+      if(${TARGET} MATCHES ".*\.cu")
+        set_source_files_properties(${TARGET} PROPERTIES COMPILE_FLAGS ${STR_NVCC_FLAGS})
+      endif()
+    endif()
   endif()
 
 endfunction()
@@ -450,7 +491,10 @@ set(CUTLASS_TOOLS_UTIL_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/tools/util/includ
 include_directories(${CUTLASS_INCLUDE_DIR})
 
 target_compile_features(CUTLASS INTERFACE cxx_std_11)
-target_compile_definitions(CUTLASS INTERFACE CUTLASS_NAMESPACE=${CUTLASS_NAMESPACE})
+
+if (NOT CUTLASS_NAMESPACE STREQUAL "cutlass")
+  target_compile_definitions(CUTLASS INTERFACE CUTLASS_NAMESPACE=${CUTLASS_NAMESPACE})
+endif()
 
 if (NOT DEFINED CUTLASS_REVISION)
 
@@ -483,6 +527,8 @@ target_include_directories(
   $<BUILD_INTERFACE:${CUTLASS_INCLUDE_DIR}>
   $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
   $<BUILD_INTERFACE:${CUDA_TOOLKIT_ROOT_DIR}/include>
+  $<BUILD_INTERFACE:${cute_SOURCE_DIR}/include>
+  $<BUILD_INTERFACE:${cute_SOURCE_DIR}/examples>
   )
 
 install(
@@ -559,6 +605,9 @@ install(DIRECTORY DESTINATION ${CUTLASS_TEST_INSTALL_LIBDIR})
 install(DIRECTORY DESTINATION ${CUTLASS_TEST_INSTALL_PREFIX}/ctest)
 
 ################################################################################
+
+set(CUTLASS_ENABLE_CUBLAS OFF CACHE BOOL "cuBLAS usage for tests")
+set(CUTLASS_ENABLE_CUDNN OFF CACHE BOOL "cuDNN usage for tests")
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cuBLAS.cmake)
 
@@ -723,7 +772,7 @@ if (CUTLASS_ENABLE_TOOLS)
   add_subdirectory(tools)
   if (CUTLASS_ENABLE_PROFILER)
     add_dependencies(test_all test_profiler)
-  endif()  
+  endif()
 endif()
 if (CUTLASS_ENABLE_EXAMPLES)
   add_subdirectory(examples)
@@ -746,7 +795,7 @@ if (CUTLASS_INSTALL_TESTS)
 
   install(
     FILES "${CMAKE_BINARY_DIR}/cmake/CTestTestfile.cmake"
-    DESTINATION ${CUTLASS_TEST_INSTALL_PREFIX}/
+    DESTINATION "${CUTLASS_TEST_INSTALL_PREFIX}/"
     )
 
 endif()
@@ -766,15 +815,23 @@ endif()
 
 ################################################################################
 
+include(CMakePackageConfigHelpers)
+
+write_basic_package_version_file(
+  ${CMAKE_CURRENT_BINARY_DIR}/NvidiaCutlassConfigVersion.cmake 
+  COMPATIBILITY AnyNewerVersion)
+
 install(
-  FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/NvidiaCutlassConfig.cmake
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/
+  FILES 
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/NvidiaCutlassConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/NvidiaCutlassConfigVersion.cmake 
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/NvidiaCutlass/
   )
 
 install(
   EXPORT NvidiaCutlass
   NAMESPACE nvidia::cutlass::
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/
+  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/NvidiaCutlass/
   FILE NvidiaCutlassTargets.cmake
   )
 

@@ -1,24 +1,30 @@
 /***************************************************************************************************
- * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
@@ -274,6 +280,36 @@ struct FastDivmod {
   unsigned int multiplier;
   unsigned int shift_right;
 
+  /// Find quotient and remainder using device-side intrinsics
+  CUTLASS_HOST_DEVICE
+  void fast_divmod(int& quotient, int& remainder, int dividend) const {
+
+#if defined(__CUDA_ARCH__)
+    // Use IMUL.HI if divisor != 1, else simply copy the source.
+    quotient = (divisor != 1) ? __umulhi(dividend, multiplier) >> shift_right : dividend;
+#else
+    quotient = int((divisor != 1) ? int(((int64_t)dividend * multiplier) >> 32) >> shift_right : dividend);
+#endif
+
+    // The remainder.
+    remainder = dividend - (quotient * divisor);
+  }
+
+  /// For long int input
+  CUTLASS_HOST_DEVICE
+  void fast_divmod(int& quotient, int64_t& remainder, int64_t dividend) const {
+
+#if defined(__CUDA_ARCH__)
+    // Use IMUL.HI if divisor != 1, else simply copy the source.
+    quotient = (divisor != 1) ? __umulhi(dividend, multiplier) >> shift_right : dividend;
+#else
+    quotient = int((divisor != 1) ? ((dividend * multiplier) >> 32) >> shift_right : dividend);
+#endif
+    // The remainder.
+    remainder = dividend - (quotient * divisor);
+  }
+
+
   /// Construct the FastDivmod object, in host code ideally.
   ///
   /// This precomputes some values based on the divisor and is computationally expensive.
@@ -282,17 +318,35 @@ struct FastDivmod {
   FastDivmod(): divisor(0), multiplier(0), shift_right(0) { }
 
   CUTLASS_HOST_DEVICE
-  FastDivmod(int divisor_): divisor(divisor_) {
-    find_divisor(multiplier, shift_right, divisor);
+  FastDivmod(int divisor): divisor(divisor) {
+
+    if (divisor != 1) {
+      unsigned int p = 31 + find_log2(divisor);
+      unsigned m = unsigned(((1ull << p) + unsigned(divisor) - 1) / unsigned(divisor));
+
+      multiplier = m;
+      shift_right = p - 32;
+    } else {
+      multiplier = 0;
+      shift_right = 0;
+    }
   }
 
   /// Computes integer division and modulus using precomputed values. This is computationally
   /// inexpensive.
   CUTLASS_HOST_DEVICE
   void operator()(int &quotient, int &remainder, int dividend) const {
-    fast_divmod(quotient, remainder, dividend, divisor, multiplier, shift_right);
+    fast_divmod(quotient, remainder, dividend);
   }
 
+  /// Computes integer division using precomputed values. This is computationally
+  /// inexpensive.
+  CUTLASS_HOST_DEVICE
+  int div(int dividend) const {
+    int quotient, remainder;
+    fast_divmod(quotient, remainder, dividend);
+    return quotient;
+  }
 
   /// Computes integer division and modulus using precomputed values. This is computationally
   /// inexpensive.
@@ -301,7 +355,7 @@ struct FastDivmod {
   CUTLASS_HOST_DEVICE
   int divmod(int &remainder, int dividend) const {
     int quotient;
-    fast_divmod(quotient, remainder, dividend, divisor, multiplier, shift_right);
+    fast_divmod(quotient, remainder, dividend);
     return quotient;
   }
 
@@ -309,7 +363,7 @@ struct FastDivmod {
   /// inexpensive.
   CUTLASS_HOST_DEVICE
   void operator()(int &quotient, int64_t &remainder, int64_t dividend) const {
-    fast_divmod(quotient, remainder, dividend, divisor, multiplier, shift_right);
+    fast_divmod(quotient, remainder, dividend);
   }
 
   /// Computes integer division and modulus using precomputed values. This is computationally
@@ -317,9 +371,14 @@ struct FastDivmod {
   CUTLASS_HOST_DEVICE
   int divmod(int64_t &remainder, int64_t dividend) const {
     int quotient;
-    fast_divmod(quotient, remainder, dividend, divisor, multiplier, shift_right);
+    fast_divmod(quotient, remainder, dividend);
     return quotient;
   }
+
+  /// Returns the divisor when cast to integer
+  CUTLASS_HOST_DEVICE
+  operator int() const { return divisor; }
+
 };
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -555,6 +614,17 @@ CUTLASS_HOST_DEVICE int64_t OffsetBytes(int64_t index) {
   }
 }
 
+CUTLASS_HOST_DEVICE int64_t OffsetBytes(int64_t index, int64_t element_sizeof_bits) {
+  if (element_sizeof_bits >= 8) {
+    return index * (element_sizeof_bits / 8);
+  }
+  else {
+    int64_t const kElementsPerByte = ((8 / element_sizeof_bits) + ((element_sizeof_bits >= 8) ? 1 : 0));
+    return index / kElementsPerByte;
+  }
+}
+
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // Min/Max
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -696,7 +766,7 @@ double fast_sqrt(double theta) {
 CUTLASS_HOST_DEVICE
 float fast_exp(float x) {
   #if defined(__CUDA_ARCH__)
-  return ::exp(x);
+  return ::expf(x);
   #else
   return std::exp(x);
   #endif
@@ -705,18 +775,18 @@ float fast_exp(float x) {
 CUTLASS_HOST_DEVICE
 double fast_exp(double x) {
   #if defined(__CUDA_ARCH__)
-  return ::expf(x);
+  return ::exp(x);
   #else
   return std::exp(x);
   #endif
 }
 
 CUTLASS_HOST_DEVICE
-float fast_exp(half_t x) {
+half_t fast_exp(half_t x) {
   #if defined(__CUDA_ARCH__) && (__CUDACC_VER_MAJOR__ >= 10) && (__CUDA_ARCH__ >= 750)
-      return ::hexp(x.to_half());
+      return (half_t)(::hexp(x.to_half()));
   #else
-      return fast_exp(float(x));
+      return (half_t)(fast_exp(float(x)));
   #endif
 }
 
@@ -884,6 +954,18 @@ struct fast_tanh_op<Array<T, N>> {
     return y;
   }
 };
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Absolute value function
+template <typename T>
+CUTLASS_HOST_DEVICE
+T absolute_value(T x) {
+  if (x < T()) {
+    return -x;
+  }
+  return x;
+}
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 

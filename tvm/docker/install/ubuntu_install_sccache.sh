@@ -20,12 +20,20 @@ set -e
 set -u
 set -o pipefail
 
-cargo install sccache
+cargo install --version 0.3.3 sccache
 
 # The docs specifically recommend hard links: https://github.com/mozilla/sccache#known-caveats
 mkdir /opt/sccache
 ln "$(which sccache)" /opt/sccache/cc
 ln "$(which sccache)" /opt/sccache/c++
+
+# Only add clang if it's on the PATH
+if command -v clang &> /dev/null
+then
+    ln "$(which sccache)" /opt/sccache/clang
+    ln "$(which sccache)" /opt/sccache/clang++
+fi
+
 
 # make rust usable by all users after install during container build
 chmod -R a+rw /opt/rust

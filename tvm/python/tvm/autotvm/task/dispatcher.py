@@ -30,14 +30,25 @@ of the DispatchContext base class.
 
 from __future__ import absolute_import as _abs
 
+from io import TextIOBase
 import logging
+from os import PathLike
+from pathlib import Path
+from typing import List, Iterable, Tuple, Union
 
 import numpy as np
 
 from .space import FallbackConfigEntity
 from .. import env as _env
+from ..measure import MeasureInput, MeasureResult
 
 logger = logging.getLogger("autotvm")
+
+Records = Union[
+    Union[str, bytes, Path],  # Path-like objects
+    TextIOBase,  # File-like objects
+    Iterable[Tuple[MeasureInput, MeasureResult]],
+]
 
 
 class DispatchContext(object):
@@ -178,19 +189,70 @@ class ApplyConfig(DispatchContext):
         self._config = cfg
 
 
+class ApplyFixedConfig(DispatchContext):
+    """Apply a config of a deterministic schedule.
+    This is used for building a single Relay operator with deterministic schedule
+    for testing schedules at Relay level.
+
+    Parameters
+    ----------
+    tasks : list[tvm.autotvm.task.task.Task]
+        List of autoTVM tasks.
+    schedule_names : str, List[str]
+        Name of schedules to use.
+    """
+
+    def __init__(self, tasks, schedule_names: Union[str, List[str]]):
+        super(ApplyFixedConfig, self).__init__()
+        if isinstance(schedule_names, str):
+            self._schedule_names = list(schedule_names)
+        elif isinstance(schedule_names, list):
+            self._schedule_names = schedule_names
+        else:
+            raise RuntimeError("Incorrect type: " + schedule_names)
+        self._tasks = tasks
+        self.workload = None
+
+    def _query_inside(self, target, workload):
+        """Override query"""
+        self.workload = workload
+
+        # Create a config from correct task
+        for task in self._tasks:
+            if task.name == workload[0]:
+                config = task.config_space.get(0)
+                break
+
+        if not config:
+            raise RuntimeError(f"workload: {str(workload)} does not exist in {str(self._tasks)}")
+        # Add low cost to the target schedule and high cost to others.
+        if workload[0] in self._schedule_names:
+            config.cost = 1e-6
+        else:
+            config.cost = 100000
+        return config
+
+    def update(self, target, workload, cfg):
+        """Override update"""
+        self.workload = workload
+        self._config = cfg
+
+
 class ApplyHistoryBest(DispatchContext):
     """
     Apply the history best config
 
     Parameters
     ----------
-    records : str or iterator of (autotvm.measure.MeasureInput, autotvm.measure.MeasureResult)
-        Collection of tuning records.
-        If is str, then it should be the filename of a records log file.
-        Each row of this file is an encoded record pair. Otherwise, it is an iterator.
+    records : None, Records, or iterator of Records objects, where a
+              Records object is a path-like object, a file-like object,
+              or an iterator of (MeasureInput, MeasureResult).
+
+        Collection of tuning records. If multiple Records objects are passed, their
+        contents will be merged.
     """
 
-    def __init__(self, records):
+    def __init__(self, records: Union[None, Records, Iterable[Records]]):
         super(ApplyHistoryBest, self).__init__()
 
         self.best_by_targetkey = {}
@@ -200,33 +262,48 @@ class ApplyHistoryBest(DispatchContext):
         if records:
             self.load(records)
 
-    def load(self, records):
+    def load(self, records: Union[Records, Iterable[Records]]):
         """Load records to this dispatch context
 
         Parameters
         ----------
-        records : str or iterator of (autotvm.measure.MeasureInput, autotvm.measure.MeasureResult)
-            Collection of tuning records.
-            If is str, then it should be the filename of a records log file.
-            Each row of this file is an encoded record pair. Otherwise, it is an iterator.
+        records : str, list of str, or iterator of (autotvm.measure.MeasureInput,\
+                                                    autotvm.measure.MeasureResult)
+
+            Collection of tuning records. If multiple Records objects are passed, their
+            contents will be merged.
         """
         # pylint: disable=import-outside-toplevel
-        from pathlib import Path
-        from ..record import load_from_file
+        from ..record import load_from_file, load_from_buffer
 
-        if isinstance(records, Path):
-            records = str(records)
+        def _unpack_records(
+            records: Union[Records, Iterable[Records]]
+        ) -> List[Tuple[MeasureInput, MeasureResult]]:
 
-        if isinstance(records, str):
-            records = load_from_file(records)
-        if not records:
+            if isinstance(records, (str, bytes, PathLike)):
+                return load_from_file(records)
+
+            if isinstance(records, TextIOBase):
+                return load_from_buffer(records)
+
+            joint_records = []
+            for record in records:
+                if isinstance(record, Tuple) and isinstance(record[0], MeasureInput):
+                    joint_records.append(record)
+                else:
+                    joint_records += _unpack_records(record)
+
+            return joint_records
+
+        flattened_records = _unpack_records(records)
+        if not flattened_records:
             return
 
         best_by_targetkey = self.best_by_targetkey
         best_by_model = self.best_by_model
 
         counter = 0
-        for inp, res in records:
+        for inp, res in flattened_records:
             counter += 1
             if res.error_no != 0:
                 continue
@@ -311,8 +388,8 @@ class FallbackContext(DispatchContext):
 
         if not _env.GLOBAL_SCOPE.silent:
             msg = (
-                "Cannot find config for target=%s, workload=%s. A fallback configuration "
-                "is used, which may bring great performance regression." % (target, workload)
+                f"Cannot find config for target={target}, workload={workload}. A fallback "
+                f"configuration is used, which may bring great performance regression."
             )
             if msg not in DispatchContext.warning_messages:
                 DispatchContext.warning_messages.add(msg)
@@ -378,7 +455,7 @@ class ApplyGraphBest(DispatchContext):
     node index.
     """
 
-    def __init__(self, records):
+    def __init__(self, records: Records):
         """
         Parameters
         ----------
@@ -389,11 +466,16 @@ class ApplyGraphBest(DispatchContext):
             Otherwise, it is an iterator.
         """
         # pylint: disable=import-outside-toplevel
-        from ..record import load_from_file
+        from ..record import load_from_file, load_from_buffer
 
         super(ApplyGraphBest, self).__init__()
-        if isinstance(records, str):
+        if isinstance(records, (str, bytes, PathLike)):
             records = load_from_file(records)
+        elif isinstance(records, TextIOBase):
+            records = load_from_buffer(records)
+        else:
+            records = list(records)
+
         self._records = list(records)
         self._counter = 0
         self._global_cfg_dict = {}
@@ -426,9 +508,9 @@ class ApplyGraphBest(DispatchContext):
         key = (str(target), workload)
         if key not in self._global_cfg_dict:
             msg = (
-                "Config for target=%s, workload=%s is missing in ApplyGraphBest context. "
-                "A fallback configuration is used, which may bring great performance "
-                "regression." % (target, workload)
+                f"Config for target={target}, workload={workload} is missing in ApplyGraphBest "
+                f"context. A fallback configuration is used, which may bring great performance "
+                f"regression."
             )
             logger.warning(msg)
             cfg = FallbackConfigEntity()

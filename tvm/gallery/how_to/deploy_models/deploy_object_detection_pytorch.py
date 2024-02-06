@@ -27,8 +27,8 @@ A quick solution is to install via pip
 
 .. code-block:: bash
 
-    pip install torch==1.7.0
-    pip install torchvision==0.8.1
+    pip install torch
+    pip install torchvision
 
 or please refer to official site
 https://pytorch.org/get-started/locally/
@@ -97,7 +97,7 @@ with torch.no_grad():
 # Download a test image and pre-process
 # -------------------------------------
 img_url = (
-    "https://raw.githubusercontent.com/dmlc/web-data/" "master/gluoncv/detection/street_small.jpg"
+    "https://raw.githubusercontent.com/dmlc/web-data/master/gluoncv/detection/street_small.jpg"
 )
 img_path = download_testdata(img_url, "test_street_small.jpg", module="data")
 

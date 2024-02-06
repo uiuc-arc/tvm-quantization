@@ -48,14 +48,23 @@ enum DeviceAttrKind : int {
   kMaxRegistersPerBlock = 9,
   kGcnArch = 10,
   kApiVersion = 11,
-  kDriverVersion = 12
+  kDriverVersion = 12,
+  kL2CacheSizeBytes = 13,
 };
 
+#ifdef TVM_KALLOC_ALIGNMENT
 /*! \brief Number of bytes each allocation must align to */
-constexpr int kAllocAlignment = 128;
+constexpr int kAllocAlignment = TVM_KALLOC_ALIGNMENT;
 
 /*! \brief Number of bytes each allocation must align to in temporary allocation */
-constexpr int kTempAllocaAlignment = 128;
+constexpr int kTempAllocaAlignment = TVM_KALLOC_ALIGNMENT;
+#else
+/*! \brief Number of bytes each allocation must align to */
+constexpr int kAllocAlignment = 64;
+
+/*! \brief Number of bytes each allocation must align to in temporary allocation */
+constexpr int kTempAllocaAlignment = 64;
+#endif  // TVM_KALLOC_ALIGNMENT
 
 /*! \brief Maximum size that can be allocated on stack */
 constexpr int kMaxStackAlloca = 1024;
@@ -85,6 +94,14 @@ class TVM_DLL DeviceAPI {
    * \sa DeviceAttrKind
    */
   virtual void GetAttr(Device dev, DeviceAttrKind kind, TVMRetValue* rv) = 0;
+
+  /*!
+   * \brief Get the physical memory size required.
+   * \param arr the tensor object.
+   * \param mem_scope the memory scope if any
+   * \return the memory size.
+   */
+  virtual size_t GetDataSize(const DLTensor& arr, Optional<String> mem_scope = NullOpt);
 
   /*!
    * \brief Query the device for specified properties.
@@ -234,45 +251,7 @@ class TVM_DLL DeviceAPI {
 
 /*! \brief The device type bigger than this is RPC device */
 constexpr int kRPCSessMask = 128;
-
-/*!
- * \brief The name of Device API factory.
- * \param type The device type.
- * \return the device name.
- */
-inline const char* DeviceName(int type) {
-  switch (type) {
-    case kDLCPU:
-      return "cpu";
-    case kDLCUDA:
-      return "cuda";
-    case kDLCUDAHost:
-      return "cuda_host";
-    case kDLOpenCL:
-      return "opencl";
-    case kDLSDAccel:
-      return "sdaccel";
-    case kDLAOCL:
-      return "aocl";
-    case kDLVulkan:
-      return "vulkan";
-    case kDLMetal:
-      return "metal";
-    case kDLVPI:
-      return "vpi";
-    case kDLROCM:
-      return "rocm";
-    case kDLExtDev:
-      return "ext_dev";
-    case kDLWebGPU:
-      return "webgpu";
-    case kDLHexagon:
-      return "hexagon";
-    default:
-      LOG(FATAL) << "unknown type =" << type;
-      return "Unknown";
-  }
-}
+static_assert(kRPCSessMask >= TVMDeviceExtType_End);
 
 /*!
  * \brief Return true if a Device is owned by an RPC session.
@@ -305,7 +284,7 @@ inline std::ostream& operator<<(std::ostream& os, DLDevice dev) {  // NOLINT(*)
     os << "remote[" << tvm::runtime::GetRPCSessionIndex(dev) << "]-";
     dev = tvm::runtime::RemoveRPCSessionMask(dev);
   }
-  os << tvm::runtime::DeviceName(static_cast<int>(dev.device_type)) << "(" << dev.device_id << ")";
+  os << tvm::runtime::DLDeviceType2Str(static_cast<int>(dev.device_type)) << ":" << dev.device_id;
   return os;
 }
 

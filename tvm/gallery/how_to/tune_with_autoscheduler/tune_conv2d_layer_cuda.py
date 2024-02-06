@@ -37,6 +37,9 @@ get it to run, you will need to wrap the body of this tutorial in a :code:`if
 __name__ == "__main__":` block.
 """
 
+# sphinx_gallery_start_ignore
+# sphinx_gallery_requires_cuda = True
+# sphinx_gallery_end_ignore
 import os
 
 import numpy as np
@@ -84,7 +87,7 @@ print(task.compute_dag)
 # mainly specify how we do the measurement during the search.
 #
 # * :code:`measure_ctx` launches a different process for measurement to
-#   provide isolation. It can protect the master process from GPU crashes
+#   provide isolation. It can protect the main process from GPU crashes
 #   during measurement and avoid other runtime conflicts.
 # * :code:`min_repeat_ms` defines the minimum duration of one "repeat" in every measurement.
 #   This can warmup the GPU, which is necessary to get accurate measurement results.
@@ -116,7 +119,9 @@ tune_option = auto_scheduler.TuningOptions(
 # file and apply it.
 
 # Run auto-tuning (search)
-task.tune(tune_option)
+# We do not run the tuning in our webpage server since it takes too long.
+# Uncomment the following line to run it by yourself.
+# task.tune(tune_option)
 # Apply the best schedule
 sch, args = task.apply_best(log_file)
 
@@ -206,4 +211,6 @@ def resume_search(task, log_file):
     del measure_ctx
 
 
-resume_search(task, log_file)
+# We do not run the tuning in our webpage server since it takes too long.
+# Uncomment the following line to run it by yourself.
+# resume_search(task, log_file)

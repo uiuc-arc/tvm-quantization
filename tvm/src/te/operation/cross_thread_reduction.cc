@@ -22,6 +22,7 @@
  * \file cross_thread_reduction.cc
  */
 #include <tvm/tir/builtin.h>
+#include <tvm/tir/stmt_functor.h>
 
 #include "compute_op.h"
 #include "op_utils.h"
@@ -62,7 +63,7 @@ using namespace tir;
 // The last step is to write the final reduction variable,
 // which should be predicated by the existing input_pred if any
 // The consequence is that input_pred should be independent of
-// the reduction axis. Otherwise, we need to seperate it into
+// the reduction axis. Otherwise, we need to separate it into
 // dependent part and independent one.
 //
 // (3) write back
@@ -134,29 +135,25 @@ Stmt MakeCrossThreadReduction(const ComputeOpNode* self, const Stage& stage,
 
   // If we load from and then store into the same res_handles in the thread_allreduce intrinsic,
   // something goes wrong, so we use an extra variable here for normal reduction.
-  std::vector<Var> normal_res_handles;
+  std::vector<Buffer> normal_res_buffers;
   std::vector<Stmt> normal_init, normal_update;
   if (!normal_red.empty()) {
-    normal_res_handles.reserve(size);
+    normal_res_buffers.reserve(size);
     normal_init.reserve(size);
     normal_update.resize(size);
     const CommReducerNode* combiner = reduces[0]->combiner.as<CommReducerNode>();
     ICHECK(combiner);
     Array<PrimExpr> lhs;
     for (size_t i = 0; i < size; ++i) {
-      DataType t = reduces[i]->dtype;
-      normal_res_handles.emplace_back("normal_reduce_temp" + std::to_string(i),
-                                      PointerType(PrimType(t), "local"));
-      lhs.push_back(Load(t, normal_res_handles[i], 0, const_true(t.lanes())));
+      normal_res_buffers.push_back(
+          decl_buffer({1}, reduces[i]->dtype, "normal_reduce_temp" + std::to_string(i), "local"));
+      lhs.push_back(BufferLoad(normal_res_buffers[i], {0}));
     }
     Array<PrimExpr> init_value = combiner->identity_element;
     Array<PrimExpr> update_value = (*combiner)(lhs, reduces[0]->source);
     for (size_t i = 0; i < size; ++i) {
-      DataType t = reduces[i]->dtype;
-      normal_init.emplace_back(
-          Store(normal_res_handles[i], init_value[i], 0, const_true(t.lanes())));
-      normal_update.emplace_back(
-          Store(normal_res_handles[i], update_value[i], 0, const_true(t.lanes())));
+      normal_init.emplace_back(BufferStore(normal_res_buffers[i], init_value[i], {0}));
+      normal_update.emplace_back(BufferStore(normal_res_buffers[i], update_value[i], {0}));
     }
   }
 
@@ -164,8 +161,7 @@ Stmt MakeCrossThreadReduction(const ComputeOpNode* self, const Stage& stage,
   freduce_args.push_back(make_const(DataType::UInt(32), static_cast<uint32_t>(size)));
   for (size_t i = 0; i < size; ++i) {
     if (!normal_red.empty()) {
-      DataType t = reduces[i]->dtype;
-      freduce_args.push_back(Load(t, normal_res_handles[i], 0, const_true(t.lanes())));
+      freduce_args.push_back(BufferLoad(normal_res_buffers[i], {0}));
     } else {
       freduce_args.push_back(reduces[0]->source[i]);
     }
@@ -174,12 +170,21 @@ Stmt MakeCrossThreadReduction(const ComputeOpNode* self, const Stage& stage,
   // No constraints on the thread reduction step. It may have redundent
   // computation for rare cases. TODO(tvm-team): revisit this.
   freduce_args.push_back(const_true(1));
-  std::vector<Var> res_handles(size);
+  std::vector<Buffer> res_buffers(size);
   for (size_t idx = 0; idx < size; ++idx) {
-    DataType dtype = reduces[idx]->dtype;
-    res_handles[idx] =
-        Var("reduce_temp" + std::to_string(idx), PointerType(PrimType(dtype), "local"));
-    freduce_args.push_back(res_handles[idx]);
+    res_buffers[idx] =
+        decl_buffer({1}, reduces[idx]->dtype, "reduce_temp" + std::to_string(idx), "local");
+    // Make a BufferLoad object so that we can pass the entire Buffer
+    // object through to LowerThreadAllreduce.  The index here is
+    // unused.
+    PrimExpr dummy_load = BufferLoad(res_buffers[idx], {0});
+    freduce_args.push_back(dummy_load);
+  }
+
+  // Checks for the thread.
+  std::vector<PrimExpr> output_preds;
+  if (stage->store_predicate.defined()) {
+    output_preds.emplace_back(stage->store_predicate);
   }
 
   for (IterVar iv : stage->leaf_iter_vars) {
@@ -188,14 +193,9 @@ Stmt MakeCrossThreadReduction(const ComputeOpNode* self, const Stage& stage,
       if (it != stage->iter_var_attrs.end() && (*it).second->bind_thread.defined()) {
         IterVar tv = (*it).second->bind_thread;
         freduce_args.push_back(tv->var);
+        output_preds.push_back(tv->var == make_const(tv->var->dtype, 0));
       }
     }
-  }
-
-  // Checks for the thread.
-  std::vector<PrimExpr> output_preds;
-  if (stage->store_predicate.defined()) {
-    output_preds.emplace_back(stage->store_predicate);
   }
 
   // Apply the existing input predicate if any.
@@ -216,18 +216,18 @@ Stmt MakeCrossThreadReduction(const ComputeOpNode* self, const Stage& stage,
 
   std::vector<Stmt> assigns(size);
   for (size_t idx = 0; idx < size; ++idx) {
-    DataType t = reduces[idx]->dtype;
-    assigns[idx] = ProducerStore(stage->op.output(idx),
-                                 Load(t, res_handles[idx], 0, const_true(t.lanes())), args);
+    assigns[idx] = ProducerStore(stage->op.output(idx), BufferLoad(res_buffers[idx], {0}), args);
   }
   Stmt assign_body = SeqStmt::Flatten(assigns);
   assign_body = MergeNest(MakeIfNest(output_preds), assign_body);
   Stmt body = SeqStmt::Flatten(reduce_body, assign_body);
   for (size_t idx = size; idx != 0; --idx) {
-    body = Allocate(res_handles[idx - 1], reduces[idx - 1]->dtype, {1}, const_true(), body);
+    const auto& res_buffer = res_buffers[idx - 1];
+    body = Allocate(res_buffer->data, res_buffer->dtype, res_buffer->shape, const_true(), body);
     if (!normal_red.empty()) {
-      body =
-          Allocate(normal_res_handles[idx - 1], reduces[idx - 1]->dtype, {1}, const_true(), body);
+      const auto& normal_res_buffer = normal_res_buffers[idx - 1];
+      body = Allocate(normal_res_buffer->data, normal_res_buffer->dtype, normal_res_buffer->shape,
+                      const_true(), body);
     }
   }
   body = Substitute(body, value_map);

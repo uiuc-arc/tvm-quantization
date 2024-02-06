@@ -32,40 +32,63 @@
 # - Vulkan_SPIRV_TOOLS_LIBRARY
 #
 
-macro(find_vulkan use_vulkan)
+macro(find_vulkan use_vulkan use_khronos_spirv)
   set(__use_vulkan ${use_vulkan})
   if(IS_DIRECTORY ${__use_vulkan})
     set(__vulkan_sdk ${__use_vulkan})
     message(STATUS "Custom Vulkan SDK PATH=" ${__use_vulkan})
-   elseif(IS_DIRECTORY $ENV{VULKAN_SDK})
-     set(__vulkan_sdk $ENV{VULKAN_SDK})
-   else()
-     set(__vulkan_sdk "")
-   endif()
+  elseif(IS_DIRECTORY $ENV{VULKAN_SDK})
+    set(__vulkan_sdk $ENV{VULKAN_SDK})
+  else()
+    set(__vulkan_sdk "")
+  endif()
 
-   if(__vulkan_sdk)
-     set(Vulkan_INCLUDE_DIRS ${__vulkan_sdk}/include)
-     find_library(Vulkan_LIBRARY NAMES vulkan vulkan-1 PATHS ${__vulkan_sdk}/lib)
-     if(Vulkan_LIBRARY)
-       set(Vulkan_FOUND TRUE)
-     endif()
-   endif(__vulkan_sdk)
 
-   # resort to find vulkan of option is on
-   if(NOT Vulkan_FOUND)
-     if(${__use_vulkan} MATCHES ${IS_TRUE_PATTERN})
-       find_package(Vulkan QUIET)
-     endif()
-   endif()
-   # additional libraries
+  if(IS_DIRECTORY ${use_khronos_spirv})
+    set(__use_khronos_spirv ${use_khronos_spirv})
+    message(STATUS "Custom khronos spirv PATH=" ${__use_khronos_spirv})
+  else()
+    set(__use_khronos_spirv "")
+  endif()
+
+  if(CMAKE_SYSTEM_NAME STREQUAL "Android")
+    set(VULKAN_NDK_SRC ${CMAKE_ANDROID_NDK}/sources/third_party/vulkan/src)
+    set(Vulkan_INCLUDE_DIRS ${VULKAN_NDK_SRC}/include)
+    set(Vulkan_FOUND TRUE)
+    message(STATUS "Android Vulkan_INCLUDE_DIRS=" ${Vulkan_INCLUDE_DIRS})
+    message(STATUS "Skip finding SPIRV in Android, make sure you only build tvm runtime.")
+    return()
+  endif()
+
+  if(__vulkan_sdk)
+    set(Vulkan_INCLUDE_DIRS ${__vulkan_sdk}/include)
+    find_library(Vulkan_LIBRARY NAMES vulkan vulkan-1 PATHS ${__vulkan_sdk}/lib)
+    if(Vulkan_LIBRARY)
+      set(Vulkan_FOUND TRUE)
+    endif()
+  endif(__vulkan_sdk)
+
+  # resort to find vulkan of option is on
+  if(NOT Vulkan_FOUND)
+    if(${__use_vulkan} MATCHES ${IS_TRUE_PATTERN})
+      find_package(Vulkan QUIET)
+    endif()
+  endif()
 
   if(Vulkan_FOUND)
     get_filename_component(VULKAN_LIBRARY_PATH ${Vulkan_LIBRARY} DIRECTORY)
-    find_library(Vulkan_SPIRV_TOOLS_LIBRARY SPIRV-Tools
-        HINTS ${VULKAN_LIBRARY_PATH} ${VULKAN_LIBRARY_PATH}/spirv-tools ${VULKAN_SDK}/lib)
+    if (WIN32)
+      find_library(Vulkan_SPIRV_TOOLS_LIBRARY SPIRV-Tools
+        HINTS ${__use_khronos_spirv}/spirv-tools/lib ${VULKAN_LIBRARY_PATH} ${VULKAN_LIBRARY_PATH}/spirv-tools ${VULKAN_SDK}/lib)
+      find_path(_libspirv libspirv.h HINTS ${__use_khronos_spirv}/spirv-tools/include ${Vulkan_INCLUDE_DIRS} PATH_SUFFIXES vulkan spirv-tools)
+      find_path(_spirv spirv.hpp HINTS ${__use_khronos_spirv}/SPIRV-Headers/include ${Vulkan_INCLUDE_DIRS} PATH_SUFFIXES vulkan SPIRV spirv/unified1 spirv-headers)
+    else()
+      find_library(Vulkan_SPIRV_TOOLS_LIBRARY SPIRV-Tools
+          HINTS ${__use_khronos_spirv}/lib ${VULKAN_LIBRARY_PATH} ${VULKAN_LIBRARY_PATH}/spirv-tools ${VULKAN_SDK}/lib)
+      find_path(_libspirv libspirv.h HINTS ${__use_khronos_spirv}/include ${Vulkan_INCLUDE_DIRS} PATH_SUFFIXES vulkan spirv-tools)
+      find_path(_spirv spirv.hpp HINTS ${__use_khronos_spirv}/include ${Vulkan_INCLUDE_DIRS} PATH_SUFFIXES vulkan SPIRV spirv/unified1 spirv-headers)
+    endif()
 
-    find_path(_libspirv libspirv.h HINTS ${Vulkan_INCLUDE_DIRS} PATH_SUFFIXES vulkan spirv-tools)
-    find_path(_spirv spirv.hpp HINTS ${Vulkan_INCLUDE_DIRS} PATH_SUFFIXES vulkan SPIRV spirv/unified1 spirv-headers)
     find_path(_glsl_std GLSL.std.450.h HINTS ${Vulkan_INCLUDE_DIRS} PATH_SUFFIXES vulkan SPIRV spirv/unified1 spirv-headers)
     list(APPEND Vulkan_INCLUDE_DIRS ${_libspirv} ${_spirv} ${_glsl_std})
     message(STATUS "Vulkan_INCLUDE_DIRS=" ${Vulkan_INCLUDE_DIRS})

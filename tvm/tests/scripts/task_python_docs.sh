@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,7 +16,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -euo pipefail
+set -euxo pipefail
 
 source tests/scripts/setup-pytest-env.sh
 
@@ -58,6 +58,9 @@ sphinx_precheck() {
 
 function join_by { local IFS="$1"; shift; echo "$*"; }
 
+# Convert bash tutorials to Python format
+tests/scripts/task_convert_scripts_to_python.sh
+
 # These warnings are produced during the docs build for various reasons and are
 # known to not signficantly affect the output. Don't add anything new to this
 # list without special consideration of its effects, and don't add anything with
@@ -78,9 +81,15 @@ IGNORED_WARNINGS=(
     'gen_gallery extension is not safe for parallel'
     'strategy:conv2d NHWC layout is not optimized for x86 with autotvm.'
     'strategy:depthwise_conv2d NHWC layout is not optimized for x86 with autotvm.'
-    'autotvm:Cannot find config for target=llvm -keys=cpu -link-params=0'
+    'strategy:depthwise_conv2d with layout NHWC is not optimized for arm cpu.'
+    'strategy:dense is not optimized for arm cpu.'
+    'autotvm:Cannot find config for target=llvm -keys=cpu'
     'autotvm:One or more operators have not been tuned. Please tune your model for better performance. Use DEBUG logging level to see more details.'
     'autotvm:Cannot find config for target=cuda -keys=cuda,gpu'
+    # Warning is thrown during TFLite quantization for micro_train tutorial
+    'absl:For model inputs containing unsupported operations which cannot be quantized, the `inference_input_type` attribute will default to the original type.'
+    'absl:Found untraced functions such as _jit_compiled_convolution_op'
+    'You are using pip version'
 )
 
 JOINED_WARNINGS=$(join_by '|' "${IGNORED_WARNINGS[@]}")
@@ -166,6 +175,7 @@ mv docs/doxygen/html _docs/reference/api/doxygen
 mv jvm/core/target/site/apidocs _docs/reference/api/javadoc
 # mv rust/target/doc _docs/api/rust
 mv web/dist/docs _docs/reference/api/typedoc
+git rev-parse HEAD > _docs/commit_hash
 
 if [ "$IS_LOCAL" != "1" ]; then
     echo "Start creating the docs tarball.."

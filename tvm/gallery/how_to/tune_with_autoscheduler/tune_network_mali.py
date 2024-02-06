@@ -44,6 +44,7 @@ get it to run, you will need to wrap the body of this tutorial in a :code:`if
 __name__ == "__main__":` block.
 """
 
+
 import numpy as np
 
 import tvm
@@ -254,7 +255,7 @@ def tune_and_evaluate():
     temp = utils.tempdir()
     filename = "deploy_lib.so"
     path_lib = temp.relpath(filename)
-    lib.export_library(path_lib, ndk.create_shared)
+    lib.export_library(path_lib, fcompile=ndk.create_shared)
     remote.upload(path_lib)
     loaded_lib = remote.load_module(filename)
     module = graph_executor.GraphModule(loaded_lib["default"](dev))

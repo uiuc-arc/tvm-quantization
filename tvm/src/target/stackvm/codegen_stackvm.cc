@@ -139,13 +139,18 @@ int CodeGenStackVM::GetVarID(const VarNode* v) const {
   return it->second;
 }
 
-void CodeGenStackVM::VisitExpr_(const LoadNode* op) {
-  this->Push(op->buffer_var);
+void CodeGenStackVM::VisitExpr_(const BufferLoadNode* op) {
+  ICHECK_EQ(op->indices.size(), 1) << "StackVM expects flat 1-d buffers.  "
+                                   << "Has StorageFlatten (TE-based schedules) or "
+                                   << "FlattenBuffer (TIR-based schedules) been run?";
+  auto index = op->indices[0];
+
+  this->Push(op->buffer->data);
   StackVM::OpCode code = StackVM::GetLoad(op->dtype);
-  if (const IntImmNode* index = op->index.as<IntImmNode>()) {
-    this->PushOp(code, index->value);
+  if (const IntImmNode* int_index = index.as<IntImmNode>()) {
+    this->PushOp(code, int_index->value);
   } else {
-    this->Push(op->index);
+    this->Push(index);
     this->PushOp(StackVM::PUSH_I64, op->dtype.element_of().bytes());
     this->PushOp(StackVM::MUL_I64);
     this->PushOp(StackVM::ADDR_ADD);
@@ -153,14 +158,19 @@ void CodeGenStackVM::VisitExpr_(const LoadNode* op) {
   }
 }
 
-void CodeGenStackVM::VisitStmt_(const StoreNode* op) {
-  this->Push(op->buffer_var);
+void CodeGenStackVM::VisitStmt_(const BufferStoreNode* op) {
+  ICHECK_EQ(op->indices.size(), 1) << "StackVM expects flat 1-d buffers.  "
+                                   << "Has StorageFlatten (TE-based schedules) or "
+                                   << "FlattenBuffer (TIR-based schedules) been run?";
+  auto index = op->indices[0];
+
+  this->Push(op->buffer->data);
   StackVM::OpCode code = StackVM::GetStore(op->value.dtype());
-  if (const IntImmNode* index = op->index.as<IntImmNode>()) {
+  if (const IntImmNode* int_index = index.as<IntImmNode>()) {
     this->Push(op->value);
-    this->PushOp(code, index->value);
+    this->PushOp(code, int_index->value);
   } else {
-    this->Push(op->index);
+    this->Push(index);
     this->PushOp(StackVM::PUSH_I64, op->value.dtype().element_of().bytes());
     this->PushOp(StackVM::MUL_I64);
     this->PushOp(StackVM::ADDR_ADD);
@@ -173,13 +183,17 @@ void CodeGenStackVM::VisitStmt_(const AllocateNode* op) {
   LOG(FATAL) << "Dynamic allocation not supported";
 }
 
+void CodeGenStackVM::VisitStmt_(const DeclBufferNode* op) { VisitStmt(op->body); }
+
 void CodeGenStackVM::VisitExpr_(const CallNode* op) {
   if (op->op.same_as(builtin::address_of())) {
-    const LoadNode* l = op->args[0].as<LoadNode>();
-    ICHECK(op->args.size() == 1 && l);
-    this->PushOp(StackVM::LOAD_HEAP, GetVarID(l->buffer_var.get()));
-    this->Push(l->index);
-    this->PushOp(StackVM::PUSH_I64, l->dtype.element_of().bytes());
+    const BufferLoadNode* load = op->args[0].as<BufferLoadNode>();
+    ICHECK(op->args.size() == 1 && load);
+    ICHECK_EQ(load->indices.size(), 1) << "CodeGenStackVM only supports flat memory allocations.";
+
+    this->PushOp(StackVM::LOAD_HEAP, GetVarID(load->buffer->data.get()));
+    this->Push(load->indices[0]);
+    this->PushOp(StackVM::PUSH_I64, load->dtype.element_of().bytes());
     this->PushOp(StackVM::MUL_I64);
     this->PushOp(StackVM::ADDR_ADD);
   } else if (op->op.same_as(builtin::reinterpret())) {
@@ -270,6 +284,12 @@ void CodeGenStackVM::VisitExpr_(const CallNode* op) {
     this->Push(op->args[0]);
     this->PushOp(StackVM::PUSH_I64, 0);
     this->PushOp(StackVM::EQ_HANDLE);
+  } else if (op->op.same_as(builtin::ret())) {
+    CHECK(op->args.size() == 1 && op->args[0]->IsInstance<IntImmNode>() &&
+          op->args[0].as<IntImmNode>()->value == 0)
+        << "StackVM does not support return values, "
+        << "and the return value " << op->args
+        << " is not special case of returning an error code of zero.";
   } else {
     LOG(FATAL) << "unknown function call " << op->op;
   }
@@ -455,13 +475,13 @@ void CodeGenStackVM::VisitStmt_(const IfThenElseNode* op) {
   int64_t else_jump = this->PushOp(StackVM::RJUMP_IF_FALSE, 0);
   this->PushOp(StackVM::POP);
   this->Push(op->then_case);
-  if (op->else_case.defined()) {
+  if (op->else_case) {
     int64_t label_then_jump = this->GetPC();
     int64_t then_jump = this->PushOp(StackVM::RJUMP, 0);
     int64_t else_begin = this->GetPC();
     this->SetOperand(else_jump, else_begin - label_ejump);
     this->PushOp(StackVM::POP);
-    this->Push(op->else_case);
+    this->Push(op->else_case.value());
     int64_t if_end = this->GetPC();
     this->SetOperand(then_jump, if_end - label_then_jump);
   } else {

@@ -40,7 +40,11 @@ extern "C" {
  *
  * \param code An error code.
  */
+#if defined(_MSC_VER)
+__declspec(noreturn) void TVMPlatformAbort(tvm_crt_error_t code);
+#else
 void __attribute__((noreturn)) TVMPlatformAbort(tvm_crt_error_t code);
+#endif
 
 /*! \brief Called by the microTVM RPC server to implement TVMLogf.
  *
@@ -97,6 +101,25 @@ tvm_crt_error_t TVMPlatformTimerStart();
  */
 tvm_crt_error_t TVMPlatformTimerStop(double* elapsed_time_seconds);
 
+/*! \brief Platform-specific before measurement call.
+ *
+ * A function which is called before calling TVMFuncCall in the TimeEvaluator.
+ * Can be used, for example, to initialize reset global state which may affect the results of
+ * measurement.
+ *
+ * \return kTvmErrorNoError if successful; a descriptive error code otherwise.
+ */
+tvm_crt_error_t TVMPlatformBeforeMeasurement();
+
+/*! \brief Platform-specific after measurement call.
+ *
+ * A function which is called after calling TVMFuncCall in the TimeEvaluator.
+ * It is the counterpart of the TVMPlatformBeforeMeasurement function.
+ *
+ * \return kTvmErrorNoError if successful; a descriptive error code otherwise.
+ */
+tvm_crt_error_t TVMPlatformAfterMeasurement();
+
 /*! \brief Fill a buffer with random data.
  *
  * Cryptographically-secure random data is NOT required. This function is intended for use
@@ -115,6 +138,15 @@ tvm_crt_error_t TVMPlatformTimerStop(double* elapsed_time_seconds);
  * \return kTvmErrorNoError if successful; a descriptive error code otherwise.
  */
 tvm_crt_error_t TVMPlatformGenerateRandom(uint8_t* buffer, size_t num_bytes);
+
+/*! \brief Initialize TVM inference.
+ *
+ * Placeholder function for TVM inference initializations on a specific platform.
+ * A common use of this function is setting up workspace memory for TVM inference.
+ *
+ * \return kTvmErrorNoError if successful.
+ */
+tvm_crt_error_t TVMPlatformInitialize();
 
 #ifdef __cplusplus
 }  // extern "C"

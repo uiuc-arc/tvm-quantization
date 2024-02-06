@@ -96,7 +96,7 @@ regular TVM CUDA compilation and code generation.
 .. code:: python
 
     from tvm.relay.op.contrib.tensorrt import partition_for_tensorrt
-    mod, config = partition_for_tensorrt(mod, params)
+    mod = partition_for_tensorrt(mod, params)
 
 
 Build the Relay graph, using the new module and config returned by partition_for_tensorrt. The
@@ -107,7 +107,7 @@ PassContext so the values can be read during compilation.
 .. code:: python
 
     target = "cuda"
-    with tvm.transform.PassContext(opt_level=3, config={'relay.ext.tensorrt.options': config}):
+    with tvm.transform.PassContext(opt_level=3):
         lib = relay.build(mod, target=target, params=params)
 
 
@@ -192,6 +192,8 @@ Operator support
 | nn.layer_norm          |                                    |
 +------------------------+------------------------------------+
 | nn.softmax             |                                    |
++------------------------+------------------------------------+
+| nn.conv1d              |                                    |
 +------------------------+------------------------------------+
 | nn.conv2d              |                                    |
 +------------------------+------------------------------------+
@@ -278,6 +280,8 @@ Operator support
 | ceil                   | Requires TensorRT 5.1.5 or greater |
 +------------------------+------------------------------------+
 | floor                  | Requires TensorRT 5.1.5 or greater |
++------------------------+------------------------------------+
+| split                  | Requires TensorRT 5.1.5 or greater |
 +------------------------+------------------------------------+
 | strided_slice          | Requires TensorRT 5.1.5 or greater |
 +------------------------+------------------------------------+

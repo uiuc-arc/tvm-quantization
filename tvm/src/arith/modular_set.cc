@@ -67,7 +67,18 @@ struct ModularSetAnalyzer::Entry {
   Entry() = default;
 
   Entry(int64_t coeff, int64_t base) {
-    ICHECK_GE(coeff, 0);
+    if (coeff < 0) {
+      // `analyzer->canonical_simplify()` can generate expressions with
+      // negative coefficients (e.g. simplifying `floormod(-i, 2)`
+      // into `floormod(i, -2) * -1`).  When this happens, the
+      // ModularSet may enter a constraint based on this expression.
+      //
+      // Handling a negative coeff uses the same sign convention as
+      // canonical_simplify, requiring that
+      // `floormod(var, coeff) == -floormod(var, -coeff)`.
+      coeff *= -1;
+      base *= -1;
+    }
     this->coeff = coeff;
     if (coeff != 0) {
       base = base % coeff;
@@ -110,6 +121,10 @@ class ModularSetAnalyzer::Impl : public ExprFunctor<ModularSetAnalyzer::Entry(co
     if ((truncmod(var, coeff) == base).Match(constraint) ||
         (floormod(var, coeff) == base).Match(constraint)) {
       Entry entry(coeff.Eval()->value, base.Eval()->value);
+      return UpdateByIntersect(var.Eval(), entry);
+    }
+    if ((var == base).Match(constraint) || (base == var).Match(constraint)) {
+      Entry entry(1, base.Eval()->value);
       return UpdateByIntersect(var.Eval(), entry);
     }
     return nullptr;
@@ -214,11 +229,40 @@ class ModularSetAnalyzer::Impl : public ExprFunctor<ModularSetAnalyzer::Entry(co
     return Union(a, b);
   }
 
+  Entry ModByConst(const PrimExpr& lhs, int64_t val, bool round_down) {
+    Entry a = VisitExpr(lhs);
+    ICHECK_NE(val, 0);
+    int64_t coeff = ZeroAwareGCD(a.coeff, val);
+    if (a.base % coeff == 0 ||
+        (a.base > 0 && (round_down || parent_->CanProveGreaterEqual(lhs, 0)))) {
+      return Entry(coeff, a.base % coeff);
+    }
+    return Everything();
+  }
+
+  Entry VisitExpr_(const FloorModNode* op) final {
+    Entry b = VisitExpr(op->b);
+    if (b.is_const()) {
+      return ModByConst(op->a, b.base, true);
+    }
+    return Everything();
+  }
+
+  Entry VisitExpr_(const ModNode* op) final {
+    Entry b = VisitExpr(op->b);
+    if (b.is_const()) {
+      return ModByConst(op->a, b.base, false);
+    }
+    return Everything();
+  }
+
   Entry VisitExpr_(const CallNode* op) final {
     // only special handle >> which can be
     // used for index calculation.
     if (op->op.same_as(tir::builtin::shift_right())) {
       return VisitRightShift(op);
+    } else if (op->op.same_as(tir::builtin::bitwise_and())) {
+      return VisitBitwiseAnd(op);
     } else {
       return Everything();
     }
@@ -239,6 +283,17 @@ class ModularSetAnalyzer::Impl : public ExprFunctor<ModularSetAnalyzer::Entry(co
     // a c x  / c -> a x
     if (b.is_const()) {
       return DivByConst(op->args[0], static_cast<int64_t>(1) << b.base, true);
+    }
+    return Everything();
+  }
+
+  Entry VisitBitwiseAnd(const CallNode* op) {
+    Entry b = VisitExpr(op->args[1]);
+    if (b.is_const()) {
+      int shift;
+      if (is_const_power_of_two_integer(Integer(b.base + 1), &shift)) {
+        return ModByConst(op->args[0], static_cast<int64_t>(1) << shift, true);
+      }
     }
     return Everything();
   }

@@ -18,15 +18,15 @@
 # pylint: disable=unused-argument, redefined-builtin, no-else-return
 """Conv3D operators"""
 from collections import namedtuple
+
 import tvm
-from tvm import te
-from tvm import autotvm
-from tvm.autotvm.task.space import SplitEntity, OtherOptionEntity
-from ..utils import traverse_inline
-from ..nn.utils import get_pad_tuple3d, infer_pad3d
+from tvm import autotvm, te
+from tvm.autotvm.task.space import OtherOptionEntity, SplitEntity
+from tvm.target.x86 import get_simd_32bit_lanes
+
 from ..nn.pad import pad
-from ..utils import get_const_tuple, simplify, get_const_int
-from .utils import get_simd_32bit_lanes
+from ..nn.utils import get_pad_tuple3d, infer_pad3d
+from ..utils import get_const_int, get_const_tuple, simplify, traverse_inline
 
 Workload3D = namedtuple(
     "Workload",
@@ -53,7 +53,7 @@ Workload3D = namedtuple(
 
 
 @autotvm.register_topi_compute("conv3d_ndhwc.x86")
-def conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, out_dtype):
+def conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, groups, out_dtype):
     """3D convolution forward operator.
 
     Parameters
@@ -74,6 +74,9 @@ def conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, out_dtype):
     dilation: int or a list/tuple of three ints
         dilation size, or [dilation_depth, dilation_height, dilation_width]
 
+    groups: int
+        Number of groups
+
     Returns
     -------
     output : tvm.te.Tensor
@@ -84,14 +87,14 @@ def conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, out_dtype):
     strides = strides if isinstance(strides, (tuple, list)) else (strides, strides, strides)
     dilation = dilation if isinstance(dilation, (tuple, list)) else (dilation, dilation, dilation)
 
-    _create_tuning_space(cfg, data, kernel, strides, padding, dilation, layout)
+    _create_tuning_space(cfg, data, kernel, strides, padding, dilation, groups, layout)
     if cfg.is_fallback:
-        _get_default_config(cfg, data, kernel, strides, padding, out_dtype, layout)
-    return _conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, out_dtype)
+        _get_default_config(cfg, data, kernel, strides, padding, groups, out_dtype, layout)
+    return _conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, groups, out_dtype)
 
 
 @autotvm.register_topi_compute("conv3d_ncdhw.x86")
-def conv3d_ncdhw(cfg, data, kernel, strides, padding, dilation, out_dtype):
+def conv3d_ncdhw(cfg, data, kernel, strides, padding, dilation, groups, out_dtype):
     """3D convolution forward operator.
 
     Parameters
@@ -112,20 +115,24 @@ def conv3d_ncdhw(cfg, data, kernel, strides, padding, dilation, out_dtype):
     dilation: int or a list/tuple of three ints
         dilation size, or [dilation_depth, dilation_height, dilation_width]
 
+    groups: int
+        Number of groups
+
     Returns
     -------
     output : tvm.te.Tensor
         5-D with shape [batch, out_channel, out_depth, out_height, out_width] for NCDHW layout
     """
+    # assert groups == 1, "conv3d_ncdhw.x86 does not support groups"
     layout = "NCDHW"
     out_dtype = data.dtype if out_dtype is None else out_dtype
     strides = strides if isinstance(strides, (tuple, list)) else (strides, strides, strides)
     dilation = dilation if isinstance(dilation, (tuple, list)) else (dilation, dilation, dilation)
 
-    _create_tuning_space(cfg, data, kernel, strides, padding, dilation, layout)
+    _create_tuning_space(cfg, data, kernel, strides, padding, dilation, groups, layout)
     if cfg.is_fallback:
-        _get_default_config(cfg, data, kernel, strides, padding, out_dtype, layout)
-    return _conv3d_ncdhw(cfg, data, kernel, strides, padding, dilation, layout, out_dtype)
+        _get_default_config(cfg, data, kernel, strides, padding, groups, out_dtype, layout)
+    return _conv3d_ncdhw(cfg, data, kernel, strides, padding, dilation, layout, groups, out_dtype)
 
 
 @autotvm.register_topi_schedule("conv3d_ndhwc.x86")
@@ -208,7 +215,7 @@ def schedule_conv3d_ncdhw(cfg, outs):
     return s
 
 
-def _conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, out_dtype):
+def _conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, groups, out_dtype):
     out_dtype = data.dtype if out_dtype is None else out_dtype
 
     assert isinstance(dilation, int) or len(dilation) == 3
@@ -220,6 +227,9 @@ def _conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, out_dtype):
     DSTR, HSTR, WSTR = strides
     batch_size, in_depth, in_height, in_width, in_channel = get_const_tuple(data.shape)
     kernel_depth, kernel_height, kernel_width, _, num_filter = get_const_tuple(kernel.shape)
+
+    assert in_channel % groups == 0, "input channels must be a multiple of group size"
+    assert num_filter % groups == 0, "number of filters must be a multiple of group size"
 
     dilated_kernel_d = (kernel_depth - 1) * dilation_d + 1
     dilated_kernel_h = (kernel_height - 1) * dilation_h + 1
@@ -255,21 +265,19 @@ def _conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, out_dtype):
 
     # fetch schedule
     ic_bn, oc_bn = cfg["tile_ic"].size[-1], cfg["tile_oc"].size[-1]
+    assert groups == 1 or ic_bn <= groups
+    assert groups == 1 or oc_bn <= groups
     shape = (batch_size, in_channel // ic_bn, pad_depth, pad_height, ic_bn, pad_width)
     data_vec = te.compute(
         shape, lambda n, C, d, h, c, w: data_pad[n, d, h, w, C * ic_bn + c], name="data_vec"
     )
 
+    ci_tile = in_channel // groups // ic_bn
+    if ci_tile == 0 or ci_tile * ic_bn * groups < in_channel:
+        ci_tile += 1
+
     # pack kernel
-    shape = (
-        num_filter // oc_bn,
-        in_channel // ic_bn,
-        kernel_depth,
-        kernel_height,
-        kernel_width,
-        ic_bn,
-        oc_bn,
-    )
+    shape = (num_filter // oc_bn, ci_tile, kernel_depth, kernel_height, kernel_width, ic_bn, oc_bn)
     kernel_vec = te.compute(
         shape,
         lambda CO, CI, d, h, w, ci, co: kernel[d, h, w, CI * ic_bn + ci, CO * oc_bn + co],
@@ -280,7 +288,7 @@ def _conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, out_dtype):
     oshape = (batch_size, num_filter // oc_bn, out_depth, out_height, out_width, oc_bn)
     unpack_shape = (batch_size, out_depth, out_height, out_width, num_filter)
 
-    ic = te.reduce_axis((0, in_channel), name="ic")
+    ic = te.reduce_axis((0, in_channel // groups), name="ic")
     kh = te.reduce_axis((0, kernel_height), name="kh")
     kw = te.reduce_axis((0, kernel_width), name="kw")
     kd = te.reduce_axis((0, kernel_depth), name="kd")
@@ -292,10 +300,18 @@ def _conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, out_dtype):
         lambda n, oc_chunk, od, oh, ow, oc_block: te.sum(
             data_vec[
                 n,
-                idxdiv(ic, ic_bn),
+                idxdiv(
+                    (oc_chunk * oc_bn + oc_block) // (num_filter // groups) * (in_channel // groups)
+                    + ic,
+                    ic_bn,
+                ),
                 od * DSTR + kd * dilation_d,
                 oh * HSTR + kh * dilation_h,
-                idxmod(ic, ic_bn),
+                idxmod(
+                    (oc_chunk * oc_bn + oc_block) // (num_filter // groups) * (in_channel // groups)
+                    + ic,
+                    ic_bn,
+                ),
                 ow * WSTR + kw * dilation_w,
             ].astype(out_dtype)
             * kernel_vec[
@@ -316,7 +332,7 @@ def _conv3d_ndhwc(cfg, data, kernel, strides, padding, dilation, out_dtype):
     return conv_unpacked
 
 
-def _conv3d_ncdhw(cfg, data, kernel, strides, padding, dilation, layout, out_dtype):
+def _conv3d_ncdhw(cfg, data, kernel, strides, padding, dilation, layout, groups, out_dtype):
     out_dtype = data.dtype if out_dtype is None else out_dtype
 
     assert isinstance(dilation, int) or len(dilation) == 3
@@ -369,16 +385,12 @@ def _conv3d_ncdhw(cfg, data, kernel, strides, padding, dilation, layout, out_dty
         shape, lambda n, C, d, h, c, w: data_pad[n, C * ic_bn + c, d, h, w], name="data_vec"
     )
 
+    ci_tile = in_channel // groups // ic_bn
+    if ci_tile == 0 or ci_tile * ic_bn * groups < in_channel:
+        ci_tile += 1
+
     # pack kernel
-    shape = (
-        num_filter // oc_bn,
-        in_channel // ic_bn,
-        kernel_depth,
-        kernel_height,
-        kernel_width,
-        ic_bn,
-        oc_bn,
-    )
+    shape = (num_filter // oc_bn, ci_tile, kernel_depth, kernel_height, kernel_width, ic_bn, oc_bn)
     kernel_vec = te.compute(
         shape,
         lambda CO, CI, d, h, w, ci, co: kernel[CO * oc_bn + co, CI * ic_bn + ci, d, h, w],
@@ -389,7 +401,7 @@ def _conv3d_ncdhw(cfg, data, kernel, strides, padding, dilation, layout, out_dty
     oshape = (batch_size, num_filter // oc_bn, out_depth, out_height, out_width, oc_bn)
     unpack_shape = (batch_size, num_filter, out_depth, out_height, out_width)
 
-    ic = te.reduce_axis((0, in_channel), name="ic")
+    ic = te.reduce_axis((0, in_channel // groups), name="ic")
     kh = te.reduce_axis((0, kernel_height), name="kh")
     kw = te.reduce_axis((0, kernel_width), name="kw")
     kd = te.reduce_axis((0, kernel_depth), name="kd")
@@ -401,10 +413,18 @@ def _conv3d_ncdhw(cfg, data, kernel, strides, padding, dilation, layout, out_dty
         lambda n, oc_chunk, od, oh, ow, oc_block: te.sum(
             data_vec[
                 n,
-                idxdiv(ic, ic_bn),
+                idxdiv(
+                    (oc_chunk * oc_bn + oc_block) // (num_filter // groups) * (in_channel // groups)
+                    + ic,
+                    ic_bn,
+                ),
                 od * DSTR + kd * dilation_d,
                 oh * HSTR + kh * dilation_h,
-                idxmod(ic, ic_bn),
+                idxmod(
+                    (oc_chunk * oc_bn + oc_block) // (num_filter // groups) * (in_channel // groups)
+                    + ic,
+                    ic_bn,
+                ),
                 ow * WSTR + kw * dilation_w,
             ].astype(out_dtype)
             * kernel_vec[
@@ -425,7 +445,7 @@ def _conv3d_ncdhw(cfg, data, kernel, strides, padding, dilation, layout, out_dty
     return conv_unpacked
 
 
-def _create_tuning_space(cfg, data, kernel, strides, padding, dilation, layout):
+def _create_tuning_space(cfg, data, kernel, strides, padding, dilation, groups, layout):
     """Create schedule configuration from input arguments"""
     dshape = get_const_tuple(data.shape)
     kshape = get_const_tuple(kernel.shape)
@@ -436,7 +456,7 @@ def _create_tuning_space(cfg, data, kernel, strides, padding, dilation, layout):
         n, ic, d, h, w = dshape
         oc, _, kd, kh, kw = kshape
     else:
-        raise ValueError("Not support this layout {} with " "schedule template.".format(layout))
+        raise ValueError(f"Not support this layout {layout} with schedule template.")
 
     # pad_front, pad_top, pad_left, pad_back, pad_down(bottom), pad_right
     pf, pt, pl, pb, pd, pr = get_pad_tuple3d(padding, (kd, kh, kw))
@@ -452,12 +472,12 @@ def _create_tuning_space(cfg, data, kernel, strides, padding, dilation, layout):
     cfg.define_knob("unroll_kw", [True, False])
 
 
-def _get_default_config(cfg, data, kernel, strides, padding, out_dtype, layout):
+def _get_default_config(cfg, data, kernel, strides, padding, groups, out_dtype, layout):
     """
     Get default schedule config for the workload
     """
     if layout not in ["NDHWC", "NCDHW"]:
-        raise ValueError("Layout {} is not supported".format(layout))
+        raise ValueError(f"Layout {layout} is not supported")
 
     static_data_shape = []
     for dim in get_const_tuple(data.shape):
@@ -466,11 +486,11 @@ def _get_default_config(cfg, data, kernel, strides, padding, out_dtype, layout):
         else:
             static_data_shape.append(dim)
     data = te.placeholder(static_data_shape, dtype=data.dtype)
-    wkl = _get_conv3d_workload(data, kernel, strides, padding, out_dtype, layout)
+    wkl = _get_conv3d_workload(data, kernel, strides, padding, groups, out_dtype, layout)
     _fallback_schedule(cfg, wkl)
 
 
-def _get_conv3d_workload(data, kernel, stride, padding, out_dtype, data_layout="NCHW"):
+def _get_conv3d_workload(data, kernel, stride, padding, groups, out_dtype, data_layout="NCHW"):
     """Get the workload structure."""
     if data_layout == "NCDHW":
         _, CI, ID, IH, IW = get_const_tuple(data.shape)
@@ -479,7 +499,7 @@ def _get_conv3d_workload(data, kernel, stride, padding, out_dtype, data_layout="
         _, ID, IH, IW, CI = get_const_tuple(data.shape)
         KD, KH, KW, CIG, CO = get_const_tuple(kernel.shape)
     else:
-        raise ValueError("not support this layout {} yet".format(data_layout))
+        raise ValueError(f"not support this layout {data_layout} yet")
 
     pad_front, pad_top, pad_left, pad_back, pad_down, pad_right = get_pad_tuple3d(
         padding, (get_const_int(KD), get_const_int(KH), get_const_int(KW))
@@ -487,17 +507,13 @@ def _get_conv3d_workload(data, kernel, stride, padding, out_dtype, data_layout="
     DPAD = pad_front + pad_back
     HPAD = pad_top + pad_down
     WPAD = pad_left + pad_right
-    GRPS = CI // CIG
     if isinstance(stride, (tuple, list)):
         DSTR, HSTR, WSTR = stride
     else:
         DSTR, HSTR, WSTR = stride, stride, stride
     assert (data.dtype == kernel.dtype) or (
         data.dtype == "uint8" and kernel.dtype == "int8"
-    ), "Do not support inputs with different data types now. ' \
-        '{} vs. {}".format(
-        data.dtype, kernel.dtype
-    )
+    ), f"Do not support inputs with different data types now. {data.dtype} vs. {kernel.dtype}"
     return Workload3D(
         data.dtype,
         out_dtype,
@@ -505,7 +521,7 @@ def _get_conv3d_workload(data, kernel, stride, padding, out_dtype, data_layout="
         IH,
         IW,
         CI,
-        GRPS,
+        groups,
         CO,
         KD,
         KH,

@@ -232,7 +232,7 @@ def conv_output_shape(
         w_shape = w_shape[2:]
 
     else:
-        raise ValueError("Unknown CuDNN tensor format: '{}'".format(tensor_format))
+        raise ValueError(f"Unknown CuDNN tensor format: '{tensor_format}'")
 
     x_lanes = tvm.runtime.DataType(data_dtype).lanes
     assert x_chan * x_lanes == w_chan_input * groups, (
@@ -253,13 +253,13 @@ def conv_output_shape(
     elif tensor_format == 1:
         output = [n_output, *output_dims, c_output]
     else:
-        raise ValueError("Unknown CuDNN tensor format: '{}'".format(tensor_format))
+        raise ValueError(f"Unknown CuDNN tensor format: '{tensor_format}'")
 
     return output
 
 
 def conv_dgrad_shape(
-    tensor_format, pad, stride, dilation, dy_shape, w_shape, output_padding=(0, 0)
+    tensor_format, pad, stride, dilation, dy_shape, w_shape, output_padding=(0, 0), groups=1
 ):
     """Get output shape of conv2d gradient with respect to data
 
@@ -296,16 +296,16 @@ def conv_dgrad_shape(
 
     if tensor_format == 0:
         N = dy_shape[0]
-        C = w_shape[1]
+        C = w_shape[1] * groups
         dy_shape = dy_shape[2:]
         w_shape = w_shape[2:]
     elif tensor_format == 1:
         N = dy_shape[0]
-        C = w_shape[-1]
+        C = w_shape[-1] * groups
         dy_shape = dy_shape[1:-1]
         w_shape = w_shape[1:-1]
     else:
-        raise ValueError("Unsupported CuDNN tensor format: '{}'".format(tensor_format))
+        raise ValueError(f"Unsupported CuDNN tensor format: '{tensor_format}'")
 
     input_dims = []
     for dy_shape_i, w_shape_i, pad_i, stride_i, dilation_i, out_pad in zip(
@@ -738,21 +738,25 @@ def conv_backward_data(
     ), "Dynamic batch is not supported for cudnn conv2d backwad data yet."
 
     dx_shape = conv_dgrad_shape(
-        tensor_format, pad, stride, dilation, dy.shape, w.shape, output_padding
+        tensor_format, pad, stride, dilation, dy.shape, w.shape, output_padding, groups
     )
 
-    algo = conv_backward_data_find_algo(
-        tensor_format,
-        pad,
-        stride,
-        dilation,
-        list(dy.shape),
-        list(w.shape),
-        dx_shape,
-        dy.dtype,
-        conv_dtype,
-        groups,
-    )
+    if exists():
+        # When cudnn exists, find the backward data algo
+        algo = conv_backward_data_find_algo(
+            tensor_format,
+            pad,
+            stride,
+            dilation,
+            list(dy.shape),
+            list(w.shape),
+            dx_shape,
+            dy.dtype,
+            conv_dtype,
+            groups,
+        )
+    else:
+        algo = 1
 
     return te.extern(
         dx_shape,
@@ -826,10 +830,20 @@ def conv_backward_filter(
         x.shape[0], tvm.tir.expr.IntImm
     ), "Dynamic batch is not supported for cudnn conv2d backwad filter yet."
 
-    if tensor_format == 0:
-        dw_shape = [dy.shape[1], x_shape[1], filter_h, filter_w]
+    ic_ind = 1 if tensor_format == 0 else 3
+
+    if groups > 1:
+        assert (
+            x_shape[ic_ind] == dy.shape[ic_ind] and x_shape[ic_ind] == groups
+        ), "Only depthwise wgrad supported for groups > 1."
+        ic = 1
     else:
-        dw_shape = [dy.shape[3], filter_h, filter_w, x_shape[3]]
+        ic = x_shape[ic_ind]
+
+    if tensor_format == 0:
+        dw_shape = [dy.shape[1], ic, filter_h, filter_w]
+    else:
+        dw_shape = [dy.shape[3], filter_h, filter_w, ic]
 
     algo = conv_backward_filter_find_algo(
         tensor_format,

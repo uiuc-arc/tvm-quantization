@@ -122,7 +122,7 @@ A few observations on HLS coding:
     - Pointer parameters can mean one of two things depending on the interface
       pragma being used.
 
-       - When used with a ``m_axi`` interface pragma, an AXI master interface
+       - When used with a ``m_axi`` interface pragma, an AXI requestor interface
          gets generated to provide DMA access to DRAM.
        - When used with a ``bram`` interface pragma, a BRAM interface gets
          generated to expose read and/or write ports to an FPGA block-RAM.
@@ -296,5 +296,3 @@ Load and Store Modules
 The load and store modules perform 2D DMA loads with a strided access pattern from DRAM to SRAM.
 In addition, the load module can insert 2D padding on the fly, which is useful when blocking 2D convolution.
 This means that VTA can tile 2D convolution inputs without paying the overhead of re-laying data out in DRAM to insert spatial padding around input and weight tiles.
-
-

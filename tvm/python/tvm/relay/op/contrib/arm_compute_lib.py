@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-# pylint: disable=invalid-name, unused-argument
+# pylint: disable=invalid-name, unused-argument, dangerous-default-value
 """Arm Compute Library supported operators."""
 import tvm
 from tvm import relay
@@ -23,7 +23,7 @@ from tvm.relay import transform
 from tvm.relay.build_module import bind_params_by_name
 from tvm.relay.expr import const
 
-from ...dataflow_pattern import is_constant, is_expr, is_op, wildcard
+from ...dataflow_pattern import is_constant, is_expr, is_op, is_tuple, wildcard
 from ..strategy.generic import is_depthwise_conv2d
 from .register import register_pattern_table
 
@@ -42,7 +42,7 @@ def is_arm_compute_runtime_enabled():
     return False
 
 
-def partition_for_arm_compute_lib(mod, params=None, **opts):
+def partition_for_arm_compute_lib(mod, params=None, disabled_ops=["concatenate"], **opts):
     """Partition the graph greedily offloading supported
     operators to Arm Compute Library.
 
@@ -52,6 +52,8 @@ def partition_for_arm_compute_lib(mod, params=None, **opts):
         The module to run passes on.
     params : Optional[Dict[str, NDArray]]
         Constant input parameters.
+    disabled_ops : Optional[list]
+        Ops do not want to offload to ACL.
 
     Returns
     -------
@@ -63,7 +65,7 @@ def partition_for_arm_compute_lib(mod, params=None, **opts):
     seq = tvm.transform.Sequential(
         [
             transform.InferType(),
-            transform.MergeComposite(arm_compute_lib_pattern_table()),
+            transform.MergeComposite(arm_compute_lib_pattern_table(disabled_ops)),
             transform.AnnotateTarget("arm_compute_lib", False),
             transform.PartitionGraph(),
         ]
@@ -128,7 +130,7 @@ def preprocess_module(mod):
 
 
 @register_pattern_table("arm_compute_lib")
-def arm_compute_lib_pattern_table():
+def arm_compute_lib_pattern_table(disabled_ops=["concatenate"]):
     """Get the ACL pattern table."""
 
     def conv_pattern():
@@ -220,6 +222,17 @@ def arm_compute_lib_pattern_table():
         pattern = is_op("sqrt")(pattern)
         return pattern
 
+    def concatenate_pattern():
+        """Create an concatenate pattern from equivalent relay operators.
+
+        Returns
+        -------
+        pattern : dataflow_pattern.AltPattern
+            Denotes the concatenate pattern.
+        """
+        pattern = is_op("concatenate")(is_tuple(None))
+        return pattern
+
     def check_conv(extract):
         """Check conv pattern is supported by ACL."""
         call = extract
@@ -229,7 +242,7 @@ def arm_compute_lib_pattern_table():
 
     def check_qnn_conv(extract):
         """Check qnn conv pattern is supported by ACL."""
-        if extract.attrs.out_dtype != "uint8":
+        if extract.attrs.out_dtype not in ("uint8", "int8"):
             return False
         call = extract
         while call.op.name != "qnn.conv2d":
@@ -245,7 +258,7 @@ def arm_compute_lib_pattern_table():
 
     def check_qnn_dense(extract):
         """Check qnn conv pattern is supported by ACL."""
-        if extract.attrs.out_dtype != "uint8":
+        if extract.attrs.out_dtype not in ("uint8", "int8"):
             return False
         call = extract
         while call.op.name != "qnn.dense":
@@ -254,7 +267,7 @@ def arm_compute_lib_pattern_table():
 
     def check_avg_pool2d(extract):
         """Check average pool2d pattern is supported by ACL."""
-        if extract.attrs.dtype != "uint8":
+        if extract.attrs.dtype not in ("uint8", "int8"):
             return False
         pool = extract.args[0]
         if pool.args[0].attrs.dtype != "int32":
@@ -266,6 +279,19 @@ def arm_compute_lib_pattern_table():
         pool = extract.args[0]
         return avg_pool2d(pool)
 
+    def check_concatenate(expr):
+        """Check concatenate pattern is supported by ACL."""
+        if "concatenate" in disabled_ops:
+            return False
+        attrs, type_args = expr.attrs, expr.type_args
+        for idx in range(len(type_args[0].fields)):
+            if type_args[0].fields[idx].dtype not in ["float32", "uint8", "int8"]:
+                return False
+        # ACL concatenate only supports maximum 4 dimensions input tensor
+        if attrs.axis not in [-4, -3, -2, -1, 0, 1, 2, 3]:
+            return False
+        return True
+
     return [
         ("arm_compute_lib.conv2d", conv_pattern(), check_conv),
         ("arm_compute_lib.qnn_conv2d", qnn_conv_pattern(), check_qnn_conv),
@@ -274,6 +300,7 @@ def arm_compute_lib_pattern_table():
         ("arm_compute_lib.qnn_conv2d", qnn_conv_pattern(), check_qnn_conv),
         ("arm_compute_lib.avg_pool2d", avg_pool2d_pattern(), check_avg_pool2d),
         ("arm_compute_lib.l2_pool2d", l2_pool2d_pattern(), check_l2_pool2d),
+        ("arm_compute_lib.concatenate", concatenate_pattern(), check_concatenate),
     ]
 
 
@@ -320,16 +347,21 @@ def conv2d(expr):
 def qnn_conv2d(expr):
     """Check if the external ACL codegen for qnn.conv2d should be used."""
     attrs, args = expr.attrs, expr.args
+    qnn_dtypes = ("uint8", "int8")
 
     if attrs.data_layout != "NHWC":
         return False
     if attrs.out_dtype != "int32" and attrs.out_dtype != "":
         return False
     data_typ = args[0].checked_type
-    if len(data_typ.shape) != 4 or data_typ.shape[0] != 1 or data_typ.dtype != "uint8":
+    if len(data_typ.shape) != 4 or data_typ.shape[0] != 1 or data_typ.dtype not in qnn_dtypes:
         return False
     kernel_typ = args[1].checked_type
-    if len(kernel_typ.shape) != 4 or kernel_typ.dtype != "uint8":
+    if len(kernel_typ.shape) != 4 or kernel_typ.dtype not in qnn_dtypes:
+        return False
+    if is_per_channel_quantization(
+        zero_point=args[2], scale=args[4]
+    ) or is_per_channel_quantization(zero_point=args[3], scale=args[5]):
         return False
     is_depthwise = is_depthwise_conv2d(
         data_typ.shape,
@@ -387,12 +419,16 @@ def qnn_dense(expr):
     """Check if the external ACL codegen for qnn.dense should be used."""
     attrs, args = expr.attrs, expr.args
     data_typ = args[0].checked_type
-    if data_typ.dtype != "uint8":
+    if data_typ.dtype not in ("uint8", "int8"):
         return False
     kernel_typ = args[1].checked_type
-    if len(kernel_typ.shape) != 2 or kernel_typ.dtype != "uint8":
+    if len(kernel_typ.shape) != 2 or kernel_typ.dtype not in ("uint8", "int8"):
         return False
     if attrs.out_dtype != "int32":
+        return False
+    if is_per_channel_quantization(
+        zero_point=args[2], scale=args[4]
+    ) or is_per_channel_quantization(zero_point=args[3], scale=args[5]):
         return False
     return True
 
@@ -412,7 +448,7 @@ def max_pool2d(expr):
     if attrs.layout != "NHWC":
         return False
     typ = args[0].checked_type
-    if typ.dtype not in ["float32", "uint8"]:
+    if typ.dtype not in ["float32", "uint8", "int8"]:
         return False
     return check_dilation(attrs)
 
@@ -440,7 +476,7 @@ def global_max_pool2d(expr):
     """Check if the external ACL codegen for gloval_maxpool2d should be used."""
     attrs, args = expr.attrs, expr.args
     typ = args[0].checked_type
-    if typ.dtype not in ["float32", "uint8"]:
+    if typ.dtype not in ["float32", "uint8", "int8"]:
         return False
     if attrs.layout != "NHWC":
         return False
@@ -484,10 +520,24 @@ def qnn_add(expr):
     """Check if the external ACL codegen for add should be used."""
     args = expr.args
     for typ in [args[0].checked_type, args[1].checked_type]:
-        if typ.dtype != "uint8":
+        if typ.dtype not in ["int8", "uint8"]:
             return False
-
+    if (
+        is_per_channel_quantization(zero_point=args[3], scale=args[2])
+        or is_per_channel_quantization(zero_point=args[5], scale=args[4])
+        or is_per_channel_quantization(zero_point=args[7], scale=args[6])
+    ):
+        return False
     return True
+
+
+def is_per_channel_quantization(zero_point, scale):
+    """Check if the quantization is per-channel"""
+    for value in [zero_point, scale]:
+        shape = value.checked_type.shape
+        if len(shape) != 0 and shape[0] != 1:
+            return True
+    return False
 
 
 class OpAttrContext(object):

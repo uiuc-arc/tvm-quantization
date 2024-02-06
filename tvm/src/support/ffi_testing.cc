@@ -23,11 +23,13 @@
  */
 #include <tvm/ir/attrs.h>
 #include <tvm/ir/env_func.h>
+#include <tvm/runtime/container/variant.h>
 #include <tvm/runtime/module.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/te/tensor.h>
 #include <tvm/tir/expr.h>
 
+#include <chrono>
 #include <thread>
 
 namespace tvm {
@@ -61,6 +63,18 @@ TVM_REGISTER_GLOBAL("testing.test_wrap_callback").set_body([](TVMArgs args, TVMR
   PackedFunc pf = args[0];
   *ret = runtime::TypedPackedFunc<void()>([pf]() { pf(); });
 });
+
+TVM_REGISTER_GLOBAL("testing.test_wrap_callback_suppress_err")
+    .set_body([](TVMArgs args, TVMRetValue* ret) {
+      PackedFunc pf = args[0];
+      auto result = runtime::TypedPackedFunc<void()>([pf]() {
+        try {
+          pf();
+        } catch (std::exception& err) {
+        }
+      });
+      *ret = result;
+    });
 
 TVM_REGISTER_GLOBAL("testing.test_raise_error_callback")
     .set_body([](TVMArgs args, TVMRetValue* ret) {
@@ -121,11 +135,11 @@ TVM_REGISTER_GLOBAL("testing.object_use_count").set_body([](TVMArgs args, TVMRet
 
 class FrontendTestModuleNode : public runtime::ModuleNode {
  public:
-  virtual const char* type_key() const { return "frontend_test"; }
+  const char* type_key() const final { return "frontend_test"; }
 
   static constexpr const char* kAddFunctionName = "__add_function";
 
-  virtual PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self);
+  virtual PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self);
 
  private:
   std::unordered_map<std::string, PackedFunc> functions_;
@@ -133,7 +147,7 @@ class FrontendTestModuleNode : public runtime::ModuleNode {
 
 constexpr const char* FrontendTestModuleNode::kAddFunctionName;
 
-PackedFunc FrontendTestModuleNode::GetFunction(const std::string& name,
+PackedFunc FrontendTestModuleNode::GetFunction(const String& name,
                                                const ObjectPtr<Object>& sptr_to_self) {
   if (name == kAddFunctionName) {
     return TypedPackedFunc<void(std::string, PackedFunc)>(
@@ -158,5 +172,21 @@ runtime::Module NewFrontendTestModule() {
 }
 
 TVM_REGISTER_GLOBAL("testing.FrontendTestModule").set_body_typed(NewFrontendTestModule);
+
+TVM_REGISTER_GLOBAL("testing.sleep_in_ffi").set_body_typed([](double timeout) {
+  std::chrono::duration<int64_t, std::nano> duration(static_cast<int64_t>(timeout * 1e9));
+  std::this_thread::sleep_for(duration);
+});
+
+TVM_REGISTER_GLOBAL("testing.ReturnsVariant").set_body_typed([](int x) -> Variant<String, IntImm> {
+  if (x % 2 == 0) {
+    return IntImm(DataType::Int(64), x / 2);
+  } else {
+    return String("argument was odd");
+  }
+});
+
+TVM_REGISTER_GLOBAL("testing.AcceptsVariant")
+    .set_body_typed([](Variant<String, Integer> arg) -> String { return arg->GetTypeKey(); });
 
 }  // namespace tvm

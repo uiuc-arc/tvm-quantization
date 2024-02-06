@@ -16,22 +16,40 @@
 # under the License.
 
 cmake_minimum_required(VERSION 3.2)
-project(HexagonLauncherRPCSkel C CXX)
+project(HexagonLauncherRPCSkel C CXX ASM)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/../HexagonLauncher.cmake")
+# From the include above get
+#   SDK_INCLUDE_DIRS
+#   QAIC_EXE_PATH
+# and
+#   QAIC_FLAGS
+#   LAUNCHER_SRC
+#   LAUNCHER_RPC_IDL
+#   LAUNCHER_RPC_H
+#   LAUNCHER_RPC_SKEL_C
+#   LAUNCHER_RPC_STUB_C
 
 add_custom_command(
   OUTPUT ${LAUNCHER_RPC_SKEL_C} ${LAUNCHER_RPC_H}
-  COMMAND ${QAIC_EXE} ${QAIC_FLAGS} "${LAUNCHER_SRC}/${LAUNCHER_RPC_IDL}"
+  COMMAND ${QAIC_EXE_PATH} ${QAIC_FLAGS} "${LAUNCHER_SRC}/${LAUNCHER_RPC_IDL}"
   MAIN_DEPENDENCY "${LAUNCHER_SRC}/${LAUNCHER_RPC_IDL}"
 )
 
+get_hexagon_sdk_property("${USE_HEXAGON_SDK}" "${USE_HEXAGON_ARCH}"
+  QURT_INCLUDE QURT_INCLUDE_DIRS
+  QURT_LIB     QURT_LIB_DIRS
+)
+if(NOT QURT_INCLUDE_DIRS OR NOT QURT_LIB_DIRS)
+  message(WARNING "Could not locate some Hexagon SDK components")
+endif()
+
 include_directories(SYSTEM
-  ${HEXAGON_QURT_INCLUDES}
+  ${QURT_INCLUDE_DIRS}
   ${CMAKE_CURRENT_BINARY_DIR}   # Output of qaic will go here
 )
 
-link_directories(${HEXAGON_QURT_LIBS})
+link_directories(${QURT_LIB_DIRS})
 
 add_definitions(-D_MACH_I32=int)
 add_definitions(-DDMLC_CXX11_THREAD_LOCAL=0)
@@ -50,26 +68,31 @@ set(SKEL_SRCS
   "${LAUNCHER_SRC}/launcher_core.cc"
   "${LAUNCHER_SRC}/launcher_hexagon.cc"
 )
+set(PROFILER_DIR "${TVM_SOURCE_DIR}/src/runtime/hexagon/profiler")
 
 add_library(launcher_rpc_skel SHARED
   "${LAUNCHER_RPC_H}"
   "${LAUNCHER_RPC_SKEL_C}"
   "${SKEL_SRCS}"
+  "${PROFILER_DIR}/prof_utils.cc"
+  "${PROFILER_DIR}/lwp_handler.S"
 )
 
 ExternalProject_Add(static_hexagon_tvm_runtime
   SOURCE_DIR "${TVM_SOURCE_DIR}"
   BUILD_COMMAND $(MAKE) runtime
   CMAKE_ARGS
+  "-DBUILD_STATIC_RUNTIME=ON"
   "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
   "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
+  "-DCMAKE_CXX_STANDARD=17"
+  "-DUSE_HEXAGON=ON"
   "-DUSE_HEXAGON_ARCH=${USE_HEXAGON_ARCH}"
-  "-DCMAKE_CXX_STANDARD=14"
+  "-DUSE_HEXAGON_SDK=${USE_HEXAGON_SDK}"
   "-DUSE_LIBBACKTRACE=OFF"
   "-DUSE_LLVM=OFF"
   "-DUSE_RPC=OFF"
-  "-DBUILD_STATIC_RUNTIME=ON"
-  "-DUSE_HEXAGON_SDK=${USE_HEXAGON_SDK}"
+  "-DUSE_CUSTOM_LOGGING=ON"
   INSTALL_COMMAND ""
   BUILD_ALWAYS ON
 )
@@ -80,4 +103,3 @@ add_library(h_tvm_runtime STATIC IMPORTED)
 set_target_properties(h_tvm_runtime PROPERTIES IMPORTED_LOCATION "${BINARY_DIR}/libtvm_runtime.a")
 
 target_link_libraries(launcher_rpc_skel -Wl,--whole-archive h_tvm_runtime -Wl,--no-whole-archive)
-

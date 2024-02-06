@@ -81,8 +81,17 @@ class IntervalSet(IntSet):
         self.__init_handle_by_constructor__(_ffi_api.IntervalSet, min_value, max_value)
 
 
+@tvm._ffi.register_object("arith.PresburgerSet")
+class PresburgerSet(IntSet):
+    """Represent of Presburger Set"""
+
+    def __init__(self):
+        self.__init_handle_by_constructor__(_ffi_api.PresburgerSet)
+
+
 def estimate_region_lower_bound(region, var_dom, predicate):
     """Analyze the region with affine map, given the domain of variables and their predicate
+    Some subregion may be discarded during the lower-bound analysis.
 
     Parameters
     ----------
@@ -101,6 +110,53 @@ def estimate_region_lower_bound(region, var_dom, predicate):
         None if the detection fails, or an array of IntSets as the result of analysis
     """
     return _ffi_api.EstimateRegionLowerBound(region, var_dom, predicate)
+
+
+def estimate_region_strict_bound(region, var_dom, predicate):
+    """Analyze the region with affine map, given the domain of variables and their predicate
+    The result should be strict, i.e. no region is discarded or relaxed.
+
+    Parameters
+    ----------
+    region : List[Range]
+        The region to be analyzed.
+
+    var_dom : Dict[Var, Range]
+        The ranges of the variables
+
+    predicate : PrimExpr
+        The predicate for the affine map
+
+    Returns
+    ----------
+    region_int_set : Optional[List[IntSet]]
+        None if the detection fails, or an array of IntSets as the result of analysis
+    """
+    return _ffi_api.EstimateRegionStrictBound(region, var_dom, predicate)
+
+
+def estimate_region_upper_bound(region, var_dom, predicate):
+    """Analyze the region with affine map, given the domain of variables and their predicate
+    Relaxation of the region may be used in upper-bound analysis,
+    i.e. some extra region may be added to the result.
+
+    Parameters
+    ----------
+    region : List[Range]
+        The region to be analyzed.
+
+    var_dom : Dict[Var, Range]
+        The ranges of the variables
+
+    predicate : PrimExpr
+        The predicate for the affine map
+
+    Returns
+    ----------
+    region_int_set : List[IntSet]
+        an array of IntSets as the result of analysis
+    """
+    return _ffi_api.EstimateRegionUpperBound(region, var_dom, predicate)
 
 
 def pos_inf():

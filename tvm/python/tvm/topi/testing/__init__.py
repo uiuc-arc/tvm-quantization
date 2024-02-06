@@ -29,7 +29,10 @@ from .conv3d_ncdhw_python import conv3d_ncdhw_python
 from .conv3d_ndhwc_python import conv3d_ndhwc_python
 from .conv3d_transpose_ncdhw_python import conv3d_transpose_ncdhw_python
 from .conv2d_transpose_python import conv2d_transpose_nchw_python, conv2d_transpose_nhwc_python
-from .conv1d_transpose_ncw_python import conv1d_transpose_ncw_python
+from .conv1d_transpose_ncw_python import (
+    conv1d_transpose_ncw_python,
+    group_conv1d_transpose_ncw_python,
+)
 from .correlation_nchw_python import correlation_nchw_python
 from .deformable_conv2d_python import deformable_conv2d_nchw_python, deformable_conv2d_nhwc_python
 from .depthwise_conv2d_python import (
@@ -43,6 +46,10 @@ from .resize_python import resize1d_python, resize2d_python, resize3d_python
 from .reorg_python import reorg_python
 from .roi_align_python import roi_align_nchw_python, roi_align_nhwc_python
 from .roi_pool_python import roi_pool_nchw_python
+from .instance_norm_python import instance_norm_python
+from .layer_norm_python import layer_norm_python
+from .group_norm_python import group_norm_python
+from .rms_norm_python import rms_norm_python
 from .lrn_python import lrn_python
 from .l2_normalize_python import l2_normalize_python
 from .gather_python import gather_python
@@ -68,7 +75,7 @@ from .common import (
     dispatch,
 )
 from .adaptive_pool_python import adaptive_pool
-from .grid_sample_python import affine_grid_python, grid_sample_nchw_python
+from .grid_sample_python import affine_grid_python, grid_sample_python
 from .matrix_set_diag import matrix_set_diag
 from .space_to_batch_nd import space_to_batch_nd_python
 from .batch_to_space_nd import batch_to_space_nd_python
@@ -76,3 +83,4 @@ from .nll_loss import nll_loss
 from .dense import dense
 from .searchsorted import searchsorted_ref
 from .conv2d_backcward_weight_python import conv2d_backward_weight_python
+from .lstm_python import lstm_python

@@ -30,6 +30,7 @@
 #include "../../runtime/texture.h"
 #include "../../runtime/thread_storage_scope.h"
 #include "../build_common.h"
+#include "../spirv/spirv_utils.h"
 
 namespace tvm {
 namespace codegen {
@@ -87,7 +88,18 @@ void CodeGenOpenCL::InitFuncState(const PrimFunc& f) {
   }
 }
 
-void CodeGenOpenCL::PrintFuncPrefix() { stream << "__kernel void"; }
+void CodeGenOpenCL::PrintFuncPrefix(std::ostream& os) { os << "__kernel "; }
+
+void CodeGenOpenCL::PreFunctionBody(const PrimFunc& f) {
+  for (Var arg : f->params) {
+    auto ptr_type = arg->type_annotation.as<PointerTypeNode>();
+    if (ptr_type && runtime::IsTextureStorage(std::string(ptr_type->storage_scope))) {
+      this->stream << "  const sampler_t image_sampler = "
+                      "CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;\n";
+      return;
+    }
+  }
+}
 
 std::string CodeGenOpenCL::Finish() {
   // inject extension enable pragma for fp16 and fp64
@@ -98,7 +110,7 @@ std::string CodeGenOpenCL::Finish() {
                    "#pragma OPENCL EXTENSION cl_amd_fp16 : enable\n"
                    "#else\n"
                    "#error \"Half precision floating point not supported"
-                   "by OpenCL implementation on your device.\" \n"
+                   " by OpenCL implementation on your device.\" \n"
                    "#endif\n\n";
   }
 
@@ -109,7 +121,7 @@ std::string CodeGenOpenCL::Finish() {
                    "#pragma OPENCL EXTENSION cl_amd_fp64 : enable\n"
                    "#else\n"
                    "#error \"Double precision floating point not supported"
-                   "by OpenCL implementation on your device.\" \n"
+                   " by OpenCL implementation on your device.\" \n"
                    "#endif\n\n";
   }
 
@@ -139,7 +151,8 @@ std::string CodeGenOpenCL::Finish() {
     // For now we rely on OpenCL preprocessor directives to utilize the correct behavior
     // depending on the OpenCL version detected at OpenCL compile time.
     decl_stream << "#ifdef __OPENCL_VERSION__\n"
-                << "#if __OPENCL_VERSION__ == CL_VERSION_2_0\n"
+                << "#if __OPENCL_VERSION__ == CL_VERSION_2_0"
+                << " || __OPENCL_VERSION__ == CL_VERSION_3_0 \n"
                 << "#define READ_IMAGEH(image, sampler, coord) "
                 << "read_imageh(image, sampler, coord)\n"
                 << "#define READ_IMAGEF(image, sampler, coord) "
@@ -172,6 +185,10 @@ void CodeGenOpenCL::PrintType(DataType t, std::ostream& os) {  // NOLINT(*)
   if (t.is_handle()) {
     ICHECK_EQ(lanes, 1) << "do not yet support vector types";
     os << "void*";
+    return;
+  }
+  if (t.is_void()) {
+    os << "void";
     return;
   }
   if (t == DataType::Bool()) {
@@ -256,21 +273,22 @@ void CodeGenOpenCL::PrintType(const Type& type, std::ostream& os) {  // NOLINT(*
   }
 }
 
-void CodeGenOpenCL::PrintVecAddr(const VarNode* buffer, DataType t, PrimExpr base,
+void CodeGenOpenCL::PrintVecAddr(const BufferNode* buffer, DataType t, PrimExpr base,
                                  std::ostream& os) {  // NOLINT(*)
-  if (!HandleTypeMatch(buffer, t.element_of())) {
+  const VarNode* buffer_var = buffer->data.get();
+  if (!HandleTypeMatch(buffer_var, t.element_of())) {
     os << '(';
-    auto it = alloc_storage_scope_.find(buffer);
+    auto it = alloc_storage_scope_.find(buffer_var);
     if (it != alloc_storage_scope_.end()) {
       PrintStorageScope(it->second, os);
     }
     PrintType(t.element_of(), os);
     os << "*)";
   }
-  os << GetVarID(buffer) << " + ";
+  os << GetVarID(buffer_var) << " + ";
   PrintExpr(base, os);
 }
-std::string CodeGenOpenCL::GetVecLoad(DataType t, const VarNode* buffer, PrimExpr base) {
+std::string CodeGenOpenCL::GetVecLoad(DataType t, const BufferNode* buffer, PrimExpr base) {
   std::ostringstream os;
   os << "vload" << t.lanes() << "(0, ";
   PrintVecAddr(buffer, t, base, os);
@@ -278,12 +296,37 @@ std::string CodeGenOpenCL::GetVecLoad(DataType t, const VarNode* buffer, PrimExp
   return os.str();
 }
 
-void CodeGenOpenCL::PrintVecStore(const VarNode* buffer, DataType t, PrimExpr base,
+void CodeGenOpenCL::PrintVecStore(const BufferNode* buffer, DataType t, PrimExpr base,
                                   const std::string& value) {
   this->PrintIndent();
   stream << "vstore" << t.lanes() << "(" << value << ", 0, ";
   PrintVecAddr(buffer, t, base, stream);
   stream << ");\n";
+}
+
+void CodeGenOpenCL::PrintVecElemLoadExpr(DataType t, int i, const std::string& value,
+                                         std::ostream& os) {  // NOLINT(*)
+  ICHECK_GT(t.lanes(), 1);
+  if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
+    if (i != 0) {
+      os << "|";
+    }
+    os << "((0x000000ff << " << i * 8 << ") & (" << value << " << " << i * 8 << "))";
+    return;
+  }
+  if (i == 0) {
+    // NOTE: opencl print things as (float2)(v0, v1)
+    os << "((";
+    PrintType(t, os);
+    os << ")(";
+  }
+  os << value;
+  if (i != t.lanes() - 1) {
+    os << ",";
+  } else {
+    os << "))";
+  }
+  return;
 }
 
 void CodeGenOpenCL::PrintStorageSync(const CallNode* op) {
@@ -322,66 +365,45 @@ void CodeGenOpenCL::PrintRestrict(const Var& v, std::ostream& os) {
 
 std::string CodeGenOpenCL::CastFromTo(std::string value, DataType from, DataType target) {
   if (from == target) return value;
+  return CastTo(value, target);
+}
+
+std::string CodeGenOpenCL::CastTo(std::string value, DataType target) {
   std::ostringstream os;
-  if (target.lanes() == 1) {
-    os << "((";
+  if (target == DataType::Bool()) {
+    os << "(";
+    os << "(";
     this->PrintType(target, os);
     os << ")" << value << ")";
-  } else {  // convert vector type
+    return os.str();
+  } else {
     os << "(";
     os << "convert_";
     this->PrintType(target, os);
     os << "(" << value << "))";
+    return os.str();
   }
-  return os.str();
-}
-
-void CodeGenOpenCL::VisitStmt_(const StoreNode* op) {
-  if (auto call = op->value.as<CallNode>()) {
-    if (call->op.same_as(builtin::texture2d_load())) {
-      need_texture_ssa_ = false;
-      // If storing a texture load into a buffer, don't use an
-      // intermediate local unless the buffer allocation is a
-      // single element selected from the texture read.
-      auto it = allocation_size_.find(op->buffer_var.get());
-      if (it != allocation_size_.end() && it->second == 1) {
-        need_texture_ssa_ = true;
-      }
-    }
-  }
-  CodeGenC::VisitStmt_(op);
-  need_texture_ssa_ = true;
-}
-
-void CodeGenOpenCL::VisitExpr_(const CastNode* op, std::ostream& os) {
-  if (auto call = op->value.as<CallNode>()) {
-    if (call->op.same_as(builtin::texture2d_load())) {
-      need_texture_ssa_ = false;
-    }
-  }
-  CodeGenC::VisitExpr_(op, os);
-  need_texture_ssa_ = true;
 }
 
 void CodeGenOpenCL::VisitStmt_(const AllocateNode* op) {
-  allocation_size_.insert(
-      {op->buffer_var.get(), op->constant_allocation_size() * op->dtype.lanes()});
+  allocation_size_.insert({op->buffer_var.get(), op->ConstantAllocationSize() * op->dtype.lanes()});
   CodeGenC::VisitStmt_(op);
 }
 
 void CodeGenOpenCL::VisitExpr_(const CallNode* op, std::ostream& os) {
   if (op->op.same_as(builtin::address_of())) {
     // Overload tvm_address_of to add storage scope (e.g. __global).
-    const LoadNode* load = op->args[0].as<LoadNode>();
+    const BufferLoadNode* load = op->args[0].as<BufferLoadNode>();
     ICHECK(op->args.size() == 1 && load);
+    ICHECK_EQ(load->indices.size(), 1) << "CodeGenOpenCL only supports flat memory allocations.";
     os << "((";
-    auto it = alloc_storage_scope_.find(load->buffer_var.get());
+    auto it = alloc_storage_scope_.find(load->buffer->data.get());
     if (it != alloc_storage_scope_.end()) {
       PrintStorageScope(it->second, os);
     }
     this->PrintType(load->dtype.element_of(), os);
-    os << " *)" << this->GetVarID(load->buffer_var.get()) << " + ";
-    this->PrintExpr(load->index, os);
+    os << " *)" << this->GetVarID(load->buffer->data.get()) << " + ";
+    this->PrintExpr(load->indices[0], os);
     os << ')';
   } else if (op->op.same_as(builtin::texture2d_store())) {
     auto* ptr_type = op->args[0].as<VarNode>()->type_annotation.as<PointerTypeNode>();
@@ -419,27 +441,22 @@ void CodeGenOpenCL::VisitExpr_(const CallNode* op, std::ostream& os) {
     }
     this->PrintExpr(op->args[0], ss);
     ss << ", ";
-    ss << "CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST, ";
+    ss << "image_sampler, ";
     ss << "((int2)(";
     this->PrintExpr(op->args[1], ss);
     ss << ", ";
     this->PrintExpr(op->args[2], ss);
     ss << ")))";
 
-    // Only use local SSA if texture is not already being stored
-    if (need_texture_ssa_) {
-      std::string rhs = SSAGetID(ss.str(), op->dtype.with_lanes(4));
-      if (op->args.back().as<RampNode>()) {
-        os << rhs;
-      } else {
-        os << "((";
-        this->PrintType(op->dtype.with_lanes(1), os);
-        os << "*)&" << rhs << ")[";
-        this->PrintExpr(op->args.back(), os);
-        os << "]";
-      }
+    std::string rhs = SSAGetID(ss.str(), op->dtype.with_lanes(4));
+    if (op->args.back().as<RampNode>()) {
+      os << rhs;
     } else {
-      os << ss.str();
+      os << "((";
+      this->PrintType(op->dtype.with_lanes(1), os);
+      os << "*)&" << rhs << ")[";
+      this->PrintExpr(op->args.back(), os);
+      os << "]";
     }
   } else if (op->op.same_as(builtin_call_extern_)) {
     auto func = Downcast<StringImm>(op->args[0]);
@@ -461,6 +478,18 @@ void CodeGenOpenCL::VisitExpr_(const BroadcastNode* op, std::ostream& os) {  // 
   for (int i = 0; i < op->lanes; ++i) {
     if (i != 0) os << ", ";
     os << v;
+  }
+  os << "))";
+}
+
+void CodeGenOpenCL::VisitExpr_(const RampNode* op, std::ostream& os) {  // NOLINT(*)
+  os << "((";
+  PrintType(op->dtype, os);
+  os << ")(";
+  for (int i = 0; i < op->lanes; i++) {
+    os << "(" << PrintExpr(op->base) << ")"
+       << "+(" << PrintExpr(op->stride) << "*" << i << ")";
+    if (i != op->lanes - 1) os << ", ";
   }
   os << "))";
 }
@@ -503,6 +532,50 @@ void CodeGenOpenCL::VisitExpr_(const MaxNode* op, std::ostream& os) {
   PrintBinaryExpr(op, "max", os, this);
 }
 
+void CodeGenOpenCL::VisitExpr_(const AndNode* op, std::ostream& os) {
+  std::ostringstream oss;
+  os << "(";
+  this->PrintExpr(op->a, oss);
+  os << CastTo(oss.str(), op->dtype);
+  oss.str("");
+  os << " && ";
+  this->PrintExpr(op->b, oss);
+  os << CastTo(oss.str(), op->dtype);
+  os << ")";
+}
+
+void CodeGenOpenCL::VisitExpr_(const OrNode* op, std::ostream& os) {
+  std::ostringstream oss;
+  os << "(";
+  this->PrintExpr(op->a, oss);
+  os << CastTo(oss.str(), op->dtype);
+  oss.str("");
+  os << " || ";
+  this->PrintExpr(op->b, oss);
+  os << CastTo(oss.str(), op->dtype);
+  os << ")";
+}
+
+void CodeGenOpenCL::VisitExpr_(const SelectNode* op, std::ostream& os) {
+  std::ostringstream oss;
+  os << "select(";
+  PrintExpr(op->false_value, oss);
+  os << CastFromTo(oss.str(), op->false_value.dtype(), op->dtype);
+  oss.str("");
+  os << ", ";
+  PrintExpr(op->true_value, oss);
+  os << CastFromTo(oss.str(), op->true_value.dtype(), op->dtype);
+  oss.str("");
+  os << ", ";
+  PrintExpr(op->condition, oss);
+  if (op->dtype.is_float()) {
+    os << CastTo(oss.str(), DataType::Int(op->dtype.bits(), op->dtype.lanes()));
+  } else {
+    os << CastFromTo(oss.str(), op->condition.dtype(), op->dtype);
+  }
+  os << ")";
+}
+
 void CodeGenOpenCL::SetTextureScope(
     const std::unordered_map<const VarNode*, std::string>& scope) {  // NOLINT(*)
   for (auto& texture : scope) {
@@ -511,24 +584,40 @@ void CodeGenOpenCL::SetTextureScope(
 }
 
 runtime::Module BuildOpenCL(IRModule mod, Target target) {
+#if TVM_ENABLE_SPIRV
+  Optional<String> device = target->GetAttr<String>("device");
+  if (device && device.value() == "spirv") {
+    auto [smap, spirv_text] = LowerToSPIRV(mod, target);
+    return runtime::OpenCLModuleCreate(smap, spirv_text, ExtractFuncInfo(mod));
+  }
+#endif
+
   using tvm::runtime::Registry;
   bool output_ssa = false;
 
-  std::stringstream code;
-  const auto* fpostproc = Registry::Get("tvm_callback_opencl_postproc");
-  for (auto kv : mod->functions) {
-    ICHECK(kv.second->IsInstance<PrimFuncNode>()) << "CodeGenOpenCL: Can only take PrimFunc";
-    code << "// Function: " << kv.first->name_hint << std::endl;
-    CodeGenOpenCL cg;
-    cg.Init(output_ssa);
-    auto f = Downcast<PrimFunc>(kv.second);
-    auto calling_conv = f->GetAttr<Integer>(tvm::attr::kCallingConv);
+  Map<GlobalVar, PrimFunc> functions;
+  for (auto [gvar, base_func] : mod->functions) {
+    ICHECK(base_func->IsInstance<PrimFuncNode>()) << "CodeGenOpenCL: Can only take PrimFunc";
+    auto prim_func = Downcast<PrimFunc>(base_func);
+    auto calling_conv = prim_func->GetAttr<Integer>(tvm::attr::kCallingConv);
     ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch)
         << "CodeGenOpenCL: expect calling_conv equals CallingConv::kDeviceKernelLaunch";
-    cg.AddFunction(f);
+    functions.Set(gvar, prim_func);
+  }
+
+  std::stringstream code;
+  const auto* fpostproc = Registry::Get("tvm_callback_opencl_postproc");
+  for (auto [gvar, prim_func] : functions) {
+    code << "// Function: " << gvar->name_hint << std::endl;
+    CodeGenOpenCL cg;
+    cg.Init(output_ssa);
+    for (auto [other_gvar, other_prim_func] : functions) {
+      cg.DeclareFunction(other_gvar, other_prim_func);
+    }
+    cg.AddFunction(gvar, prim_func);
     std::string fsource = cg.Finish();
     if (fpostproc) {
-      fsource = (*fpostproc)(fsource).operator std::string();
+      fsource = (*fpostproc)(fsource, target).operator std::string();
     }
     code << fsource;
   }

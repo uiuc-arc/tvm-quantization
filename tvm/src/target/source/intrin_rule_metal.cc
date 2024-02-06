@@ -22,7 +22,6 @@
  * \brief Metal intrinsic rules.
  */
 #include <tvm/tir/op_attr_types.h>
-#include <tvm/topi/elemwise.h>
 
 #include "../intrin_rule.h"
 
@@ -30,6 +29,28 @@ namespace tvm {
 namespace codegen {
 namespace intrin {
 using tir::FLowerIntrinsic;
+
+struct MetalWarpIntrinsic {
+  const Op operator()(DataType t, const Op& orig_op) const {
+    if (orig_op.same_as(builtin::tvm_warp_shuffle())) {
+      return Op::Get("tir.metal.simd_shuffle");
+    } else if (orig_op.same_as(builtin::tvm_warp_shuffle_up())) {
+      return Op::Get("tir.metal.simd_shuffle_up");
+    } else {
+      ICHECK(orig_op.same_as(builtin::tvm_warp_shuffle_down()));
+      return Op::Get("tir.metal.simd_shuffle_down");
+    }
+  }
+};
+
+template <typename T>
+static PrimExpr DispatchMetalShuffle(const PrimExpr& e) {
+  const CallNode* call = e.as<CallNode>();
+  ICHECK(call != nullptr);
+  ICHECK_EQ(call->args.size(), 5);  // mask, value, warp_id, width, warp_size
+  Array<PrimExpr> metal_args{{call->args[1], call->args[2]}};
+  return Call(call->dtype, T()(call->dtype, Downcast<Op>(call->op)), metal_args);
+}
 
 TVM_REGISTER_OP("tir.floor")
     .set_attr<FLowerIntrinsic>("metal.FLowerIntrinsic", DispatchPureExtern<Direct>);
@@ -44,6 +65,9 @@ TVM_REGISTER_OP("tir.fabs")
     .set_attr<FLowerIntrinsic>("metal.FLowerIntrinsic", DispatchPureExtern<Direct>);
 
 TVM_REGISTER_OP("tir.round")
+    .set_attr<FLowerIntrinsic>("metal.FLowerIntrinsic", DispatchPureExtern<Direct>);
+
+TVM_REGISTER_OP("tir.nearbyint")
     .set_attr<FLowerIntrinsic>("metal.FLowerIntrinsic", DispatchPureExtern<Direct>);
 
 TVM_REGISTER_OP("tir.exp").set_attr<FLowerIntrinsic>("metal.FLowerIntrinsic",
@@ -91,23 +115,38 @@ TVM_REGISTER_OP("tir.cos").set_attr<FLowerIntrinsic>("metal.FLowerIntrinsic",
 TVM_REGISTER_OP("tir.cosh")
     .set_attr<FLowerIntrinsic>("metal.FLowerIntrinsic", DispatchPureExtern<Direct>);
 
-// There is no erf function in Metal. When erf is used, we use fast_erf instead
-static PrimExpr DispatchFastErf(const PrimExpr& e) {
-  LOG(WARNING) << " Metal doesn't have built-in erf function. fast_erf will be used instead.";
-  const CallNode* call = e.as<CallNode>();
-  ICHECK(call != nullptr);
-  ICHECK_EQ(call->args.size(), 1);
-  PrimExpr arg = call->args[0];
-  int bits = arg.dtype().bits();
-  bool isFloat = arg.dtype().is_float();
-  PrimExpr res;
-  if (isFloat && (bits == 16 || bits == 32))
-    res = topi::fast_erf_float_expr(arg, bits);
-  else
-    LOG(FATAL) << "Unsupported type in Metal fast_erf";
-  return res;
-}
 TVM_REGISTER_OP("tir.erf").set_attr<FLowerIntrinsic>("metal.FLowerIntrinsic", DispatchFastErf);
+
+TVM_REGISTER_OP("tir.tvm_warp_shuffle")
+    .set_attr<FLowerIntrinsic>("metal.FLowerIntrinsic", DispatchMetalShuffle<MetalWarpIntrinsic>);
+
+TVM_REGISTER_OP("tir.tvm_warp_shuffle_up")
+    .set_attr<FLowerIntrinsic>("metal.FLowerIntrinsic", DispatchMetalShuffle<MetalWarpIntrinsic>);
+
+TVM_REGISTER_OP("tir.tvm_warp_shuffle_down")
+    .set_attr<FLowerIntrinsic>("metal.FLowerIntrinsic", DispatchMetalShuffle<MetalWarpIntrinsic>);
+
+// Register low-level builtin ops.
+TVM_REGISTER_OP("tir.metal.simd_shuffle")
+    .set_num_inputs(2)
+    .add_argument("var", "Expr", "The variable to sync.")
+    .add_argument("lane", "Expr", "The source thread id.")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "simd_shuffle")
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TVM_REGISTER_OP("tir.metal.simd_shuffle_up")
+    .set_num_inputs(2)
+    .add_argument("var", "Expr", "The variable to sync.")
+    .add_argument("delta", "Expr", "The source lane id offset to be added.")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "simd_shuffle_up")
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TVM_REGISTER_OP("tir.metal.simd_shuffle_down")
+    .set_num_inputs(2)
+    .add_argument("var", "Expr", "The variable to sync.")
+    .add_argument("delta", "Expr", "The source lane id offset to be subtracted.")
+    .set_attr<TGlobalSymbol>("TGlobalSymbol", "simd_shuffle_down")
+    .set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
 }  // namespace intrin
 }  // namespace codegen

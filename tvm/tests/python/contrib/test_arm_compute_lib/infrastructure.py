@@ -30,6 +30,9 @@ from tvm.contrib import utils
 from tvm.autotvm.measure import request_remote
 
 
+QNN_DTYPES = ("uint8", "int8")
+
+
 class Device:
     """
     Configuration for Arm Compute Library tests.
@@ -41,7 +44,7 @@ class Device:
 
     Notes
     -----
-        The test configuration will be loaded once when the the class is created. If the configuration
+        The test configuration will be loaded once when the class is created. If the configuration
         changes between tests, any changes will not be picked up.
 
     Parameters
@@ -120,6 +123,21 @@ class Device:
         cls.cross_compile = test_config.get("cross_compile") or ""
 
 
+def get_low_high_atol_rtol(dtype):
+    """Returns a tuple with boundary values and tolerance for ACL tests."""
+
+    if dtype == "float32":
+        low, high, atol, rtol = (-127, 128, 0.001, 0.001)
+    elif dtype == "uint8":
+        low, high, atol, rtol = (0, 255, 1, 0)
+    elif dtype == "int8":
+        low, high, atol, rtol = (-127, 128, 1, 0)
+    else:
+        raise Exception(f"dtype not expected: {dtype}")
+
+    return low, high, atol, rtol
+
+
 def get_cpu_op_count(mod):
     """Traverse graph counting ops offloaded to TVM."""
 
@@ -163,13 +181,23 @@ def skip_codegen_test():
         return True
 
 
-def build_module(mod, target, params=None, enable_acl=True, tvm_ops=0, acl_partitions=1):
+def build_module(
+    mod,
+    target,
+    params=None,
+    enable_acl=True,
+    tvm_ops=0,
+    acl_partitions=1,
+    disabled_ops=["concatenate"],
+):
     """Build module with option to build for ACL."""
     if isinstance(mod, tvm.relay.expr.Call):
         mod = tvm.IRModule.from_expr(mod)
     with tvm.transform.PassContext(opt_level=3, disabled_pass=["AlterOpLayout"]):
         if enable_acl:
-            mod = arm_compute_lib.partition_for_arm_compute_lib(mod, params)
+            mod = arm_compute_lib.partition_for_arm_compute_lib(
+                mod, params, disabled_ops=disabled_ops
+            )
             tvm_op_count = get_cpu_op_count(mod)
             assert tvm_op_count == tvm_ops, "Got {} TVM operators, expected {}".format(
                 tvm_op_count, tvm_ops
@@ -199,13 +227,16 @@ def build_and_run(
     tvm_ops=0,
     acl_partitions=1,
     config=None,
+    disabled_ops=["concatenate"],
 ):
     """Build and run the relay module."""
     if config is None:
         config = {}
 
     try:
-        lib = build_module(mod, device.target, params, enable_acl, tvm_ops, acl_partitions)
+        lib = build_module(
+            mod, device.target, params, enable_acl, tvm_ops, acl_partitions, disabled_ops
+        )
     except Exception as e:
         err_msg = "The module could not be built.\n"
         if config:
@@ -276,9 +307,16 @@ def verify_codegen(
     num_acl_modules=1,
     tvm_ops=0,
     target="llvm -mtriple=aarch64-linux-gnu -mattr=+neon",
+    disabled_ops=["concatenate"],
 ):
     """Check acl codegen against a known good output."""
-    module = build_module(module, target, tvm_ops=tvm_ops, acl_partitions=num_acl_modules)
+    module = build_module(
+        module,
+        target,
+        tvm_ops=tvm_ops,
+        acl_partitions=num_acl_modules,
+        disabled_ops=disabled_ops,
+    )
     acl_modules = extract_acl_modules(module)
 
     assert len(acl_modules) == num_acl_modules, (

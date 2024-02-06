@@ -15,9 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 """Evolutionary Search Strategy"""
-
-from typing import NamedTuple
-
 from tvm._ffi import register_object
 
 from .. import _ffi_api
@@ -32,16 +29,14 @@ class EvolutionarySearch(SearchStrategy):
 
     Parameters
     ----------
-    num_trials_per_iter : int
-        Number of trials per iteration.
-    num_trials_total : int
-        Total number of trials.
     population_size : int
         The initial population of traces from measured samples and randomly generated samples.
     init_measured_ratio : int
         The ratio of measured samples in the initial population.
     init_min_unmeasured : int
         The minimal size of unmeasured population in the initial sampling.
+    max_fail_count : int
+        The maximum number of failure during initial sampling.
     genetic_num_iters : int
         The number of iterations for genetic algorithm.
     genetic_mutate_prob : float
@@ -52,8 +47,6 @@ class EvolutionarySearch(SearchStrategy):
         The ratio of greedy selected samples in the final picks.
     """
 
-    num_trials_per_iter: int
-    num_trials_total: int
     population_size: int
     init_measured_ratio: int
     init_min_unmeasured: int
@@ -65,53 +58,24 @@ class EvolutionarySearch(SearchStrategy):
     def __init__(
         self,
         *,
-        num_trials_per_iter: int,
-        num_trials_total: int,
-        population_size: int,
-        init_measured_ratio: float,
-        init_min_unmeasured: int,
-        genetic_num_iters: int,
-        genetic_mutate_prob: float,
-        genetic_max_fail_count: int,
-        eps_greedy: float,
+        population_size: int = 512,
+        init_measured_ratio: float = 0.2,
+        init_min_unmeasured: int = 50,
+        max_fail_count: int = 5,
+        genetic_num_iters: int = 4,
+        genetic_mutate_prob: float = 0.85,
+        genetic_max_fail_count: int = 10,
+        eps_greedy: float = 0.05,
     ) -> None:
         """Constructor"""
         self.__init_handle_by_constructor__(
             _ffi_api.SearchStrategyEvolutionarySearch,  # type: ignore # pylint: disable=no-member
-            num_trials_per_iter,
-            num_trials_total,
             population_size,
             init_measured_ratio,
             init_min_unmeasured,
+            max_fail_count,
             genetic_num_iters,
             genetic_mutate_prob,
             genetic_max_fail_count,
             eps_greedy,
-        )
-
-
-class EvolutionarySearchConfig(NamedTuple):
-    """Configuration for EvolutionarySearch"""
-
-    num_trials_per_iter: int
-    num_trials_total: int
-    population_size: int = 2048
-    init_measured_ratio: float = 0.2
-    init_min_unmeasured: int = 50
-    genetic_num_iters: int = 4
-    genetic_mutate_prob: float = 0.85
-    genetic_max_fail_count: int = 10
-    eps_greedy: float = 0.05
-
-    def create_strategy(self) -> EvolutionarySearch:
-        return EvolutionarySearch(
-            num_trials_per_iter=self.num_trials_per_iter,
-            num_trials_total=self.num_trials_total,
-            population_size=self.population_size,
-            init_measured_ratio=self.init_measured_ratio,
-            init_min_unmeasured=self.init_min_unmeasured,
-            genetic_num_iters=self.genetic_num_iters,
-            genetic_mutate_prob=self.genetic_mutate_prob,
-            genetic_max_fail_count=self.genetic_max_fail_count,
-            eps_greedy=self.eps_greedy,
         )

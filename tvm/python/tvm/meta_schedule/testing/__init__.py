@@ -15,6 +15,5 @@
 # specific language governing permissions and limitations
 # under the License.
 """Testing utilities in meta schedule"""
-from .byoc_trt import relay_build_with_tensorrt
-from .local_rpc import LocalRPC
-from .relay_workload import MODEL_TYPE, MODEL_TYPES, get_network, get_torch_model
+
+# NOTE: Do not import any module here by default

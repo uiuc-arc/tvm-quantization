@@ -21,6 +21,9 @@
 #include <tvm/relay/transform.h>
 #include <tvm/target/target.h>
 
+#include "../../../../target/parsers/cpu.h"
+#include "compiler_attrs.h"
+
 namespace tvm {
 
 namespace relay {
@@ -29,10 +32,15 @@ namespace cmsisnn {
 
 tvm::transform::Pass RelayToTIR();
 runtime::Module TIRToRuntime(IRModule mod, Target target);
+using FTVMTIRToRuntime = tvm::runtime::TypedPackedFunc<runtime::Module(IRModule, Target)>;
 
 TVM_REGISTER_TARGET_KIND("cmsis-nn", kDLCPU)
-    .set_attr<FTVMRelayToTIR>("RelayToTIR", RelayToTIR())
-    .set_attr<FTVMTIRToRuntime>("TIRToRuntime", TIRToRuntime);
+    .add_attr_option<Array<String>>("mattr")
+    .add_attr_option<String>("mcpu")
+    .add_attr_option<Bool>("debug_last_error")
+    .set_attr<relay::transform::FTVMRelayToTIR>(tvm::attr::kRelayToTIR, RelayToTIR())
+    .set_attr<FTVMTIRToRuntime>("TIRToRuntime", TIRToRuntime)
+    .set_target_parser(tvm::target::parsers::cpu::ParseTarget);
 
 }  // namespace cmsisnn
 }  // namespace contrib

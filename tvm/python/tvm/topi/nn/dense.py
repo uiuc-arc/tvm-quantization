@@ -17,8 +17,9 @@
 # pylint: disable=invalid-name,unused-argument
 """TVM operator fully connected compute."""
 import tvm
-from tvm import te, auto_scheduler
-from .. import tag
+from tvm import auto_scheduler, te
+
+from .. import tag, add
 
 
 def matmul(
@@ -29,6 +30,7 @@ def matmul(
     transpose_a=False,
     transpose_b=False,
     auto_scheduler_rewritten_layout="",
+    meta_schedule_original_shape=None,
 ):
     """The default implementation of matmul in topi.
 
@@ -55,75 +57,111 @@ def matmul(
     auto_scheduler_rewritten_layout: Optional[str] = ""
         The layout after auto-scheduler's layout rewrite pass.
 
+    meta_schedule_original_shape: Optional[List[PrimExpr]] = None
+        The original shape of the input tensor.
+
     Returns
     -------
     output : tvm.te.Tensor
         2-D with shape [batch, out_dim]
     """
-    # TODO(jcf94): Add multi-dim support for tensor_a
-    assert len(tensor_a.shape) == 2, "only support 2-dim matmul"
+    # TODO(yixin): support cases for 1-dim input
+    # TODO(yixin): adding support and further check for >2-dim input in autotvm template
+    assert (
+        len(tensor_a.shape) >= 2 and len(tensor_b.shape) >= 2
+    ), "1-dim matmul is not supported yet."
     if bias is not None:
         assert len(bias.shape) == 1
     if out_dtype is None:
         out_dtype = tensor_a.dtype
     if transpose_a:
-        in_dim, batch = tensor_a.shape
+        reduce_dim_a, in_dim = tensor_a.shape[-2:]
     else:
-        batch, in_dim = tensor_a.shape
+        in_dim, reduce_dim_a = tensor_a.shape[-2:]
+    batch_dims_a = tensor_a.shape[:-2]
 
     if auto_scheduler_rewritten_layout:
         # Infer shape for the rewritten layout
-        out_dim, red_dim = auto_scheduler.get_shape_from_rewritten_layout(
+        assert len(tensor_b).shape == 2, "only support 2-dim matmul when using auto-scheduler"
+        out_dim, reduce_dim_b = auto_scheduler.get_shape_from_rewritten_layout(
             auto_scheduler_rewritten_layout, ["j", "k"]
         )
         auto_scheduler.remove_index_check(tensor_b)
+    elif meta_schedule_original_shape:
+        auto_scheduler.rewrite_tensor_shape(tensor_b, meta_schedule_original_shape)
+        if transpose_b:
+            out_dim, reduce_dim_b = tensor_b.shape[-2:]
+        else:
+            reduce_dim_b, out_dim = tensor_b.shape[-2:]
     elif transpose_b:
-        out_dim, red_dim = tensor_b.shape
+        out_dim, reduce_dim_b = tensor_b.shape[-2:]
     else:
-        red_dim, out_dim = tensor_b.shape
-    assert in_dim == red_dim
+        reduce_dim_b, out_dim = tensor_b.shape[-2:]
+    batch_dims_b = tensor_b.shape[:-2]
 
-    k = te.reduce_axis((0, in_dim), name="k")
-    if (transpose_a, transpose_b) == (True, True):
-        compute_lambda = lambda i, j: te.sum(
-            tensor_a[k, i].astype(out_dtype) * tensor_b[j, k].astype(out_dtype), axis=k
+    if not isinstance(reduce_dim_a, tvm.tir.Var) and not isinstance(reduce_dim_b, tvm.tir.Var):
+        assert int(reduce_dim_a) == int(
+            reduce_dim_b
+        ), f"Reduction dimensions of dense do not match. {reduce_dim_a} vs {reduce_dim_b}."
+
+    result_ndim = max(len(batch_dims_a), len(batch_dims_b))
+    batch_dims_a = [1] * (result_ndim - len(batch_dims_a)) + batch_dims_a
+    batch_dims_b = [1] * (result_ndim - len(batch_dims_b)) + batch_dims_b
+
+    for idx, (l, r) in enumerate(zip(batch_dims_a, batch_dims_b)):
+        if (
+            not isinstance(l, tvm.tir.Var)
+            and not isinstance(r, tvm.tir.Var)
+            and int(l) != 1
+            and int(r) != 1
+        ):
+            assert int(l) == int(r), (
+                "Batch dimensions of dense do not match: "
+                f"{tensor_a.shape[:-2]} vs {tensor_b.shape[:-2]}."
+            )
+        if not isinstance(l, tvm.tir.Var) and int(l) == 1:
+            batch_dims_a[idx] = batch_dims_b[idx]
+
+    k = te.reduce_axis((0, reduce_dim_a), name="k")
+
+    def compute(*indices):
+        batch_indices_a = indices[-len(tensor_a.shape) : -2]
+        batch_indices_a = [
+            i if isinstance(dim, tvm.tir.Var) or int(dim) != 1 else 0
+            for i, dim in zip(batch_indices_a, tensor_a.shape[:-2])
+        ]
+        batch_indices_b = indices[-len(tensor_b.shape) : -2]
+        batch_indices_b = [
+            i if isinstance(dim, tvm.tir.Var) or int(dim) != 1 else 0
+            for i, dim in zip(batch_indices_b, tensor_b.shape[:-2])
+        ]
+        i, j = indices[-2:]
+        a_indices = (*batch_indices_a, k, i) if transpose_a else (*batch_indices_a, i, k)
+        b_indices = (*batch_indices_b, j, k) if transpose_b else (*batch_indices_b, k, j)
+        return te.sum(
+            tensor_a[a_indices].astype(out_dtype) * tensor_b[b_indices].astype(out_dtype), axis=k
         )
-        compute_name = "T_matmul_TT"
-        compute_tag = "matmul"
-    elif (transpose_a, transpose_b) == (True, False):
-        compute_lambda = lambda i, j: te.sum(
-            tensor_a[k, i].astype(out_dtype) * tensor_b[k, j].astype(out_dtype), axis=k
-        )
-        compute_name = "T_matmul_TN"
-        compute_tag = "matmul"
-    elif (transpose_a, transpose_b) == (False, True):
-        compute_lambda = lambda i, j: te.sum(
-            tensor_a[i, k].astype(out_dtype) * tensor_b[j, k].astype(out_dtype), axis=k
-        )
-        compute_name = "T_matmul_NT"
-        # TODO(jcf94): Remove `dense` when `matmul` is finally ready
-        compute_tag = "dense"
-    else:  # (transpose_a, transpose_b) == (False, False):
-        compute_lambda = lambda i, j: te.sum(
-            tensor_a[i, k].astype(out_dtype) * tensor_b[k, j].astype(out_dtype), axis=k
-        )
-        compute_name = "T_matmul_NN"
-        compute_tag = "matmul"
+
+    compute_name = {
+        (True, True): "T_matmul_TT",
+        (True, False): "T_matmul_TN",
+        (False, True): "T_matmul_NT",
+        (False, False): "T_matmul_NN",
+    }[(transpose_a, transpose_b)]
+
+    # TODO(jcf94): Remove `dense` when `matmul` is finally ready
+    compute_tag = "dense" if (transpose_a, transpose_b) == (False, True) else "matmul"
 
     mat = te.compute(
-        (batch, out_dim),
-        compute_lambda,
+        (*batch_dims_a, in_dim, out_dim),
+        compute,
         name=compute_name,
         tag=compute_tag,
         attrs={"layout_free_placeholders": [tensor_b]},
     )
 
     if bias is not None:
-        mat = te.compute(
-            (batch, out_dim),
-            lambda i, j: mat[i, j] + bias[j].astype(out_dtype),
-            tag=tag.BROADCAST,
-        )
+        mat = add(mat, bias.astype(out_dtype))
 
     if auto_scheduler_rewritten_layout:
         mat = auto_scheduler.rewrite_compute_body(mat, auto_scheduler_rewritten_layout)
@@ -154,7 +192,14 @@ def matmul_legalize(attrs, inputs, types):
     return None
 
 
-def dense(data, weight, bias=None, out_dtype=None, auto_scheduler_rewritten_layout=""):
+def dense(
+    data,
+    weight,
+    bias=None,
+    out_dtype=None,
+    auto_scheduler_rewritten_layout="",
+    meta_schedule_original_shape=None,
+):
     """The default implementation of dense in topi.
     This is an alias of matmul_nt operator for data tensor in non-transposed format and weight
     tensor in transposed format.
@@ -176,12 +221,24 @@ def dense(data, weight, bias=None, out_dtype=None, auto_scheduler_rewritten_layo
     auto_scheduler_rewritten_layout: str = ""
         The layout after auto-scheduler's layout rewrite pass.
 
+    meta_schedule_original_shape: Optional[List[PrimExpr]] = None
+        The original shape of the input tensor.
+
     Returns
     -------
     output : tvm.te.Tensor
         2-D with shape [batch, out_dim]
     """
-    return matmul(data, weight, bias, out_dtype, False, True, auto_scheduler_rewritten_layout)
+    return matmul(
+        data,
+        weight,
+        bias,
+        out_dtype,
+        False,
+        True,
+        auto_scheduler_rewritten_layout,
+        meta_schedule_original_shape,
+    )
 
 
 @tvm.target.generic_func
@@ -273,4 +330,23 @@ def dense_alter_layout(attrs, inputs, tinfos, out_type):
     Unlike other TOPI functions, this function operates on both graph level and operator level.
     """
     # not to change by default
+    return None
+
+
+@tvm.target.generic_func
+def batch_matmul_legalize(attrs, inputs, types):
+    """Legalizes batch_matmul op.
+    Parameters
+    ----------
+    attrs : tvm.ir.Attrs
+        Attributes of current batch_matmul
+    inputs : list of tvm.relay.Expr
+        The args of the Relay expr to be legalized
+    types : list of types
+        List of input and output types
+    Returns
+    -------
+    result : tvm.relay.Expr
+        The legalized expr
+    """
     return None

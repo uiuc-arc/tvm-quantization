@@ -95,12 +95,33 @@ struct SimulatedQuantizeAttrs : public tvm::AttrsNode<SimulatedQuantizeAttrs> {
 
 /*! \brief Attribute for dequantize operator */
 struct DequantizeAttrs : public tvm::AttrsNode<DequantizeAttrs> {
+  DataType out_dtype;
   int axis;
 
   TVM_DECLARE_ATTRS(DequantizeAttrs, "relay.attrs.DequantizeAttrs") {
+    TVM_ATTR_FIELD(out_dtype).describe("Output data type, can be one of [float16, float32].");
     TVM_ATTR_FIELD(axis)
         .describe(
             "The channel axis for channel wise dequantization. Default value is -1,"
+            "which corresponds to the last axis.")
+        .set_default(-1);
+  }
+};
+
+/*! \brief Attribute for broadcast operator */
+struct BroadcastAttrs : public tvm::AttrsNode<BroadcastAttrs> {
+  int lhs_axis;
+  int rhs_axis;
+
+  TVM_DECLARE_ATTRS(BroadcastAttrs, "relay.attrs.BroadcastAttrs") {
+    TVM_ATTR_FIELD(lhs_axis)
+        .describe(
+            "The channel axis for channel wise broadcast. Default value is -1,"
+            "which corresponds to the last axis.")
+        .set_default(-1);
+    TVM_ATTR_FIELD(rhs_axis)
+        .describe(
+            "The channel axis for channel wise broadcast. Default value is -1,"
             "which corresponds to the last axis.")
         .set_default(-1);
   }

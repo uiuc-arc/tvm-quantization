@@ -23,7 +23,7 @@ from tvm.te.hybrid import script
 
 from . import _make
 from .dyn import _make as _dyn_make
-from ..expr import Tuple, Expr, Constant
+from ..expr import Tuple, Expr, Constant, Call
 from . import op as reg
 
 
@@ -32,7 +32,7 @@ def _make_virtual_device(device):
         return target.VirtualDevice(device)
     if isinstance(device, str):
         return target.VirtualDevice(_nd.device(device))
-    raise ValueError("expecting a Device or device name, but received a %s" % (type(device)))
+    raise ValueError(f"expecting a Device or device name, but received a {type(device)}")
 
 
 # We create a wrapper function for each operator in the
@@ -611,6 +611,24 @@ def floor_divide(lhs, rhs):
     return _make.floor_divide(lhs, rhs)
 
 
+def trunc_divide(lhs, rhs):
+    """Trunc division with numpy-style broadcasting.
+
+    Parameters
+    ----------
+    lhs : relay.Expr
+        The left hand side input data
+    rhs : relay.Expr
+        The right hand side input data
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+    """
+    return _make.trunc_divide(lhs, rhs)
+
+
 def power(lhs, rhs):
     """Power with numpy-style broadcasting.
 
@@ -663,6 +681,24 @@ def floor_mod(lhs, rhs):
         The computed result.
     """
     return _make.floor_mod(lhs, rhs)
+
+
+def trunc_mod(lhs, rhs):
+    """Trunc mod with numpy-style broadcasting.
+
+    Parameters
+    ----------
+    lhs : relay.Expr
+        The left hand side input data
+    rhs : relay.Expr
+        The right hand side input data
+
+    Returns
+    -------
+    result : relay.Expr
+        The computed result.
+    """
+    return _make.trunc_mod(lhs, rhs)
 
 
 def logical_and(lhs, rhs):
@@ -1105,12 +1141,15 @@ def concatenate(data, axis):
     result: relay.Expr
         The concatenated tensor.
     """
-    data = list(data)
+    if not isinstance(data, Call):
+        data = list(data)
     if not data:
         raise ValueError("relay.concatenate requires data to be non-empty.")
+    if not isinstance(data, Call):
+        data = Tuple(data)
     if not isinstance(axis, int):
         raise ValueError("For now, we only support integer axis")
-    return _make.concatenate(Tuple(data), axis)
+    return _make.concatenate(data, axis)
 
 
 def einsum(data, equation):

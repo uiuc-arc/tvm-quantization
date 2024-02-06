@@ -42,6 +42,7 @@ The goal of this section is to give you an overview of TVM's capabilites and
 how to use them through the Python API.
 """
 
+
 ################################################################################
 # TVM is a deep learning compiler framework, with a number of different modules
 # available for working with deep learning models and operators. In this
@@ -85,16 +86,17 @@ from tvm.contrib import graph_executor
 #   :ref:`Compile Deep Learning Models <tutorial-frontend>` section of the TVM
 #   Documentation.
 
-model_url = "".join(
-    [
-        "https://github.com/onnx/models/raw/",
-        "master/vision/classification/resnet/model/",
-        "resnet50-v2-7.onnx",
-    ]
+model_url = (
+    "https://github.com/onnx/models/raw/main/"
+    "vision/classification/resnet/model/"
+    "resnet50-v2-7.onnx"
 )
 
 model_path = download_testdata(model_url, "resnet50-v2-7.onnx", module="onnx")
 onnx_model = onnx.load(model_path)
+
+# Seed numpy's RNG to get consistent results
+np.random.seed(0)
 
 ################################################################################
 # Downloading, Preprocessing, and Loading the Test Image
@@ -307,7 +309,7 @@ runner = autotvm.LocalRunner(
 ################################################################################
 # Create a simple structure for holding tuning options. We use an XGBoost
 # algorithim for guiding the search. For a production job, you will want to set
-# the number of trials to be larger than the value of 10 used here. For CPU we
+# the number of trials to be larger than the value of 20 used here. For CPU we
 # recommend 1500, for GPU 3000-4000. The number of trials required can depend
 # on the particular model and processor, so it's worth spending some time
 # evaluating performance across a range of values to find the best balance
@@ -322,7 +324,7 @@ runner = autotvm.LocalRunner(
 
 tuning_option = {
     "tuner": "xgb",
-    "trials": 10,
+    "trials": 20,
     "early_stopping": 100,
     "measure_option": autotvm.measure_option(
         builder=autotvm.LocalBuilder(build_func="default"), runner=runner
@@ -342,7 +344,7 @@ tuning_option = {
 # .. admonition:: Setting Tuning Parameters
 #
 #   In this example, in the interest of time, we set the number of trials and
-#   early stopping to 10. You will likely see more performance improvements if
+#   early stopping to 20 and 100. You will likely see more performance improvements if
 #   you set these values to be higher but this comes at the expense of time
 #   spent tuning. The number of trials required for convergence will vary
 #   depending on the specifics of the model and the target platform.
@@ -353,7 +355,44 @@ tasks = autotvm.task.extract_from_program(mod["main"], target=target, params=par
 # Tune the extracted tasks sequentially.
 for i, task in enumerate(tasks):
     prefix = "[Task %2d/%2d] " % (i + 1, len(tasks))
-    tuner_obj = XGBTuner(task, loss_type="rank")
+
+    # choose tuner
+    tuner = "xgb"
+
+    # create tuner
+    if tuner == "xgb":
+        tuner_obj = XGBTuner(task, loss_type="reg")
+    elif tuner == "xgb_knob":
+        tuner_obj = XGBTuner(task, loss_type="reg", feature_type="knob")
+    elif tuner == "xgb_itervar":
+        tuner_obj = XGBTuner(task, loss_type="reg", feature_type="itervar")
+    elif tuner == "xgb_curve":
+        tuner_obj = XGBTuner(task, loss_type="reg", feature_type="curve")
+    elif tuner == "xgb_rank":
+        tuner_obj = XGBTuner(task, loss_type="rank")
+    elif tuner == "xgb_rank_knob":
+        tuner_obj = XGBTuner(task, loss_type="rank", feature_type="knob")
+    elif tuner == "xgb_rank_itervar":
+        tuner_obj = XGBTuner(task, loss_type="rank", feature_type="itervar")
+    elif tuner == "xgb_rank_curve":
+        tuner_obj = XGBTuner(task, loss_type="rank", feature_type="curve")
+    elif tuner == "xgb_rank_binary":
+        tuner_obj = XGBTuner(task, loss_type="rank-binary")
+    elif tuner == "xgb_rank_binary_knob":
+        tuner_obj = XGBTuner(task, loss_type="rank-binary", feature_type="knob")
+    elif tuner == "xgb_rank_binary_itervar":
+        tuner_obj = XGBTuner(task, loss_type="rank-binary", feature_type="itervar")
+    elif tuner == "xgb_rank_binary_curve":
+        tuner_obj = XGBTuner(task, loss_type="rank-binary", feature_type="curve")
+    elif tuner == "ga":
+        tuner_obj = GATuner(task, pop_size=50)
+    elif tuner == "random":
+        tuner_obj = RandomTuner(task)
+    elif tuner == "gridsearch":
+        tuner_obj = GridSearchTuner(task)
+    else:
+        raise ValueError("Invalid tuner: " + tuner)
+
     tuner_obj.tune(
         n_trial=min(tuning_option["trials"], len(task.config_space)),
         early_stopping=tuning_option["early_stopping"],

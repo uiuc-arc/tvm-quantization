@@ -54,7 +54,14 @@ class JSONRuntimeBase : public ModuleNode {
     LoadGraph(graph_json_);
   }
 
-  const char* type_key() const override { return "json"; }
+  ~JSONRuntimeBase() override = default;
+
+  const char* type_key() const override { return "json"; }  // May be overridden
+
+  /*! \brief Get the property of the runtime module .*/
+  int GetPropertyMask() const override {
+    return ModulePropertyMask::kBinarySerializable | ModulePropertyMask::kRunnable;
+  }
 
   /*! \brief Initialize a specific json runtime. */
   virtual void Init(const Array<NDArray>& consts) = 0;
@@ -68,7 +75,7 @@ class JSONRuntimeBase : public ModuleNode {
    * \param sptr_to_self The pointer to the module node.
    * \return The packed function.
    */
-  PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self) override {
+  PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self) override {
     if (name == "get_symbol") {
       return PackedFunc(
           [sptr_to_self, this](TVMArgs args, TVMRetValue* rv) { *rv = this->symbol_name_; });
@@ -88,8 +95,11 @@ class JSONRuntimeBase : public ModuleNode {
       // The function to initialize constant tensors.
       return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
         ICHECK_EQ(args.size(), 1U);
-        this->Init(args[0]);
-        this->initialized_ = true;
+        std::lock_guard<std::mutex> guard(this->initialize_mutex_);
+        if (!this->initialized_) {
+          this->Init(args[0]);
+          this->initialized_ = true;
+        }
         *rv = 0;
       });
     } else {
@@ -135,7 +145,7 @@ class JSONRuntimeBase : public ModuleNode {
    * \param format the format to return.
    * \return A string of JSON.
    */
-  std::string GetSource(const std::string& format = "json") override { return graph_json_; }
+  String GetSource(const String& format = "json") override { return graph_json_; }
 
  protected:
   /*!
@@ -186,6 +196,7 @@ class JSONRuntimeBase : public ModuleNode {
         for (size_t j = 0; j < nodes_[nid].GetOpShape().size(); ++j) {
           input_var_eid_.push_back(EntryID(nid, j));
         }
+        nodes_[nid].SetNumOutput(nodes_[nid].GetOpShape().size());
       } else {
         ICHECK_EQ(nodes_[nid].op_type_, "const");
         auto pos = std::find(std::begin(const_names_), std::end(const_names_), name);
@@ -222,6 +233,7 @@ class JSONRuntimeBase : public ModuleNode {
   void Load(dmlc::JSONReader* reader) {
     reader->BeginObject();
     std::string key;
+    std::string symbol_;
     while (reader->NextObjectItem(&key)) {
       if (key == "nodes") {
         reader->Read(&nodes_);
@@ -231,6 +243,8 @@ class JSONRuntimeBase : public ModuleNode {
         reader->Read(&node_row_ptr_);
       } else if (key == "heads") {
         reader->Read(&outputs_);
+      } else if (key == "symbol") {
+        reader->Read(&symbol_);
       } else {
         LOG(FATAL) << "Unknown key: " << key;
       }
@@ -269,6 +283,8 @@ class JSONRuntimeBase : public ModuleNode {
   std::vector<uint32_t> const_idx_;
   /*! \brief Indicate if the engine has been initialized. */
   bool initialized_{false};
+  /*! \brief Initializer mutex*/
+  std::mutex initialize_mutex_;
 };
 
 }  // namespace json

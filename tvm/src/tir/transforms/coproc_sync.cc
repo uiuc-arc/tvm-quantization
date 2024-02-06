@@ -38,19 +38,19 @@ namespace tir {
 // Visitor to find touched set by co-processor scope.
 class CoProcTouchedBuffer : public StmtExprVisitor {
  public:
-  void VisitExpr_(const LoadNode* op) final {
+  void VisitExpr_(const BufferLoadNode* op) final {
     if (in_scope_) {
-      touched_[op->buffer_var.get()].coproc = true;
+      touched_[op->buffer->data.get()].coproc = true;
     } else {
-      touched_[op->buffer_var.get()].normal = true;
+      touched_[op->buffer->data.get()].normal = true;
     }
     StmtExprVisitor::VisitExpr_(op);
   }
-  void VisitStmt_(const StoreNode* op) final {
+  void VisitStmt_(const BufferStoreNode* op) final {
     if (in_scope_) {
-      touched_[op->buffer_var.get()].coproc = true;
+      touched_[op->buffer->data.get()].coproc = true;
     } else {
-      touched_[op->buffer_var.get()].normal = true;
+      touched_[op->buffer->data.get()].normal = true;
     }
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -105,7 +105,7 @@ class CoProcSyncPlanner : public StorageAccessVisitor {
   }
 
   // Write synchronization to be inserted before or after stmt.
-  std::unordered_map<const Object*, std::vector<Stmt> > sync_;
+  std::unordered_map<const Object*, std::vector<Stmt>> sync_;
 
  protected:
   bool Enabled(const VarNode* buf, const StorageScope& scope) const final {
@@ -224,8 +224,8 @@ class CoProcBarrierDetector : public StorageAccessVisitor {
     PlanWriteBarrier(scope_.back(), nullptr);
   }
 
-  std::unordered_map<const Object*, std::vector<Stmt> > barrier_before_;
-  std::unordered_map<const Object*, std::vector<Stmt> > barrier_after_;
+  std::unordered_map<const Object*, std::vector<Stmt>> barrier_before_;
+  std::unordered_map<const Object*, std::vector<Stmt>> barrier_after_;
 
  protected:
   bool Enabled(const VarNode* buf, const StorageScope& scope) const final {
@@ -245,7 +245,7 @@ class CoProcBarrierDetector : public StorageAccessVisitor {
   // Plan write barrier at Read after write point.
   std::vector<AccessEntry> PlanWriteBarrier(std::vector<StmtEntry> seq, const ForNode* loop) {
     std::vector<AccessEntry> read_seq;
-    std::unordered_map<const VarNode*, std::vector<AccessEntry> > write_set;
+    std::unordered_map<const VarNode*, std::vector<AccessEntry>> write_set;
 
     auto fupdate = [&](size_t i, const AccessEntry& acc) {
       auto it = write_set.find(acc.buffer.get());
@@ -283,7 +283,7 @@ class CoProcBarrierDetector : public StorageAccessVisitor {
 
   std::vector<AccessEntry> PlanReadBarrier(std::vector<StmtEntry> seq, const ForNode* loop) {
     std::vector<AccessEntry> write_seq;
-    std::unordered_map<const VarNode*, std::vector<AccessEntry> > read_set;
+    std::unordered_map<const VarNode*, std::vector<AccessEntry>> read_set;
 
     auto fupdate = [&](size_t i, const AccessEntry& acc) {
       auto it = read_set.find(acc.buffer.get());
@@ -325,7 +325,8 @@ class CoProcBarrierDetector : public StorageAccessVisitor {
     Array<arith::IntSet> wset;
     for (const AccessEntry& acc : wvec) {
       ICHECK(acc.dtype == wvec[0].dtype);
-      wset.push_back(acc.touched);
+      ICHECK_EQ(acc.touched.size(), 1) << "CoProcBarrierDetector expects flat memory";
+      wset.push_back(acc.touched[0]);
     }
     Range none;
     Range r = arith::Union(wset).CoverRange(none);
@@ -410,8 +411,8 @@ class CoProcInstDepDetector : public StmtVisitor {
       first_state_.clear();
       last_state_.clear();
     }
-    if (op->else_case.defined()) {
-      this->VisitStmt(op->else_case);
+    if (op->else_case) {
+      this->VisitStmt(op->else_case.value());
       if (last_state_.node != nullptr) {
         curr_state.node = op;
         MatchFixEnterPop(first_state_);
@@ -436,8 +437,8 @@ class CoProcInstDepDetector : public StmtVisitor {
 
   // insert before is stored in reverse order
   // the first element is closest to the node.
-  std::unordered_map<const Object*, std::vector<Stmt> > insert_before_;
-  std::unordered_map<const Object*, std::vector<Stmt> > insert_after_;
+  std::unordered_map<const Object*, std::vector<Stmt>> insert_before_;
+  std::unordered_map<const Object*, std::vector<Stmt>> insert_after_;
 
  private:
   // state in the sync entry
@@ -449,9 +450,9 @@ class CoProcInstDepDetector : public StmtVisitor {
     // Set of all possible contexts in the exit moment.
     std::unordered_set<int> exit_ctx;
     // existing pop performed at enter
-    std::vector<std::pair<int, int> > enter_pop;
+    std::vector<std::pair<int, int>> enter_pop;
     // existing push performed at exit
-    std::vector<std::pair<int, int> > exit_push;
+    std::vector<std::pair<int, int>> exit_push;
     // clear the state
     void clear() {
       node = nullptr;
@@ -466,8 +467,8 @@ class CoProcInstDepDetector : public StmtVisitor {
   // return the push/pop message at enter/exit of the Block
   // after considering the existing unmatcheded events and added events
   void InjectSync(const SyncState& prev, const SyncState& next,
-                  std::vector<std::pair<int, int> >* prev_exit_push,
-                  std::vector<std::pair<int, int> >* next_enter_pop) {
+                  std::vector<std::pair<int, int>>* prev_exit_push,
+                  std::vector<std::pair<int, int>>* next_enter_pop) {
     prev_exit_push->clear();
     next_enter_pop->clear();
     // quick path
@@ -484,9 +485,9 @@ class CoProcInstDepDetector : public StmtVisitor {
       return;
     }
     // complicate path.
-    std::vector<std::pair<int, int> > vpush = prev.exit_push;
-    std::vector<std::pair<int, int> > vpop = next.enter_pop;
-    std::vector<std::pair<int, int> > pending;
+    std::vector<std::pair<int, int>> vpush = prev.exit_push;
+    std::vector<std::pair<int, int>> vpop = next.enter_pop;
+    std::vector<std::pair<int, int>> pending;
     for (int from : prev.exit_ctx) {
       for (int to : next.enter_ctx) {
         if (from != to) {
@@ -549,7 +550,7 @@ class CoProcInstDepDetector : public StmtVisitor {
 
   void UpdateState() {
     if (last_state_.node != nullptr) {
-      std::vector<std::pair<int, int> > t1, t2;
+      std::vector<std::pair<int, int>> t1, t2;
       InjectSync(last_state_, curr_state_, &t1, &t2);
       std::swap(last_state_, curr_state_);
     } else {
@@ -635,8 +636,8 @@ class CoProcSyncInserter : public StmtMutator {
  private:
   // insert before is stored in reverse order
   // the first element is closest to the node.
-  std::unordered_map<const Object*, std::vector<Stmt> > insert_before_;
-  std::unordered_map<const Object*, std::vector<Stmt> > insert_after_;
+  std::unordered_map<const Object*, std::vector<Stmt>> insert_before_;
+  std::unordered_map<const Object*, std::vector<Stmt>> insert_after_;
 };
 
 Stmt CoProcSync(Stmt stmt) { return CoProcSyncInserter().Insert(std::move(stmt)); }

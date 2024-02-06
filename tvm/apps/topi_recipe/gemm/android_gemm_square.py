@@ -34,7 +34,7 @@ target = "llvm -mtriple=%s-linux-android" % arch
 
 
 def ngflops(N):
-    return 2.0 * float(N * N * N) / (10 ** 9)
+    return 2.0 * float(N * N * N) / (10**9)
 
 
 dtype = "float32"
@@ -123,7 +123,7 @@ def test_gemm_gpu(N, times, bn, num_block, num_thread):
     f = tvm.build(s, [A, B, C], tvm.target.Target("opencl", host=target), name="gemm_gpu")
     temp = utils.tempdir()
     path_dso = temp.relpath("gemm_gpu.so")
-    f.export_library(path_dso, ndk.create_shared)
+    f.export_library(path_dso, fcompile=ndk.create_shared)
 
     # connect to the proxy
     remote = rpc.connect(proxy_host, proxy_port, key=key)

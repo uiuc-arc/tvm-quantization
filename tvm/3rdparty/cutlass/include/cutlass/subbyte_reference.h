@@ -1,24 +1,30 @@
 /***************************************************************************************************
- * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
@@ -288,8 +294,18 @@ public:
 
 template <
   typename Element_,              /// CUTLASS numeric element type.
-  typename Storage_ = uint8_t     /// Underlying storage type. Must be able to hold an integer 
+  typename Storage_ =             /// Underlying storage type. Must be able to hold an integer
                                   ///   number of objects of type Element.
+
+#if defined(__CUDA_ARCH__)        /// Default size depends on width of atomicCas() overloads.
+  #if (__CUDA_ARCH__ >= 700)      ///
+  uint16_t
+  #else
+  uint32_t
+  #endif
+#else
+  uint8_t
+#endif
 >
 class SubbyteReference {
 public:
@@ -381,13 +397,40 @@ public:
   CUTLASS_HOST_DEVICE
   SubbyteReference & set(Element const &x) {
 
-    Storage item = (reinterpret_cast<Storage const &>(x) & kMask);
+    Storage item        = (reinterpret_cast<Storage const &>(x) & kMask);
+    Storage kUpdateMask = Storage(~(kMask << (offset_ * cutlass::sizeof_bits<Element>::value)));
+    Storage new_bits    = Storage(item << (offset_ * cutlass::sizeof_bits<Element>::value));
 
-    Storage kUpdateMask = Storage(~(kMask << (offset_ * sizeof_bits<Element>::value)));
-    *ptr_ = Storage((*ptr_ & kUpdateMask) | Storage(item << (offset_ * sizeof_bits<Element>::value)));
+#if defined(__CUDA_ARCH__)
+
+    //
+    // Homebrew read-modify-write
+    //
+    Storage original;
+    Storage updated;
+
+    do {
+
+      original = (*ptr_);
+
+      updated  = Storage((original & kUpdateMask) | new_bits);
+
+      original = atomicCAS(ptr_, original, updated);
+
+    } while (updated != original);
+
+#else
+
+    Storage original = (*ptr_);
+    Storage updated  = Storage((original & kUpdateMask) | new_bits);
+    *ptr_ = updated;
+
+#endif
 
     return *this;
   }
+
+  ////
 
   /// Unpacks an element from memory
   CUTLASS_HOST_DEVICE

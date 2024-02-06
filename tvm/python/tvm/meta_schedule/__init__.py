@@ -15,23 +15,40 @@
 # specific language governing permissions and limitations
 # under the License.
 """Package `tvm.meta_schedule`. The meta schedule infrastructure."""
-from . import arg_info
-from . import database
-from . import builder
-from . import runner
-from . import mutator
-from . import postproc
-from . import schedule_rule
-from . import space_generator
-from . import search_strategy
-from . import integration
-from . import feature_extractor
-from . import cost_model
-from .search_strategy import (
-    EvolutionarySearchConfig,
-    MeasureCandidate,
-    ReplayFuncConfig,
-    ReplayTraceConfig,
+from . import (
+    arg_info,
+    builder,
+    cost_model,
+    database,
+    feature_extractor,
+    measure_callback,
+    mutator,
+    postproc,
+    relay_integration,
+    runner,
+    schedule,
+    schedule_rule,
+    search_strategy,
+    space_generator,
+    tir_integration,
+    trace_apply,
 )
-from .tune import tune_te, tune_tir, tune_relay
+from .builder import Builder
+from .cost_model import CostModel
+from .database import Database
+from .extracted_task import ExtractedTask
+from .feature_extractor import FeatureExtractor
+from .measure_callback import MeasureCallback
+from .mutator import Mutator
+from .postproc import Postproc
+from .profiler import Profiler
+from .relay_integration import is_meta_schedule_enabled
+from .runner import Runner
+from .schedule_rule import ScheduleRule
+from .search_strategy import MeasureCandidate, SearchStrategy
+from .space_generator import SpaceGenerator
+from .task_scheduler import TaskScheduler
+from .tir_integration import tune_tir
+from .tune import tune_tasks
 from .tune_context import TuneContext
+from .utils import derived_object

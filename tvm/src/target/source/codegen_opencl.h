@@ -41,33 +41,39 @@ class CodeGenOpenCL final : public CodeGenC {
 
   // override print thread tag.
   void InitFuncState(const PrimFunc& f) final;
-  void PrintFuncPrefix() final;                                              // NOLINT(*)
+  void PrintFuncPrefix(std::ostream& os) final;                              // NOLINT(*)
+  void PreFunctionBody(const PrimFunc& f) final;                             // NOLINT(*)
   void BindThreadIndex(const IterVar& iv) final;                             // NOLINT(*)
   void PrintStorageScope(const std::string& scope, std::ostream& os) final;  // NOLINT(*)
   void PrintStorageSync(const CallNode* op) final;                           // NOLINT(*)
   void PrintType(DataType t, std::ostream& os) final;                        // NOLINT(*)
   void PrintType(const Type& type, std::ostream& os) final;                  // NOLINT(*)
-  std::string GetVecLoad(DataType t, const VarNode* buffer, PrimExpr base) final;
-  void PrintVecStore(const VarNode* buffer, DataType t, PrimExpr base,
+  std::string GetVecLoad(DataType t, const BufferNode* buffer, PrimExpr base) final;
+  void PrintVecStore(const BufferNode* buffer, DataType t, PrimExpr base,
                      const std::string& value) final;  // NOLINT(*)
+  void PrintVecElemLoadExpr(DataType t, int i, const std::string& value,
+                            std::ostream& os) final;  // NOLINT(*)
   // the address of load/store
-  void PrintVecAddr(const VarNode* buffer, DataType t, PrimExpr base,
+  void PrintVecAddr(const BufferNode* buffer, DataType t, PrimExpr base,
                     std::ostream& os);                                           // NOLINT(*)
   void PrintRestrict(const Var& v, std::ostream& os) final;                      // NOLINT(*)
   std::string CastFromTo(std::string value, DataType from, DataType target);     // NOLINT(*)
+  std::string CastTo(std::string value, DataType target);                        // NOLINT(*)
   void SetTextureScope(const std::unordered_map<const VarNode*, std::string>&);  // NOLINT(*)
 
   // overload visitor
   void VisitStmt_(const AllocateNode* op) final;                     // NOLINT(*)
   void VisitExpr_(const BroadcastNode* op, std::ostream& os) final;  // NOLINT(*)
+  void VisitExpr_(const RampNode* op, std::ostream& os) final;       // NOLINT(*)
   void VisitExpr_(const CallNode* op, std::ostream& os) final;       // NOLINT(*)
-  void VisitExpr_(const CastNode* op, std::ostream& os) final;       // NOLINT(*)
   void VisitExpr_(const FloatImmNode* op, std::ostream& os) final;   // NOLINT(*)
-  void VisitStmt_(const StoreNode* op) final;                        // NOLINT(*)
 
   // overload min and max to avoid ambiguous call errors
   void VisitExpr_(const MinNode* op, std::ostream& os) final;
   void VisitExpr_(const MaxNode* op, std::ostream& os) final;
+  void VisitExpr_(const AndNode* op, std::ostream& os) final;
+  void VisitExpr_(const OrNode* op, std::ostream& os) final;
+  void VisitExpr_(const SelectNode* op, std::ostream& os) final;
 
  private:
   // whether enable fp16 and fp64 extension
@@ -78,12 +84,9 @@ class CodeGenOpenCL final : public CodeGenC {
   // Whether to enable sampler or sampler-less texture reads,
   // where the choice depends on the OpenCL version used.
   bool enable_compliant_texture_reads_{false};
-  // Key to disable use of texture SSA in certain scenarios. For example,
-  // when loaded value is stored directly to a user declared l-value buffer
-  bool need_texture_ssa_{true};
   // Mapping from buffer to allocation size.
   // Useful to track when a scalar store of a vectorized texture load is required.
-  std::unordered_map<const Object*, int32_t> allocation_size_;
+  std::unordered_map<const Object*, size_t> allocation_size_;
 };
 
 }  // namespace codegen

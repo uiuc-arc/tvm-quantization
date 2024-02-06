@@ -1,24 +1,30 @@
 /***************************************************************************************************
- * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
@@ -35,6 +41,7 @@
 #include "cutlass/matrix_coord.h"
 #include "cutlass/complex.h"
 #include "cutlass/semaphore.h"
+#include "cutlass/gemm/kernel/params_universal_base.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -99,15 +106,11 @@ public:
   //
 
   /// Argument structure
-  struct Arguments {
-
+  struct Arguments : UniversalArgumentsBase
+  {
     //
     // Data members
     //
-
-    GemmUniversalMode mode;
-    GemmCoord problem_size;
-    int batch_count;
 
     typename EpilogueOutputOp::Params epilogue;
 
@@ -136,15 +139,11 @@ public:
     typename LayoutC::Stride::Index ldd_real;
     typename LayoutC::Stride::Index ldd_imag;
 
-    int64_t batch_stride_D;    // unused
-
     //
     // Methods
     //
     
     Arguments(): 
-      mode(GemmUniversalMode::kArray),
-      batch_count(1),
       ptr_M(nullptr),
       ptr_N(nullptr),
       ptr_K(nullptr),
@@ -155,9 +154,8 @@ public:
       ptr_C_real(nullptr), 
       ptr_C_imag(nullptr), 
       ptr_D_real(nullptr),
-      ptr_D_imag(nullptr),
-      batch_stride_D(0)
-      { }
+      ptr_D_imag(nullptr)
+    {}
 
     /// constructs an arguments structure
     Arguments(
@@ -182,11 +180,9 @@ public:
       typename LayoutC::Stride::Index ldc_real,
       typename LayoutC::Stride::Index ldc_imag,
       typename LayoutC::Stride::Index ldd_real,
-      typename LayoutC::Stride::Index ldd_imag
-    ):
-      mode(GemmUniversalMode::kArray),
-      problem_size(problem_size), 
-      batch_count(batch_count),
+      typename LayoutC::Stride::Index ldd_imag)
+    :
+      UniversalArgumentsBase(mode, problem_size, batch_count, batch_stride_D),
       epilogue(epilogue),
       ptr_M(ptr_M),
       ptr_N(ptr_N),
@@ -206,10 +202,8 @@ public:
       ldc_real(ldc_real),
       ldc_imag(ldc_imag),
       ldd_real(ldd_real),
-      ldd_imag(ldd_imag),
-      batch_stride_D(0) {
-
-      }
+      ldd_imag(ldd_imag)
+    {}
 
     /// Returns arguments for the transposed problem
     Arguments transposed_problem() const {
@@ -226,15 +220,30 @@ public:
     }
   };
 
+
   //
   // Structure for precomputing values in host memory and passing to kernels
   //
 
   /// Parameters structure
-  struct Params {
-    cutlass::gemm::GemmCoord problem_size;
-    cutlass::gemm::GemmCoord grid_tiled_shape;
-    int swizzle_log_tile;
+  struct Params : UniversalParamsBase<
+    ThreadblockSwizzle,
+    ThreadblockShape,
+    ElementA,
+    ElementB,
+    ElementC>
+  {
+    using ParamsBase = UniversalParamsBase<
+      ThreadblockSwizzle,
+      ThreadblockShape,
+      ElementA,
+      ElementB,
+      ElementC>;
+
+    //
+    // Data members
+    //
+
     typename Mma::IteratorA::Params params_A_real;
     typename Mma::IteratorA::Params params_A_imag;
     typename Mma::IteratorB::Params params_B_real;
@@ -243,11 +252,9 @@ public:
     typename Epilogue::OutputTileIterator::Params params_C_imag;
     typename Epilogue::OutputTileIterator::Params params_D_real;
     typename Epilogue::OutputTileIterator::Params params_D_imag;
-    
+
     typename EpilogueOutputOp::Params output_op;
 
-    int batch_count;
-    
     int const *ptr_M;
     int const *ptr_N;
     int const *ptr_K;
@@ -262,35 +269,19 @@ public:
     void * const * ptr_D_imag;
 
     //
-    // Methods
+    // Host dispatch API
     //
 
-    CUTLASS_HOST_DEVICE
-    Params():
-      batch_count(0),
-      swizzle_log_tile(0),
-      ptr_M(nullptr),
-      ptr_N(nullptr),
-      ptr_K(nullptr),
-      ptr_A_real(nullptr),
-      ptr_A_imag(nullptr),
-      ptr_B_real(nullptr),
-      ptr_B_imag(nullptr),
-      ptr_C_real(nullptr),
-      ptr_C_imag(nullptr),
-      ptr_D_real(nullptr),
-      ptr_D_imag(nullptr) { }
+    /// Default constructor
+    Params() = default;
 
-    CUTLASS_HOST_DEVICE
+    /// Constructor
     Params(
-      Arguments const &args,
-      cutlass::gemm::GemmCoord const & grid_tiled_shape,
-      int gemm_k_size = 0,                                    // ignored
-      void *workspace = nullptr                               // ignored
-    ):
-      problem_size(args.problem_size),
-      grid_tiled_shape(grid_tiled_shape),
-      swizzle_log_tile(ThreadblockSwizzle().get_log_tile(grid_tiled_shape)),
+      Arguments const &args,  /// GEMM application arguments
+      int device_sms,         /// Number of SMs on the device
+      int sm_occupancy)       /// Kernel SM occupancy (in thread blocks)
+    :
+      ParamsBase(args, device_sms, sm_occupancy),
       ptr_M(args.ptr_M),
       ptr_N(args.ptr_N),
       ptr_K(args.ptr_K),
@@ -303,7 +294,6 @@ public:
       params_D_real(args.ldd_real),
       params_D_imag(args.ldd_imag),
       output_op(args.epilogue),
-      batch_count(args.batch_count),
       ptr_A_real(args.ptr_A_real),
       ptr_A_imag(args.ptr_A_imag),
       ptr_B_real(args.ptr_B_real),
@@ -311,14 +301,13 @@ public:
       ptr_C_real(args.ptr_C_real),
       ptr_C_imag(args.ptr_C_imag),
       ptr_D_real(args.ptr_D_real),
-      ptr_D_imag(args.ptr_D_imag) {
+      ptr_D_imag(args.ptr_D_imag)
+    {}
 
-    }
-
-    void update(
-      Arguments const &args,
-      void *workspace = nullptr) {
-
+    /// Lightweight update given a subset of arguments.  Problem geometry is assumed
+    /// to remain the same.
+    void update(Arguments const &args)
+    {
       ptr_M = args.ptr_M;
       ptr_N = args.ptr_N;
       ptr_K = args.ptr_K;
@@ -339,6 +328,7 @@ public:
     }
   };
 
+
   /// Shared memory storage structure
   union SharedStorage {
     typename Mma::SharedStorage main_loop;
@@ -348,11 +338,8 @@ public:
 public:
 
   //
-  // Methods
+  // Host dispatch API
   //
-
-  CUTLASS_DEVICE
-  GemmPlanarComplexArray() { } 
 
   /// Determines whether kernel satisfies alignment
   static Status can_implement(Arguments const &args) {
@@ -361,22 +348,53 @@ public:
     static int const kAlignmentB = Mma::IteratorB::AccessType::kElements;
     static int const kAlignmentC = Epilogue::OutputTileIterator::kElementsPerAccess;
 
-    if ((args.problem_size.m() % kAlignmentA) || (args.problem_size.k() % kAlignmentA) ||
-      (args.problem_size.n() % kAlignmentB) || (args.problem_size.k() % kAlignmentB) ||
-      (args.problem_size.m() % kAlignmentC) || (args.problem_size.n() % kAlignmentC)) {
+    bool isAMisaligned = false;
+    bool isBMisaligned = false;
+    bool isCMisaligned = false;
 
+    if (platform::is_same<LayoutA, layout::RowMajor>::value) {
+      isAMisaligned = args.problem_size.k() % kAlignmentA;
+    } else if (platform::is_same<LayoutA, layout::ColumnMajor>::value) {
+      isAMisaligned = args.problem_size.m() % kAlignmentA;
+    }
+
+    if (platform::is_same<LayoutB, layout::RowMajor>::value) {
+      isBMisaligned = args.problem_size.n() % kAlignmentB;
+    } else if (platform::is_same<LayoutB, layout::ColumnMajor>::value) {
+      isBMisaligned = args.problem_size.k() % kAlignmentB;
+    }
+
+    if (platform::is_same<LayoutC, layout::RowMajor>::value) {
+      isCMisaligned = args.problem_size.n() % kAlignmentC;
+    } else if (platform::is_same<LayoutC, layout::ColumnMajor>::value) {
+      isCMisaligned = args.problem_size.m() % kAlignmentC;
+    }
+
+    if (isAMisaligned || isBMisaligned || isCMisaligned) {
       return Status::kErrorMisalignedOperand;
     }
 
     return Status::kSuccess;
   }
 
-  static size_t get_extra_workspace_size(Arguments const &args,
-                                         cutlass::gemm::GemmCoord const &grid_tiled_shape) {
 
-    return 0;
+public:
+
+  //
+  // Device-only API
+  //
+
+  // Factory invocation
+  CUTLASS_DEVICE
+  static void invoke(
+    Params const &params,
+    SharedStorage &shared_storage)
+  {
+    GemmPlanarComplexArray op;
+    op(params, shared_storage);
   }
- 
+
+
   /// Executes one GEMM
   CUTLASS_DEVICE
   void operator()(Params const &params, SharedStorage &shared_storage) {
@@ -449,7 +467,7 @@ public:
 
         // Broadcast the warp_id computed by lane 0 to ensure dependent code
         // is compiled as warp-uniform.
-        int warp_idx = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
+        int warp_idx = canonical_warp_idx();
         int lane_idx = threadIdx.x % 32;
     
         //

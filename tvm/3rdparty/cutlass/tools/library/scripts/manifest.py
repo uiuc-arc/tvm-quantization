@@ -10,6 +10,10 @@ import shutil
 
 from library import *
 from gemm_operation import *
+from rank_k_operation import *
+from rank_2k_operation import *
+from trmm_operation import *
+from symm_operation import *
 from conv2d_operation import *  
 from conv3d_operation import *  
 
@@ -24,6 +28,10 @@ class EmitOperationKindLibrary:
       OperationKind.Gemm: EmitGemmConfigurationLibrary
       , OperationKind.Conv2d: EmitConv2dConfigurationLibrary  
       , OperationKind.Conv3d: EmitConv3dConfigurationLibrary  
+      , OperationKind.RankK: EmitRankKConfigurationLibrary
+      , OperationKind.Rank2K: EmitRank2KConfigurationLibrary
+      , OperationKind.Trmm: EmitTrmmConfigurationLibrary
+      , OperationKind.Symm: EmitSymmConfigurationLibrary
     }
 
     self.configurations = [];
@@ -177,25 +185,45 @@ class Options:
 class Manifest:
 
   #
-  def __init__(self, args):
+  def __init__(self, args = None):
     self.operations = {}
     self.args = args
+    self.operation_count = 0
+    self.operations_by_name = {}
 
-    architectures = args.architectures.split(';') if len(args.architectures) else ['50',]
-    self.compute_capabilities = [int(x) for x in architectures]
-    
+    self.kernel_filter = ''
+    self.kernel_filter_list = []
+    self.kernel_names = []
+    self.operations_enabled = []
     self.selected_kernels = []
+    self.ignore_kernel_names = []
+    self.compute_capabilities = [50,]
+    self.curr_build_dir = '.'
+    self.filter_by_cc = True
+
+    if self.args:
+      self.kernel_filter = self.args.kernels
+      self.curr_build_dir = args.curr_build_dir
+
+      architectures = args.architectures.split(';') if len(args.architectures) else ['50',]
+      architectures = [x if x != '90a' else '90' for x in architectures]
+
+      self.compute_capabilities = [int(x) for x in architectures]
+    
+      if args.filter_by_cc in ['false', 'False', '0']:
+        self.filter_by_cc = False
     
     if args.operations == 'all':
       self.operations_enabled = []
     else:
-
       operations_list = [
         OperationKind.Gemm
         , OperationKind.Conv2d    
         , OperationKind.Conv3d    
+          , OperationKind.RankK
+          , OperationKind.Trmm
+          , OperationKind.Symm
       ] 
-
       self.operations_enabled = [x for x in operations_list if OperationKindNames[x] in args.operations.split(',')]
 
     if args.kernels == 'all':
@@ -213,6 +241,7 @@ class Manifest:
 
     self.operation_count = 0
     self.operations_by_name = {}
+    self.disable_full_archs_compilation = args.disable_full_archs_compilation
 
 
   def get_kernel_filters (self, kernelListFile):
@@ -225,8 +254,7 @@ class Manifest:
     else:
         return []
 
-
-
+  #
   def filter_out_kernels(self, kernel_name, kernel_filter_list):
 
     for kernel_filter_re in kernel_filter_list:
@@ -252,10 +280,12 @@ class Manifest:
     ''' Filtering operations based on various criteria'''
 
     # filter based on compute capability
-    enabled = False
+    enabled = not (self.filter_by_cc)
+
     for cc in self.compute_capabilities:
       if cc >= operation.tile_description.minimum_compute_capability and \
-        cc <= operation.tile_description.maximum_compute_capability:
+         cc <= operation.tile_description.maximum_compute_capability and \
+         (cc not in SharedMemPerCC or SharedMemPerCC[cc] >= CalculateSmemUsage(operation)):
 
         enabled = True
         break
@@ -292,7 +322,6 @@ class Manifest:
         if self.filter_out_kernels(operation.procedural_name(), self.kernel_filter_list):
             enabled = True
 
-
     # todo: filter based on compute data type
     return enabled
   #
@@ -322,6 +351,8 @@ class Manifest:
 
       self.operations[operation.operation_kind][configuration_name].append(operation)
       self.operation_count += 1
+    else:
+      print("Culled {} from manifest".format(operation.procedural_name()))
   #
 
   #
@@ -334,7 +365,7 @@ class Manifest:
       GeneratorTarget.Library: EmitInterfaceLibrary 
     }
 
-    generated_path = os.path.join(self.args.curr_build_dir, 'generated')
+    generated_path = os.path.join(self.curr_build_dir, 'generated')
 
     # create generated/
     if os.path.exists(generated_path):
@@ -371,11 +402,58 @@ class Manifest:
   PRIVATE
 """, { 'target_name': target_name})
 
-      manifest_file.write(target_text)
+      manifest_file.write(target_text + '\n\n')
 
       for source_file in source_files:
         manifest_file.write("    %s\n" % str(source_file.replace('\\', '/')))
-      manifest_file.write(")")
+      manifest_file.write(")\n")
+
+      if self.disable_full_archs_compilation:
+
+        def for_hopper(name):
+            pass
+
+        def for_ampere(name):
+            return "16816" in name or \
+                   "16832" in name or \
+                   "16864" in name or \
+                   ("1688" in name and "tf32" in name)
+
+        def for_turing(name):
+            return ("1688" in name and "tf32" not in name) or \
+                    "8816" in name  
+
+        def for_volta(name):
+            return "884" in name
+
+        def is_cpp(name):
+            return name.endswith(".cpp")
+
+        def get_src_archs_str_given_requested_cuda_archs(archs, source_file):
+            intersected_archs = archs & set(self.compute_capabilities)
+            if intersected_archs == set():
+                raise RuntimeError(
+                      """
+                      Empty archs set for file {} after taking
+                      the intersection of {} (global requested archs) and
+                      {} (per file requested archs)
+                      """.format(source_file, set(self.compute_capabilities), archs))
+            else:
+                return " ".join(map(str, intersected_archs))
+
+        for source_file in source_files:
+            if is_cpp(source_file):
+                continue # skip because source is cpp
+            elif for_ampere(source_file):
+                archs_str = get_src_archs_str_given_requested_cuda_archs({80, 87, 90}, source_file)
+            elif for_turing(source_file):
+                archs_str = get_src_archs_str_given_requested_cuda_archs({75}, source_file)
+            elif for_volta(source_file):
+                archs_str = get_src_archs_str_given_requested_cuda_archs({70, 72}, source_file)
+            else:
+                raise RuntimeError("Per file archs are not set {}, as there is no rule specified for this file pattern".format(source_file))      
+ 
+            manifest_file.write("cutlass_apply_cuda_gencode_flags({} SM_ARCHS {})\n".format(str(source_file.replace('\\', '/')), archs_str))
   #
 
 ###################################################################################################

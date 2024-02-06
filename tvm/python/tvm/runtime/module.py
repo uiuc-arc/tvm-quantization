@@ -23,7 +23,6 @@ import struct
 from typing import Sequence
 import numpy as np
 
-import tvm._ffi
 from tvm._ffi.base import _LIB, check_call, c_str, string_types, _RUNTIME_ONLY
 from tvm._ffi.libinfo import find_include_path
 from .packed_func import PackedFunc, PackedFuncHandle, _set_class_module
@@ -74,26 +73,28 @@ class BenchmarkResult:
         self.max = np.max(self.results)
 
     def __repr__(self):
-        return "BenchmarkResult(min={}, mean={}, median={}, max={}, std={}, results={})".format(
-            self.min, self.mean, self.median, self.max, self.std, self.results
+        return (
+            f"BenchmarkResult(min={self.min}, mean={self.mean}, median={self.median}, "
+            f"max={self.max}, std={self.std}, results={self.results})"
         )
 
     def __str__(self):
-        return """Execution time summary:
-{:^12} {:^12} {:^12} {:^12} {:^12}
-{:^12.4f} {:^12.4f} {:^12.4f} {:^12.4f} {:^12.4f}
-               """.format(
-            "mean (ms)",
-            "median (ms)",
-            "max (ms)",
-            "min (ms)",
-            "std (ms)",
-            self.mean * 1000,
-            self.median * 1000,
-            self.max * 1000,
-            self.min * 1000,
-            self.std * 1000,
+        return (
+            f"Execution time summary:\n"
+            f"{'mean (ms)':^12} {'median (ms)':^12} {'max (ms)':^12} "
+            f"{'min (ms)':^12} {'std (ms)':^12}\n"
+            f"{self.mean * 1000:^12.4f} {self.median * 1000:^12.4f} {self.max * 1000:^12.4f} "
+            f"{self.min * 1000:^12.4f} {self.std * 1000:^12.4f}"
+            "               "
         )
+
+
+class ModulePropertyMask(object):
+    """Runtime Module Property Mask."""
+
+    BINARY_SERIALIZABLE = 0b001
+    RUNNABLE = 0b010
+    DSO_EXPORTABLE = 0b100
 
 
 class Module(object):
@@ -127,6 +128,28 @@ class Module(object):
         self._entry = self.get_function(self.entry_name)
         return self._entry
 
+    def implements_function(self, name, query_imports=False):
+        """Returns True if the module has a definition for the global function with name. Note
+        that has_function(name) does not imply get_function(name) is non-null since the module
+        may be, eg, a CSourceModule which cannot supply a packed-func implementation of the function
+        without further compilation. However, get_function(name) non null should always imply
+        has_function(name).
+
+        Parameters
+        ----------
+        name : str
+            The name of the function
+
+        query_imports : bool
+            Whether to also query modules imported by this module.
+
+        Returns
+        -------
+        b : Bool
+            True if module (or one of its imports) has a definition for name.
+        """
+        return _ffi_api.ModuleImplementsFunction(self, name, query_imports)
+
     def get_function(self, name, query_imports=False):
         """Get function from the module.
 
@@ -150,7 +173,7 @@ class Module(object):
             )
         )
         if not ret_handle.value:
-            raise AttributeError("Module has no function '%s'" % name)
+            raise AttributeError(f"Module has no function '{name}'")
         return PackedFunc(ret_handle, False)
 
     def import_module(self, module):
@@ -178,7 +201,7 @@ class Module(object):
         return self.entry_func(*args)
 
     def __repr__(self):
-        return "Module(%s, %x)" % (self.type_key, self.handle.value)
+        return f"Module({self.type_key}, {self.handle.value:x})"
 
     @property
     def type_key(self):
@@ -217,6 +240,52 @@ class Module(object):
         nmod = _ffi_api.ModuleImportsSize(self)
         return [_ffi_api.ModuleGetImport(self, i) for i in range(nmod)]
 
+    def get_property_mask(self):
+        """Get the runtime module property mask. The mapping is stated in ModulePropertyMask.
+
+        Returns
+        -------
+        mask : int
+            Bitmask of runtime module property
+        """
+        return _ffi_api.ModuleGetPropertyMask(self)
+
+    @property
+    def is_binary_serializable(self):
+        """Returns true if module is 'binary serializable', ie can be serialzed into binary
+         stream and loaded back to the runtime module.
+
+        Returns
+        -------
+        b : Bool
+            True if the module is binary serializable.
+        """
+        return (self.get_property_mask() & ModulePropertyMask.BINARY_SERIALIZABLE) != 0
+
+    @property
+    def is_runnable(self):
+        """Returns true if module is 'runnable'. ie can be executed without any extra
+        compilation/linking steps.
+
+        Returns
+        -------
+        b : Bool
+            True if the module is runnable.
+        """
+        return (self.get_property_mask() & ModulePropertyMask.RUNNABLE) != 0
+
+    @property
+    def is_dso_exportable(self):
+        """Returns true if module is 'DSO exportable', ie can be included in result of
+        export_library by the external compiler directly.
+
+        Returns
+        -------
+        b : Bool
+            True if the module is DSO exportable.
+        """
+        return (self.get_property_mask() & ModulePropertyMask.DSO_EXPORTABLE) != 0
+
     def save(self, file_name, fmt=""):
         """Save the module to file.
 
@@ -236,7 +305,19 @@ class Module(object):
         """
         _ffi_api.ModuleSaveToFile(self, file_name, fmt)
 
-    def time_evaluator(self, func_name, dev, number=10, repeat=1, min_repeat_ms=0, f_preproc=""):
+    def time_evaluator(
+        self,
+        func_name,
+        dev,
+        number=10,
+        repeat=1,
+        min_repeat_ms=0,
+        limit_zero_time_iterations=100,
+        cooldown_interval_ms=0,
+        repeats_to_cooldown=1,
+        cache_flush_bytes=0,
+        f_preproc="",
+    ):
         """Get an evaluator that measures time cost of running function.
 
         Parameters
@@ -265,6 +346,21 @@ class Module(object):
             minimum duration requirement of one `repeat`.
             i.e., When the run time of one `repeat` falls below this time, the `number` parameter
             will be automatically increased.
+
+        limit_zero_time_iterations: int, optional
+            The maximum number of repeats when measured time is equal to 0.
+            It helps to avoid hanging during measurements.
+
+        cooldown_interval_ms: int, optional
+            The cooldown interval in milliseconds between the number of repeats defined by
+            `repeats_to_cooldown`.
+
+        repeats_to_cooldown: int, optional
+            The number of repeats before the cooldown is activated.
+
+        cache_flush_bytes: int, optional
+            The number of bytes to flush from the cache before each repeat.
+
         f_preproc: str, optional
             The preprocess function name we want to execute before executing the time evaluator.
 
@@ -288,6 +384,10 @@ class Module(object):
                 number,
                 repeat,
                 min_repeat_ms,
+                limit_zero_time_iterations,
+                cooldown_interval_ms,
+                repeats_to_cooldown,
+                cache_flush_bytes,
                 f_preproc,
             )
 
@@ -323,6 +423,10 @@ class Module(object):
         stack.append(self)
         while stack:
             module = stack.pop()
+            assert (
+                module.is_dso_exportable or module.is_binary_serializable
+            ), f"Module {module.type_key} should be either dso exportable or binary serializable."
+
             if filter_func(module):
                 dso_modules.append(module)
             for m in module.imported_modules:
@@ -332,10 +436,18 @@ class Module(object):
         return dso_modules
 
     def _collect_dso_modules(self):
-        is_dso_exportable = lambda m: (m.type_key == "llvm" or m.type_key == "c")
-        return self._collect_from_import_tree(is_dso_exportable)
+        return self._collect_from_import_tree(lambda m: m.is_dso_exportable)
 
-    def export_library(self, file_name, fcompile=None, addons=None, workspace_dir=None, **kwargs):
+    def export_library(
+        self,
+        file_name,
+        *,
+        fcompile=None,
+        fpack_imports=None,
+        addons=None,
+        workspace_dir=None,
+        **kwargs,
+    ):
         """
         Export the module and all imported modules into a single device library.
 
@@ -361,6 +473,16 @@ class Module(object):
             This behavior is controlled by the type of object exported.
             If fcompile has attribute object_format, will compile host library
             to that format. Otherwise, will use default format "o".
+
+        fpack_imports: function(mod: runtime.Module, is_system_lib: bool, symbol_prefix: str,
+                                workspace_dir: str) -> str
+            Function used to pack imported modules from `mod` into a file suitable for passing
+            to fcompile as an input file. The result can be a C source, or an .o object file,
+            or any other file that the fcompile function can handle. The function returns the
+            name of the created file.
+
+            If not provided, the imported modules will be serialized either via packing to an
+            LLVM module, or to a C source file.
 
         workspace_dir : str, optional
             The path of the directory used to create the intermediate
@@ -390,8 +512,8 @@ class Module(object):
         if self.type_key == "stackvm":
             if not file_name.endswith(".stackvm"):
                 raise ValueError(
-                    "Module[%s]: can only be saved as stackvm format."
-                    "did you build with LLVM enabled?" % self.type_key
+                    f"Module[{self.type_key}]: can only be saved as stackvm format."
+                    "did you build with LLVM enabled?"
                 )
             self.save(file_name)
             return
@@ -403,7 +525,9 @@ class Module(object):
         files = addons if addons else []
         is_system_lib = False
         has_c_module = False
-        llvm_target_triple = None
+        system_lib_prefix = None
+        llvm_target_string = None
+        global_object_format = "o"
         for index, module in enumerate(modules):
             if fcompile is not None and hasattr(fcompile, "object_format"):
                 if module.type_key == "c":
@@ -416,12 +540,9 @@ class Module(object):
                     object_format = module.format
                     has_c_module = True
                 else:
-                    object_format = fcompile.object_format
+                    global_object_format = object_format = fcompile.object_format
             else:
-                if module.type_key == "llvm":
-                    object_format = "o"
-                else:
-                    assert module.type_key == "c"
+                if module.type_key == "c":
                     if len(module.format) > 0:
                         assert module.format in [
                             "c",
@@ -436,37 +557,51 @@ class Module(object):
                         if kwargs["cc"] == "nvcc":
                             object_format = "cu"
                     has_c_module = True
+                else:
+                    assert module.type_key == "llvm" or module.type_key == "static_library"
+                    global_object_format = object_format = "o"
+
             path_obj = os.path.join(workspace_dir, f"lib{index}.{object_format}")
             module.save(path_obj)
             files.append(path_obj)
-            is_system_lib = (
-                module.type_key == "llvm" and module.get_function("__tvm_is_system_module")()
-            )
-            llvm_target_triple = (
-                module.type_key == "llvm" and module.get_function("_get_target_triple")()
-            )
+            if module.type_key == "llvm":
+                is_system_lib = module.get_function("__tvm_is_system_module")()
+                llvm_target_string = module.get_function("_get_target_string")()
+                system_lib_prefix = module.get_function("__tvm_get_system_lib_prefix")()
+
         if not fcompile:
             if file_name.endswith(".tar"):
                 fcompile = _tar.tar
             else:
                 fcompile = _cc.create_shared
 
-        if llvm_target_triple is None and hasattr(fcompile, "get_target_triple"):
-            llvm_target_triple = fcompile.get_target_triple()
+        if llvm_target_string is None and hasattr(fcompile, "get_target_triple"):
+            triple = fcompile.get_target_triple()
+            assert triple, "Target triple should not be empty"
+            llvm_target_string = "llvm -mtriple " + triple
 
         if getattr(fcompile, "need_system_lib", False) and not is_system_lib:
-            raise ValueError("%s need --system-lib option" % str(fcompile))
+            raise ValueError(f"{str(fcompile)} need --system-lib option")
 
         if self.imported_modules:
-            if enabled("llvm") and llvm_target_triple:
-                path_obj = os.path.join(workspace_dir, f"devc.{object_format}")
-                m = _ffi_api.ModulePackImportsToLLVM(self, is_system_lib, llvm_target_triple)
+            pack_lib_prefix = system_lib_prefix if system_lib_prefix else ""
+
+            if fpack_imports is not None:
+                path_out = fpack_imports(self, is_system_lib, pack_lib_prefix, workspace_dir)
+                files.append(path_out)
+            elif enabled("llvm") and llvm_target_string:
+                path_obj = os.path.join(
+                    workspace_dir, f"{pack_lib_prefix}devc.{global_object_format}"
+                )
+                m = _ffi_api.ModulePackImportsToLLVM(
+                    self, is_system_lib, llvm_target_string, pack_lib_prefix
+                )
                 m.save(path_obj)
                 files.append(path_obj)
             else:
-                path_cc = os.path.join(workspace_dir, "devc.c")
+                path_cc = os.path.join(workspace_dir, f"{pack_lib_prefix}devc.c")
                 with open(path_cc, "w") as f:
-                    f.write(_ffi_api.ModulePackImportsToC(self, is_system_lib))
+                    f.write(_ffi_api.ModulePackImportsToC(self, is_system_lib, pack_lib_prefix))
                 files.append(path_cc)
 
         # The imports could contain a c module but the object format could be tar
@@ -483,7 +618,7 @@ class Module(object):
         return fcompile(file_name, files, **kwargs)
 
 
-def system_lib():
+def system_lib(symbol_prefix=""):
     """Get system-wide library module singleton.
 
     System lib is a global module that contains self register functions in startup.
@@ -496,12 +631,18 @@ def system_lib():
     The system lib is intended to be linked and loaded during the entire life-cyle of the program.
     If you want dynamic loading features, use dso modules instead.
 
+    Parameters
+    ----------
+    symbol_prefix: Optional[str]
+        Optional symbol prefix that can be used for search. When we lookup a symbol
+        symbol_prefix + name will first be searched, then the name without symbol_prefix.
+
     Returns
     -------
     module : runtime.Module
         The system-wide library module.
     """
-    return _ffi_api.SystemLib()
+    return _ffi_api.SystemLib(symbol_prefix)
 
 
 def load_module(path, fmt=""):
@@ -529,7 +670,7 @@ def load_module(path, fmt=""):
     if os.path.isfile(path):
         path = os.path.realpath(path)
     else:
-        raise ValueError("cannot find file %s" % path)
+        raise ValueError(f"cannot find file {path}")
 
     # High level handling for .o and .tar file.
     # We support this to be consistent with RPC module load.
@@ -552,6 +693,13 @@ def load_module(path, fmt=""):
     return _ffi_api.ModuleLoadFromFile(path, fmt)
 
 
+def load_static_library(path, func_names):
+    """Load the .o library at path which implements functions with func_names.
+    Unlike the generic load_module the result will remain as a static_library
+    and will not be relinked on-the-fly into a .so library."""
+    return _ffi_api.ModuleLoadStaticLibrary(path, func_names)
+
+
 def enabled(target):
     """Whether module runtime is enabled for target
 
@@ -572,6 +720,17 @@ def enabled(target):
     >>> tvm.runtime.enabled("gpu")
     """
     return _ffi_api.RuntimeEnabled(target)
+
+
+def num_threads() -> int:
+    """Get the number of threads in use by the TVM runtime.
+
+    Returns
+    -------
+    int
+        Number of threads in use.
+    """
+    return _ffi_api.NumThreads()
 
 
 _set_class_module(Module)

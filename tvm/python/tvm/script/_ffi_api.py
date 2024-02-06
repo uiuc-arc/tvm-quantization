@@ -1,4 +1,3 @@
-# Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
 # regarding copyright ownership.  The ASF licenses this file
@@ -16,5 +15,6 @@
 # under the License.
 """FFI APIs for tvm.script"""
 import tvm._ffi
+
 
 tvm._ffi._init_api("script", __name__)

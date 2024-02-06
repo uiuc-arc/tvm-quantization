@@ -40,6 +40,7 @@
 
 #include "../../support/arena.h"
 #include "../../support/ring_buffer.h"
+#include "../../support/utils.h"
 #include "../object_internal.h"
 #include "rpc_local_session.h"
 
@@ -218,6 +219,16 @@ class RPCEndpoint::EventHandler : public dmlc::Stream {
     this->Write(cdata);
   }
 
+  void WriteObject(void* obj) { this->ThrowError(RPCServerStatus::kUnknownTypeCode); }
+  uint64_t GetObjectBytes(void* obj) {
+    this->ThrowError(RPCServerStatus::kUnknownTypeCode);
+    return 0;
+  }
+
+  void ReadObject(int* tcode, TVMValue* value) {
+    this->ThrowError(RPCServerStatus::kUnknownTypeCode);
+  }
+
   void MessageDone() {
     // Unused here, implemented for microTVM framing layer.
   }
@@ -372,8 +383,11 @@ class RPCEndpoint::EventHandler : public dmlc::Stream {
     if (code == RPCCode::kException) {
       // switch to the state before sending exception.
       this->SwitchToState(kRecvPacketNumBytes);
-      std::string msg = args[0];
-      LOG(FATAL) << "RPCError: Error caught from RPC call:\n" << msg;
+      String msg = args[0];
+      if (!support::StartsWith(msg, "RPCSessionTimeoutError: ")) {
+        msg = "RPCError: Error caught from RPC call:\n" + msg;
+      }
+      LOG(FATAL) << msg;
     }
 
     ICHECK(setreturn != nullptr) << "fsetreturn not available";
@@ -623,6 +637,9 @@ class RPCEndpoint::EventHandler : public dmlc::Stream {
 
 RPCCode RPCEndpoint::HandleUntilReturnEvent(bool client_mode, RPCSession::FEncodeReturn setreturn) {
   RPCCode code = RPCCode::kCallFunc;
+
+  CHECK(channel_) << "Expected connection to server " << name_
+                  << " to be active, but the connection was previously closed";
   while (code != RPCCode::kReturn && code != RPCCode::kShutdown && code != RPCCode::kCopyAck) {
     while (writer_.bytes_available() != 0) {
       writer_.ReadWithCallback(
@@ -1125,6 +1142,8 @@ class RPCClientSession : public RPCSession, public DeviceAPI {
   DeviceAPI* GetDeviceAPI(Device dev, bool allow_missing) final { return this; }
 
   bool IsLocalSession() const final { return false; }
+
+  void Shutdown() final { endpoint_->Shutdown(); }
 
  private:
   uint64_t GetRPCMaxTransferSize() {

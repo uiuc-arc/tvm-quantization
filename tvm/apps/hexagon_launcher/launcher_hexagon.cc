@@ -23,7 +23,6 @@ extern "C" {
 #include <HAP_farf.h>
 #include <HAP_perf.h>
 #include <qurt_error.h>
-#include <qurt_hvx.h>
 }
 
 #include <tvm/runtime/object.h>
@@ -36,22 +35,29 @@ extern "C" {
 #include "launcher_rpc.h"
 
 static std::unique_ptr<Model> TheModel;
+bool WriteLWPOutput(const std::string&);
 
 static AEEResult error_too_small(const std::string& func_name, const std::string& value_name,
                                  int given, int needed) {
-  FARF(ERROR, "%s: %s value too small (%d), need at least %d", func_name.c_str(),
-       value_name.c_str(), given, needed);
+  LOG(ERROR) << func_name.c_str() << ": " << value_name.c_str() << " value too small (" << given
+             << "), need at least " << needed;
   return AEE_EBADPARM;
 }
 
 int __QAIC_HEADER(launcher_rpc_open)(const char* uri, remote_handle64* handle) {
   *handle = 0;  // Just use any value.
   reset_device_api();
+  static const tvm::runtime::PackedFunc acq_res =
+      get_runtime_func("device_api.hexagon.acquire_resources");
+  acq_res();
   return AEE_SUCCESS;
 }
 
 int __QAIC_HEADER(launcher_rpc_close)(remote_handle64 handle) {
   // Comment to stop clang-format from single-lining this function.
+  static const tvm::runtime::PackedFunc rel_res =
+      get_runtime_func("device_api.hexagon.release_resources");
+  rel_res();
   return AEE_SUCCESS;
 }
 
@@ -59,12 +65,27 @@ AEEResult __QAIC_HEADER(launcher_rpc_load)(remote_handle64 handle, const char* m
                                            const char* graph_json) {
   if (TheModel) {
     // Need to unload first.
-    FARF(ERROR, "%s: model already loaded, unload first", __func__);
+    LOG(ERROR) << __func__ << ": model already loaded, unload first";
     return AEE_EUNABLETOLOAD;
   }
 
   tvm::runtime::Module module = load_module(module_path);
-  tvm::runtime::Module executor = create_graph_executor(graph_json, module, Model::device());
+  std::string module_type = module->type_key();
+  tvm::runtime::Module executor;
+  if (module_type == "AotExecutorFactory") {
+    executor = create_aot_executor(module, Model::external());
+  } else if (module_type == "library") {
+    // We're not expecting "GraphExecutorFactory" here.
+    executor = create_graph_executor(graph_json, module, Model::device());
+  } else {
+    LOG(ERROR) << __func__ << ": unexpected module type: " << module_type;
+    // Fall through.
+  }
+
+  if (executor.get() == nullptr) {
+    LOG(ERROR) << __func__ << ": failed to create executor for module" << module_path;
+    return AEE_EUNABLETOLOAD;
+  }
 
   TheModel = std::make_unique<Model>(executor, module, graph_json);
   return AEE_SUCCESS;
@@ -84,7 +105,7 @@ AEEResult __QAIC_HEADER(launcher_rpc_get_num_inputs)(remote_handle64 handle, int
   }
 
   tvm::runtime::PackedFunc get_num_inputs =
-      get_module_func(TheModel->graph_executor, "get_num_inputs");
+      get_module_func(TheModel->model_executor, "get_num_inputs");
   *num_inputs = get_num_inputs();
   return AEE_SUCCESS;
 }
@@ -94,7 +115,7 @@ AEEResult __QAIC_HEADER(launcher_rpc_set_input)(remote_handle64 handle, int inpu
                                                 const unsigned char* input_value, int value_size) {
   if (!TheModel) {
     // No model created.
-    FARF(ERROR, "%s: no model created", __func__);
+    LOG(ERROR) << __func__ << ": no model created";
     return AEE_EBADSTATE;
   }
 
@@ -119,7 +140,7 @@ AEEResult __QAIC_HEADER(launcher_rpc_set_input)(remote_handle64 handle, int inpu
 
   auto input = tvm::runtime::NDArray::FromDLPack(&managed);
 
-  tvm::runtime::PackedFunc set_input = get_module_func(TheModel->graph_executor, "set_input");
+  tvm::runtime::PackedFunc set_input = get_module_func(TheModel->model_executor, "set_input");
   set_input(input_idx, input);
 
   return AEE_SUCCESS;
@@ -132,7 +153,7 @@ AEEResult __QAIC_HEADER(launcher_rpc_get_num_outputs)(remote_handle64 handle, in
   }
 
   tvm::runtime::PackedFunc get_num_outputs =
-      get_module_func(TheModel->graph_executor, "get_num_outputs");
+      get_module_func(TheModel->model_executor, "get_num_outputs");
   *num_outputs = get_num_outputs();
   return AEE_SUCCESS;
 }
@@ -152,7 +173,7 @@ AEEResult __QAIC_HEADER(launcher_rpc_get_output)(remote_handle64 handle, int out
     return AEE_EBADPARM;
   }
 
-  tvm::runtime::PackedFunc get_output = get_module_func(TheModel->graph_executor, "get_output");
+  tvm::runtime::PackedFunc get_output = get_module_func(TheModel->model_executor, "get_output");
   tvm::runtime::NDArray output = get_output(output_idx);
 
   std::vector<int64_t> shape_vec{output->shape, output->shape + output->ndim};
@@ -163,7 +184,7 @@ AEEResult __QAIC_HEADER(launcher_rpc_get_output)(remote_handle64 handle, int out
     delete static_cast<tvm::runtime::NDArray::Container*>(container);
   });
 
-  tvm::runtime::NDArray host_output(GetObjectPtr<tvm::Object>(container));
+  tvm::runtime::NDArray host_output(tvm::runtime::GetObjectPtr<tvm::runtime::Object>(container));
 
   if (meta_size != 0) {
     auto* meta = reinterpret_cast<tensor_meta*>(output_meta);
@@ -189,28 +210,11 @@ AEEResult __QAIC_HEADER(launcher_rpc_get_output)(remote_handle64 handle, int out
 }
 
 AEEResult __QAIC_HEADER(launcher_rpc_run)(remote_handle64 handle, uint64_t* pcycles,
-                                          uint64_t* usecs) {
+                                          uint64_t* usecs, int gen_lwp_json) {
   if (!TheModel) {
     // No model created.
-    FARF(ERROR, "%s: no model created", __func__);
+    LOG(ERROR) << __func__ << ": no model created";
     return AEE_EBADSTATE;
-  }
-
-  // Reserve HVX.
-  int res = qurt_hvx_reserve(QURT_HVX_RESERVE_ALL_AVAILABLE);
-  switch (res) {
-    case QURT_HVX_RESERVE_NOT_SUPPORTED:
-    case QURT_HVX_RESERVE_NOT_SUCCESSFUL:
-      FARF(ERROR, "error reserving HVX: %u", res);
-      return AEE_EFAILED;
-    default:
-      break;
-  }
-  // Lock HVX.
-  int lck = qurt_hvx_lock(QURT_HVX_MODE_128B);
-  if (lck != 0) {
-    FARF(ERROR, "error locking HVX: %u", lck);
-    return AEE_EFAILED;
   }
 
   uint64_t us_begin = HAP_perf_get_time_us();
@@ -223,17 +227,11 @@ AEEResult __QAIC_HEADER(launcher_rpc_run)(remote_handle64 handle, uint64_t* pcyc
   *pcycles = pc_end - pc_begin;
   *usecs = us_end - us_begin;
 
-  // Unlock HVX.
-  int unl = qurt_hvx_unlock();
-  if (unl != 0) {
-    FARF(ERROR, "error unlocking HVX: %u", unl);
-    return AEE_EFAILED;
-  }
-  // Release HVX.
-  int rel = qurt_hvx_cancel_reserve();
-  if (rel != 0) {
-    FARF(ERROR, "error canceling HVX reservation: %u", rel);
-    return AEE_EFAILED;
+  if (gen_lwp_json) {
+    if (!WriteLWPOutput("lwp.json")) {
+      LOG(ERROR) << "ERROR: failed to generate lwp json file";
+      return AEE_EFAILED;
+    }
   }
 
   return AEE_SUCCESS;

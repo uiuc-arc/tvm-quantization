@@ -17,56 +17,12 @@
 # pylint: disable=invalid-name,unused-variable,unused-argument,no-member
 """Arm target utility functions"""
 
-import re
-import tvm
+from tvm.target import Target
 
 
-def get_arch_version(target_mattr):
-    """Parse the LLVM target -mattr, and return
-    the architecture version in a decimal representation
-    (e.g., if -mattr=v8.4a, return 8.4)
-    """
-
-    arch_version = 8.0
-    m = re.compile(r"\+v(.*)\.(.*)a")
-    for attr in target_mattr:
-        match_obj = m.match(attr)
-        if match_obj:
-            major = int(match_obj.group(1))
-            minor = int(match_obj.group(2))
-            decimal = 10
-            if minor >= 10:
-                decimal = 100
-            arch_version = major + float(minor) / decimal
-
-    return arch_version
-
-
-def is_dotprod_available():
-    """Checks whether the hardware has support for udot/sdot instructions."""
-    target = tvm.target.Target.current(allow_none=False)
-    arch_version = get_arch_version(target.mattr)
-    return arch_version >= 8.4 or ((arch_version in (8.2, 8.3)) and "+dotprod" in target.mattr)
-
-
-def is_mmla_available():
-    """Checks whether the hardware has support for ummla/smmla instructions."""
-    target = tvm.target.Target.current(allow_none=False)
-    arch_version = get_arch_version(target.mattr)
-    return arch_version >= 8.6 or (
-        (arch_version in (8.2, 8.3, 8.4, 8.5)) and "+i8mm" in target.mattr
-    )
-
-
-def is_aarch64_arm():
-    """Checks whether we are compiling for an AArch64 target."""
-    target = tvm.target.Target.current(allow_none=False)
-    return "aarch64" in target.attrs.get("mtriple", "")
-
-
-def get_tiling_B_interleaved_t(interleave_A):
+def get_tiling_B_transformed(interleave_A, in_dtype):
     """Compute the tiling information for matrix B', where B'
-    is the transposed and interleaved version of matrix B in C=A*B.
+    is the tiled, interleaved (and transposed) version of matrix B in C=A*B.
 
     The tiling information is chosen to maximize register usage during the
     tile computation.
@@ -80,38 +36,87 @@ def get_tiling_B_interleaved_t(interleave_A):
 
     Parameters
     ----------
-    interleave_A: bool
-                  determines if A is expected to be interleaved
+    interleave_A : bool
+        determines if A is expected to be interleaved
+    in_dtype : str
+        input datatype
+
 
     Returns
     ----------
-    tile_rows_B: the output tile rows of B'
-    tile_cols_B: the output tile columns of B'
+    tile_N: the output tile size of B' on N axis (N = OC)
+    tile_K: the output tile size of B' on K axis (K = KW * KH * IC)
     """
-    if is_mmla_available():
-        # If smmla/ummla is available,  A must be interleaved.
-        # Each load from B' will contain 8 elements
-        # and we are loading 12 rows of B' (i.e., 12 columns of B)
-        tile_rows_B = 12
-        tile_cols_B = 8
-    elif is_dotprod_available():
-        # The number of tile rows of B' vary depending on the
-        # strategy:
-        # * If we are interleaving A, then we select 12 columns from B'(i.e.,
-        #   12 rows from B).
-        # * If we are not interleaving A, then we select 16 columns from B'(i.e.,
-        #   16 rows from B).
-        tile_rows_B = 12 if interleave_A else 16
+    target = Target.current(allow_none=False)
+    if in_dtype in ["int8", "uint8"]:
+        if target.features.has_matmul_i8:
+            # If smmla/ummla is available,  A must be interleaved.
+            # Each load from B' will contain 8 elements
+            # and we are loading 12 rows of B' (i.e., 12 columns of B)
+            tile_N = 12
+            tile_K = 8
+        elif target.features.has_dotprod:
+            # The number of tile rows of B' vary depending on the
+            # strategy:
+            # * If we are interleaving A, then we select 12 columns from B'(i.e.,
+            #   12 rows from B).
+            # * If we are not interleaving A, then we select 16 columns from B'(i.e.,
+            #   16 rows from B).
+            tile_N = 12 if interleave_A else 16
 
-        # Dot product instruction groups 2 (u)int16x8 vectors in
-        # groups of 4 and compute the dot product among those groups
-        # This means that the number of columns in a tile of B' (i.e.,  the
-        # rows of the original matrix B)  need to be 4.
-        tile_cols_B = 4
+            # Dot product instruction groups 2 (u)int16x8 vectors in
+            # groups of 4 and compute the dot product among those groups
+            # This means that the number of columns in a tile of B' (i.e.,  the
+            # rows of the original matrix B)  need to be 4.
+            tile_K = 4
+        else:
+            # If no acceleration is available, A must be interleaved. In this case
+            # we load 4 rows of B' (i.e., 4 columns of B). Each of them will contain 16 elements
+            tile_N = 4
+            tile_K = 16
     else:
-        # If no acceleration is available, A must be interleaved. In this case
-        # we load 4 rows of B' (i.e., 4 columns of B). Each of them will contain 16 elements
-        tile_rows_B = 4
-        tile_cols_B = 16
+        # In non-quantized cases, A is not interleaved.
+        # Each load from B' contains 16 elements (i.e. 16 columns from B)
+        # We are loading 4 rows from B', in the dimension of reduction (i.e. 4 rows from B)
+        tile_N = 16
+        tile_K = 4
 
-    return tile_rows_B, tile_cols_B
+    return tile_N, tile_K
+
+
+def get_conv2d_weights_padding(N, K, tile_N, tile_K):
+    """Compute the necessary padding for matrix B', where B'
+    is the transformed version of matrix B in C=A*B.
+
+    Parameters
+    ----------
+    N : int
+        Number of columns in B = OC
+    K : int
+        Number of rows in B = KW * KH * IC
+    tile_N : int
+             tile size of B' on N axis
+    tile_K : int
+             tile size of B' on K axis
+
+    Returns
+    ----------
+    pad_N : padding for N axis
+    pad_K : padding for K axis
+    """
+    pad_N = 0
+    pad_K = 0
+
+    if N % tile_N != 0:
+        pad_N = tile_N - (N % tile_N)
+
+    # Tensorize will later make use of 4 tiles at once across the K axis so make sure we pad such
+    # that K is multiple of 4
+    K_multiplier = 4
+    tile_K_multiplied = tile_K * K_multiplier
+    K_misalignment = K % tile_K_multiplied
+
+    if K_misalignment != 0:
+        pad_K = tile_K_multiplied - K_misalignment
+
+    return pad_N, pad_K

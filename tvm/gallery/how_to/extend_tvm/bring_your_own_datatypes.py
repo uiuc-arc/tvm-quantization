@@ -47,10 +47,11 @@ Since we do not use any 3rdparty library, there is no setup needed.
 
 If you would like to try this with your own datatype library, first bring the library's functions into the process space with ``CDLL``:
 
-.. code-block :: python
+.. code-block:: python
 
     ctypes.CDLL('my-datatype-lib.so', ctypes.RTLD_GLOBAL)
 """
+
 
 ######################
 # A Simple TVM Program
@@ -313,7 +314,7 @@ except tvm.TVMError as e:
     print(str(e).split("\n")[-1])
 
 ######################################################################
-# When we attempt to run the model, we get a familiar error telling us that more functions need to be registerd for myfloat.
+# When we attempt to run the model, we get a familiar error telling us that more functions need to be registered for myfloat.
 #
 # Because this is a neural network, many more operations are required.
 # Here, we register all the needed functions:

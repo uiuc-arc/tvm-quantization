@@ -245,10 +245,10 @@ def group_conv2d_NCHWc_int8(
         assert out_channels % groups == 0, "output channels must divide group size"
         assert (
             channels % ic_block_factor == 0
-        ), "Number of input channels per group must divide {}".format(ic_block_factor)
+        ), f"Number of input channels per group must divide {ic_block_factor}"
         assert (
             out_channels % oc_block_factor == 0
-        ), "Number of output channels per group must divide {}".format(oc_block_factor)
+        ), f"Number of output channels per group must divide {oc_block_factor}"
 
         packed_data = te.compute(
             (batch, channels // ic_block_factor, height, width, ic_block_factor),
@@ -282,14 +282,10 @@ def group_conv2d_NCHWc_int8(
     # Shall we pad the channels to avoid raising assertions?
     assert (
         groups <= oc_chunk
-    ), "Number of groups {} should be less than " "output channel chunk size {}".format(
-        groups, oc_chunk
-    )
+    ), f"Number of groups {groups} should be less than output channel chunk size {oc_chunk}"
     assert (
         groups <= ic_chunk
-    ), "Number of groups {} should be less than " "input channel chunk size {}".format(
-        groups, ic_chunk
-    )
+    ), f"Number of groups {groups} should be less than input channel chunk size {ic_chunk}"
 
     if isinstance(stride, int):
         stride_h = stride_w = stride
@@ -394,9 +390,6 @@ def schedule_group_conv2d_NCHWc_int8(cfg, outs):
 
     traverse_inline(s, outs[0].op, _callback)
     return s
-
-
-_dp4a = dp4a("shared", "shared", "local")
 
 
 def _schedule_group_conv2d_NCHWc_int8(cfg, s, output):
@@ -509,7 +502,11 @@ def _schedule_group_conv2d_NCHWc_int8(cfg, s, output):
 
     s[conv].reorder(rco, ryo, rxo, rci, ryi, rxi, n, f, y, x, c, rc_block)
     _, rc_block = s[conv].split(rc_block, factor=4)
-    s[conv].tensorize(rc_block, _dp4a)
+    target = tvm.target.Target.current(allow_none=False)
+    do_tensorize = "+dotprod" in target.mattr or target.supports_integer_dot_product
+    if do_tensorize:
+        dtypes = (pad_data.dtype, packed_kernel.dtype)
+        s[conv].tensorize(rc_block, dp4a("shared", "shared", "local", dtypes))
 
     s[AA].compute_at(s[conv], rxo)
     s[WW].compute_at(s[conv], rxo)

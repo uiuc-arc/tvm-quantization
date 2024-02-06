@@ -23,13 +23,20 @@ The following conversion APIs are added :
 """
 import logging
 import math
-from typing import Tuple, Optional, List
+from typing import List, Optional, Tuple
+
 import numpy as np  # type: ignore
 from ethosu.vela import api as vapi  # type: ignore
+from ethosu.vela.architecture_allocator import find_block_config
+from ethosu.vela.architecture_features import Accelerator, create_default_arch
+from ethosu.vela.operation import NpuBlockType
+from ethosu.vela.register_command_stream_generator import resampling_mode_map
+from ethosu.vela.register_command_stream_util import to_kernel
+from ethosu.vela.shape4d import Shape4D
 
 import tvm
-from tvm.relay.backend.contrib.ethosu import util  # type: ignore
 from tvm.relay.backend.contrib.ethosu import tir_to_cs_translator as tirtocs
+from tvm.relay.backend.contrib.ethosu import util  # type: ignore
 
 # pylint: disable=invalid-name
 logger = logging.getLogger("Ethos-U")
@@ -54,6 +61,9 @@ def get_optimal_block_config(
     Therefore, we need to pick an optimal block configuration considering bandwidth
     to bring IFM blocks and the number of OFM block computes need to happen
     to cover the OFM as indicated by the npu op.
+    For the case when cascader is enabled, the logic of choosing the optimal configuration block
+    from TVM will be used in other cases, the Vela's logic will be used except
+    the cases when dev_force_block_config option is specified.
 
     Parameters
     ----------
@@ -67,8 +77,86 @@ def get_optimal_block_config(
     ethosu.vela.api.NpuShape3D :
         The optimal block config for the operator
     """
-    all_valid_block_configs = vapi.npu_find_block_configs(npu_op, accel_config)
-    return _get_optimal_block_config(all_valid_block_configs)
+    options = tvm.transform.PassContext.current().config.get("relay.ext.ethos-u.options", None)
+    if options and options.dev_force_block_config:
+        block_config = [int(v) for v in options.dev_force_block_config.split("x")]
+        return vapi.NpuShape3D(height=block_config[0], width=block_config[1], depth=block_config[2])
+    elif options and options.enable_cascader:
+        all_valid_block_configs = vapi.npu_find_block_configs(npu_op, accel_config)
+        return _get_optimal_block_config(all_valid_block_configs)
+    else:
+        return _find_block_config_with_vela(npu_op, accel_config)
+
+
+def _find_block_config_with_vela(
+    npu_op: vapi.NpuOperation, accelerator: vapi.NpuAccelerator
+) -> vapi.NpuShape3D:
+    """An internal function to get block config using Vela's logic.
+
+    Parameters
+    ----------
+    npu_op : ethosu.vela.api.NpuOperation
+        The NPU operation
+    accelerator : ethosu.vela.api.NpuAccelerator
+        The NPU accelerator
+
+    Returns
+    -------
+    ethosu.vela.api.NpuShape3D :
+        The optimal block config for the operator
+    """
+    if isinstance(npu_op, vapi.NpuConv2DOperation):
+        block_type = NpuBlockType.ConvolutionMxN
+    elif isinstance(npu_op, vapi.NpuConvDepthWiseOperation):
+        block_type = NpuBlockType.ConvolutionDepthWise
+    elif isinstance(npu_op, vapi.NpuPoolingOperation):
+        block_type = (
+            NpuBlockType.ReduceSum
+            if npu_op.sub_op_type == vapi.NpuPoolingOp.REDUCE_SUM
+            else NpuBlockType.Pooling
+        )
+    elif isinstance(npu_op, vapi.NpuElementWiseOperation):
+        block_type = NpuBlockType.ElementWise
+    else:
+        assert 0, "Unsupported operation"
+
+    ifm_shape = Shape4D(1, npu_op.ifm.shape.height, npu_op.ifm.shape.width, npu_op.ifm.shape.depth)
+    ifm2_shape = None
+    if npu_op.ifm2:
+        ifm2_shape = Shape4D(
+            1, npu_op.ifm2.shape.height, npu_op.ifm2.shape.width, npu_op.ifm2.shape.depth
+        )
+    ofm_shape = Shape4D(1, npu_op.ofm.shape.height, npu_op.ofm.shape.width, npu_op.ofm.shape.depth)
+
+    ifm_resampling_mode = resampling_mode_map[npu_op.ifm_upscale]
+    ifm_bits = npu_op.ifm.data_type.size_in_bits()
+    lut_banks = 0
+    if npu_op.activation:
+        lut_banks = 2 if npu_op.activation.op_type == vapi.NpuActivationOp.TABLE_LOOKUP else 0
+
+    has_scaling = True
+    for tensor in [npu_op.ifm, npu_op.ifm2, npu_op.ofm]:
+        if tensor and tensor.quantization is None:
+            has_scaling = False
+            break
+
+    arch = create_default_arch(Accelerator.from_npu_accelerator(accelerator))
+
+    cfg = find_block_config(
+        arch,
+        block_type,
+        ofm_shape,
+        ifm_shape,
+        ifm2_shape,
+        npu_op.ifm2_scalar is not None,
+        ifm_bits,
+        to_kernel(npu_op.kernel),
+        lut_banks,
+        has_scaling,
+        ifm_resampling_mode,
+    )
+    assert cfg is not None, f"There is no configuration suitable for {accelerator}"
+    return vapi.NpuShape3D(cfg.ofm_block.height, cfg.ofm_block.width, cfg.ofm_block.depth)
 
 
 def _get_optimal_block_config(all_valid_block_configs: List[vapi.NpuShape3D]) -> vapi.NpuShape3D:
@@ -140,25 +228,25 @@ def encode_weights(
     op = str(tir_extern_call.args[0].value)
     assert op in supported_ops.keys()
     npu_op, weights_zero_point = supported_ops[op](tir_extern_call)
-    block_config = get_optimal_block_config(npu_op, accel_config)
-    # The weight layout is assumed to be flat OHWI, always.
-    assert len(values.shape) == 1
     is_depthwise = op == "ethosu_depthwise_conv2d"
-    shape_ohwi = (
-        npu_op.ofm.shape.depth,
-        npu_op.kernel.height,
-        npu_op.kernel.width,
-        1 if is_depthwise else npu_op.ifm.shape.depth,
-    )
-    assert values.size == np.prod(shape_ohwi)
-    values = np.reshape(values, shape_ohwi)
+    # Recover the original shape if we are dealing with a flattened tensor
+    if len(values.shape) == 1:
+        shape_ohwi = (
+            npu_op.ofm.shape.depth,
+            npu_op.kernel.height,
+            npu_op.kernel.width,
+            1 if is_depthwise else npu_op.ifm.shape.depth,
+        )
+        assert values.size == np.prod(shape_ohwi)
+        values = np.reshape(values, shape_ohwi)
+
     return compress_weights(
         weights=values,
         weights_zp=weights_zero_point,
         # The weight layout is assumed to be OHWI, always.
         weights_layout="OHWI",
         ifm_bitdepth=npu_op.ifm.data_type.size_in_bits(),
-        block_depth=block_config.depth,
+        block_depth=npu_op.block_config.depth,
         dilation=(npu_op.kernel.dilation_x, npu_op.kernel.dilation_y),
         accel_config=accel_config,
         is_depthwise=is_depthwise,
@@ -217,6 +305,7 @@ def compress_weights(
         weights.shape[layout_transform_indices[weights_layout][3]],
     ]
     block_traversal = calculate_block_traversal_mode(is_depthwise, shape_ohwi, ifm_bitdepth)
+
     compressed_weights = vapi.npu_encode_weights(
         accelerator=accel_config,
         weights_volume=weights_ohwi,
@@ -389,8 +478,18 @@ def get_accelerator_config() -> vapi.NpuAccelerator:
         "ethos-u55-64": vapi.NpuAccelerator.Ethos_U55_64,
         "ethos-u55-32": vapi.NpuAccelerator.Ethos_U55_32,
         "ethos-u65-256": vapi.NpuAccelerator.Ethos_U65_256,
+        "ethos-u65-512": vapi.NpuAccelerator.Ethos_U65_512,
     }
     compiler_attrs = tvm.get_global_func("relay.ext.ethos-u.get_compiler_attrs")()
     accel_config_str = compiler_attrs.accelerator_config
     assert accel_config_str in npu_accel_str_map.keys(), f"{accel_config_str} is not supported"
     return npu_accel_str_map[accel_config_str]
+
+
+def get_max_copy_movements() -> int:
+    """Get maximum copy movements for CopyComputeReordering pass.
+    max_outstanding_dma from architecture features indicates how many
+    DMA operations can be in-progress.
+    """
+    arch = create_default_arch(Accelerator.from_npu_accelerator(get_accelerator_config()))
+    return arch.max_outstanding_dma

@@ -57,7 +57,6 @@ static inline int32_t GetQmin(const DataType& dtype) {
     return static_cast<int32_t>(min_value[0]);
   } else {
     LOG(FATAL) << "Type not supported " << dtype;
-    return -1;  // To hide the warning
   }
 }
 
@@ -70,7 +69,6 @@ static inline int32_t GetQmax(const DataType& dtype) {
     return static_cast<int32_t>(max_value[0]);
   } else {
     LOG(FATAL) << "Type not supported " << dtype;
-    return -1;  // To hide the warning
   }
 }
 
@@ -106,9 +104,11 @@ std::string SelectRequntizeParameter(const std::string& arg_value, const std::st
 static inline Expr Requantize(const Expr& data, const Array<IndexExpr>& input_shape,
                               const Expr& input_scale, const Expr& input_zero_point,
                               const Expr& output_scale, const Expr& output_zero_point,
-                              const DataType& out_dtype, const std::string& rounding = "None",
+                              const DataType& out_dtype, const int& axis = -1,
+                              const std::string& rounding = "None",
                               const std::string& compute_dtype = "None") {
   auto attrs = make_object<RequantizeAttrs>();
+  attrs->axis = axis;
   attrs->out_dtype = std::move(out_dtype);
   const RequantizeConfig& cfg = RequantizeConfig::Current();
   attrs->rounding =
@@ -118,6 +118,10 @@ static inline Expr Requantize(const Expr& data, const Array<IndexExpr>& input_sh
   return RequantizeLower(data, input_scale, input_zero_point, output_scale, output_zero_point,
                          attrs.operator->(), input_shape, attrs->out_dtype);
 }
+
+Expr MakeRequantize(Expr data, Expr input_scale, Expr input_zero_point, Expr output_scale,
+                    Expr output_zero_point, int axis, String rounding, String compute_dtype,
+                    DataType out_dtype);
 
 Expr DequantizeLower(const Expr& input_tensor, const Expr& input_scale,
                      const Expr& input_zero_point, const Array<tvm::relay::Type>& types,
@@ -131,6 +135,8 @@ static inline Expr Dequantize(const Expr& data, const Expr& input_scale,
 
   return DequantizeLower(data, input_scale, input_zero_point, types, attrs.operator->());
 }
+Expr MakeDequantize(Expr data, Expr input_scale, Expr input_zero_point, int axis,
+                    DataType out_dtype = DataType::Float(32));
 
 Expr QuantizeLower(const Expr& input_tensor, const Expr& output_scale,
                    const Expr& output_zero_point, const Array<tvm::relay::Type>& types,
@@ -145,6 +151,8 @@ static inline Expr Quantize(const Expr& data, const Expr& output_scale,
 
   return QuantizeLower(data, output_scale, output_zero_point, types, attrs.operator->());
 }
+Expr MakeQuantize(Expr data, Expr output_scale, Expr output_zero_point, int axis,
+                  DataType out_dtype);
 
 static inline int64_t get_const_int(const tvm::PrimExpr& x) {
   auto* value_ptr = tir::as_const_int(x);
@@ -203,6 +211,23 @@ Expr FixedPointMultiplyToNearest(Expr tensor, double multiplier,
 Expr FixedPointMultiplyPerChannel(Expr tensor, std::vector<double> multiplier,
                                   const Array<IndexExpr>& input_shape, int channel_axis,
                                   const std::string& rounding);
+
+/*
+ * Wrapper for 'FixedPointMultiplyPerChannel' with rounding parameter == "TONEAREST".
+ */
+Expr FixedPointMultiplyPerChannelToNearest(Expr tensor, std::vector<double> multiplier,
+                                           const Array<IndexExpr>& input_shape, int channel_axis);
+
+/*
+ * \brief Creates FixedPointMultiply operation where the input tensor is
+ per-axis/per-channel quantized..
+ * \param tensor The quantized input tensor.
+ * \param multipliers List of scalar multipliers.
+ * \param channel_axis The channel_axis along which the input tensor is quantized.
+ * \return The Relay op.
+ */
+Expr FixedPointMultiplyPerChannel(Expr tensor, const std::vector<double>& multipliers, int axis);
+
 /*
  * \brief Checks whether an expr type is scalar of a given data type.
  * \param expr_type The type of expr to be checked.
@@ -264,6 +289,12 @@ static inline std::vector<float> GetFloatVectorFromConstant(const Expr& expr) {
   }
   return vals;
 }
+
+Expr MakeQnnConv2D(Expr data, Expr weight, Expr input_zero_point, Expr kernel_zero_point,
+                   Expr input_scale, Expr kernel_scale, Array<IndexExpr> strides,
+                   Array<IndexExpr> padding, Array<IndexExpr> dilation, int groups,
+                   IndexExpr channels, Array<IndexExpr> kernel_size, String data_layout,
+                   String kernel_layout, String out_layout, DataType out_dtype);
 
 }  // namespace qnn
 }  // namespace relay

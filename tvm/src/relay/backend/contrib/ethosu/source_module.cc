@@ -78,7 +78,7 @@ class EthosUModuleNode : public ModuleNode {
    * \param file_name The file to be saved to.
    * \param format The format of the file.
    */
-  void SaveToFile(const std::string& file_name, const std::string& format) final {
+  void SaveToFile(const String& file_name, const String& format) final {
     std::string fmt = GetFileFormat(file_name, format);
     ICHECK_EQ(fmt, "c") << "Can only save to format="
                         << "c";
@@ -87,9 +87,9 @@ class EthosUModuleNode : public ModuleNode {
     out.close();
   }
 
-  std::string GetSource(const std::string& format) final { return c_source; }
+  String GetSource(const String& format) final { return c_source; }
 
-  std::string GetFormat() { return "c"; }
+  String GetFormat() override { return "c"; }
 
   Array<CompilationArtifact> GetArtifacts() { return compilation_artifacts_; }
 
@@ -101,7 +101,7 @@ class EthosUModuleNode : public ModuleNode {
    *
    * \return The function pointer when it is found, otherwise, PackedFunc(nullptr).
    */
-  PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self) final {
+  PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self) final {
     if (name == "get_func_names") {
       return PackedFunc([sptr_to_self, this](TVMArgs args, TVMRetValue* rv) {
         Array<String> func_names;
@@ -114,11 +114,21 @@ class EthosUModuleNode : public ModuleNode {
     return PackedFunc();
   }
 
-  const char* type_key() const override { return "c"; }
+  const char* type_key() const final { return "c"; }
 
   static Module Create(Array<CompilationArtifact> compilation_artifacts) {
     auto n = make_object<EthosUModuleNode>(compilation_artifacts);
     return Module(n);
+  }
+
+  /*! \brief Get the property of the runtime module .*/
+  int GetPropertyMask() const override { return ModulePropertyMask::kDSOExportable; }
+
+  bool ImplementsFunction(const String& name, bool query_imports) final {
+    return std::find_if(compilation_artifacts_.begin(), compilation_artifacts_.end(),
+                        [&name](const CompilationArtifact& artifact) {
+                          return artifact->function_name == name;
+                        }) != compilation_artifacts_.end();
   }
 
  private:
@@ -190,7 +200,7 @@ class EthosUModuleNode : public ModuleNode {
     std::unordered_map<int, relay::contrib::ethosu::BaseAddress> param_idx_to_base_address;
     for (const relay::contrib::ethosu::BaseAddress& base_address : artifact->base_addresses) {
       if (base_address->primfunc_param_idx.defined()) {
-        param_idx_to_base_address[base_address->primfunc_param_idx] = base_address;
+        param_idx_to_base_address[base_address->primfunc_param_idx.IntValue()] = base_address;
       }
     }
     for (unsigned int i = 0; i < param_idx_to_base_address.size(); i++) {
@@ -250,8 +260,6 @@ class EthosUModuleNode : public ModuleNode {
     PrintExternCPrefix(ss);
     PrintRuntimeFunctionSignature(ss, compilation_artifact, func_no_dashes);
     ss << "  void* cms_data = (void*)(" << func_no_dashes << "_cms_data_data);\n";
-    ss << "  int64_t device_type = kDLCPU;\n";
-    ss << "  int64_t device_id = 0;\n";
     ss << "  const size_t cms_data_size = sizeof(" << func_no_dashes << "_cms_data_data);\n";
     ss << "  size_t base_addrs_size[" << kMaxBaseAddresses_ << "] = {0};\n";
     ss << "  uint64_t base_addrs[" << kMaxBaseAddresses_ << "] = {0};\n";
@@ -262,9 +270,8 @@ class EthosUModuleNode : public ModuleNode {
          compilation_artifact->base_addresses) {
       if (base_address->is_runtime_allocation) {
         ss << "  int8_t* " << base_address->name
-           << " = (int8_t*) TVMBackendAllocWorkspace(device_type, device_id, "
-              "(uint64_t)"
-           << base_address->size << ", 0, 16);\n";
+           << " = (int8_t*) TVMBackendAllocWorkspace(kDLCPU, 0, (uint64_t)" << base_address->size
+           << ", 0, 16);\n";
       }
       ss << SetBaseAddress(base_address->region->value, base_address->name.c_str(),
                            base_address->size->value);
@@ -278,7 +285,7 @@ class EthosUModuleNode : public ModuleNode {
     for (const relay::contrib::ethosu::BaseAddress& base_address :
          compilation_artifact->base_addresses) {
       if (base_address->is_runtime_allocation) {
-        ss << "  TVMBackendFreeWorkspace(device_type, device_id, " << base_address->name << ");\n";
+        ss << "  TVMBackendFreeWorkspace(kDLCPU, 0, " << base_address->name << ");\n";
       }
     }
     ss << "  return result;\n";

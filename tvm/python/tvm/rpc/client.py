@@ -14,27 +14,27 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+# pylint: disable=used-before-assignment
 """RPC client tools"""
 import os
-import stat
 import socket
+import stat
 import struct
 import time
 
 import tvm._ffi
-from tvm.contrib import utils
 from tvm._ffi.base import TVMError
+from tvm.contrib import utils
 from tvm.runtime import ndarray as nd
+from tvm._ffi.runtime_ctypes import Device
 
-from . import base
-from . import server
-from . import _ffi_api
+from . import _ffi_api, base, server
 
 
 class RPCSession(object):
     """RPC Client session module
 
-    Do not directly create the obhect, call connect
+    Do not directly create the object, call connect
     """
 
     # pylint: disable=invalid-name
@@ -145,6 +145,23 @@ class RPCSession(object):
             self._remote_funcs["remove"] = self.get_function("tvm.rpc.server.remove")
         self._remote_funcs["remove"](path)
 
+    def listdir(self, path):
+        """ls files from remote temp folder.
+
+        Parameters
+        ----------
+        path: str
+            The relative location to remote temp folder.
+
+        Returns
+        -------
+        dirs: str
+            The files in the given directory with split token ','.
+        """
+        if "listdir" not in self._remote_funcs:
+            self._remote_funcs["listdir"] = self.get_function("tvm.rpc.server.listdir")
+        return self._remote_funcs["listdir"](path)
+
     def load_module(self, path):
         """Load a remote module, the file need to be uploaded first.
 
@@ -199,39 +216,39 @@ class RPCSession(object):
 
     def cpu(self, dev_id=0):
         """Construct CPU device."""
-        return self.device(1, dev_id)
+        return self.device(Device.kDLCPU, dev_id)
 
     def cuda(self, dev_id=0):
         """Construct CUDA GPU device."""
-        return self.device(2, dev_id)
+        return self.device(Device.kDLCUDA, dev_id)
 
     def cl(self, dev_id=0):
         """Construct OpenCL device."""
-        return self.device(4, dev_id)
+        return self.device(Device.kDLOpenCL, dev_id)
 
     def vulkan(self, dev_id=0):
         """Construct Vulkan device."""
-        return self.device(7, dev_id)
+        return self.device(Device.kDLVulkan, dev_id)
 
     def metal(self, dev_id=0):
         """Construct Metal device."""
-        return self.device(8, dev_id)
+        return self.device(Device.kDLMetal, dev_id)
 
     def rocm(self, dev_id=0):
         """Construct ROCm device."""
-        return self.device(10, dev_id)
+        return self.device(Device.kDLROCM, dev_id)
 
     def ext_dev(self, dev_id=0):
         """Construct extension device."""
-        return self.device(12, dev_id)
+        return self.device(Device.kDLExtDev, dev_id)
 
     def hexagon(self, dev_id=0):
         """Construct Hexagon device."""
-        return self.device(14, dev_id)
+        return self.device(Device.kDLHexagon, dev_id)
 
     def webgpu(self, dev_id=0):
         """Construct WebGPU device."""
-        return self.device(15, dev_id)
+        return self.device(Device.kDLWebGPU, dev_id)
 
 
 class LocalSession(RPCSession):
@@ -302,7 +319,7 @@ class TrackerSession(object):
         self._sock.sendall(struct.pack("<i", base.RPC_TRACKER_MAGIC))
         magic = struct.unpack("<i", base.recvall(self._sock, 4))[0]
         if magic != base.RPC_TRACKER_MAGIC:
-            raise RuntimeError("%s is not RPC Tracker" % str(self._addr))
+            raise RuntimeError(f"{str(self._addr)} is not RPC Tracker")
 
     def close(self):
         """Close the tracker connection."""
@@ -315,7 +332,7 @@ class TrackerSession(object):
         base.sendjson(self._sock, [base.TrackerCode.SUMMARY])
         value = base.recvjson(self._sock)
         if value[0] != base.TrackerCode.SUCCESS:
-            raise RuntimeError("Invalid return value %s" % str(value))
+            raise RuntimeError(f"Invalid return value {str(value)}")
         return value[1]
 
     def text_summary(self):
@@ -326,18 +343,19 @@ class TrackerSession(object):
 
         res = ""
         res += "Server List\n"
-        res += "----------------------------\n"
-        res += "server-address\tkey\n"
-        res += "----------------------------\n"
-        for item in data["server_info"]:
+        res += "------------------------------\n"
+        res += "server-address           key\n"
+        res += "------------------------------\n"
+        sorted_server = sorted(data["server_info"], key=lambda x: x["key"])
+        for item in sorted_server:
             addr = item["addr"]
-            res += str(addr[0]) + ":" + str(addr[1]) + "\t"
+            res += "%21s    " % ":".join(map(str, addr))
             res += item["key"] + "\n"
             key = item["key"].split(":")[1]  # 'server:rasp3b` -> 'rasp3b'
             if key not in total_ct:
                 total_ct[key] = 0
             total_ct[key] += 1
-        res += "----------------------------\n"
+        res += "------------------------------\n"
         res += "\n"
 
         # compute max length of device key
@@ -350,19 +368,14 @@ class TrackerSession(object):
             max_key_len = 0
 
         res += "Queue Status\n"
-        title = ("%%-%ds" % max_key_len + "   total  free  pending\n") % "key"
+        title = f"{'key':<{max_key_len}s}   total  free  pending\n"
         separate_line = "-" * len(title) + "\n"
         res += separate_line + title + separate_line
         for k in keys:
             total = total_ct.get(k, 0)
             free, pending = queue_info[k]["free"], queue_info[k]["pending"]
             if total or pending:
-                res += ("%%-%ds" % max_key_len + "   %-5d  %-4d  %-7d\n") % (
-                    k,
-                    total,
-                    free,
-                    pending,
-                )
+                res += f"{k:<{max_key_len}}   {total:<5d}  {free:<4d}  {pending:<7d}\n"
         res += separate_line
         return res
 
@@ -400,7 +413,7 @@ class TrackerSession(object):
                 base.sendjson(self._sock, [base.TrackerCode.REQUEST, key, "", priority])
                 value = base.recvjson(self._sock)
                 if value[0] != base.TrackerCode.SUCCESS:
-                    raise RuntimeError("Invalid return value %s" % str(value))
+                    raise RuntimeError(f"Invalid return value {str(value)}")
                 url, port, matchkey = value[1]
                 return connect(
                     url,
@@ -415,7 +428,7 @@ class TrackerSession(object):
             except TVMError as err:
                 last_err = err
         raise RuntimeError(
-            "Cannot request %s after %d retry, last_error:%s" % (key, max_retry, str(last_err))
+            f"Cannot request {key} after {max_retry} retry, last_error:{str(last_err)}"
         )
 
     def request_and_run(self, key, func, priority=1, session_timeout=0, max_retry=2):
@@ -453,14 +466,16 @@ class TrackerSession(object):
                 duration = time.time() - tstart
                 # roughly estimate if the error is due to timeout termination
                 if session_timeout and duration >= session_timeout * 0.95:
-                    raise RuntimeError("Session timeout when running %s" % func.__name__)
+                    raise RuntimeError(f"Session timeout when running {func.__name__}")
                 last_err = err
         raise RuntimeError(
-            "Failed to run on %s after %d retry, last_error:%s" % (key, max_retry, str(last_err))
+            f"Failed to run on {key} after {max_retry} retry, last_error:{str(last_err)}"
         )
 
 
-def connect(url, port, key="", session_timeout=0, session_constructor_args=None):
+def connect(
+    url, port, key="", session_timeout=0, session_constructor_args=None, enable_logging=False
+):
     """Connect to RPC Server
 
     Parameters
@@ -484,6 +499,9 @@ def connect(url, port, key="", session_timeout=0, session_constructor_args=None)
         The first element of the list is always a string specifying the name of
         the session constructor, the following args are the positional args to that function.
 
+    enable_logging: boolean
+        flag to enable/disable logging. Logging is disabled by default.
+
     Returns
     -------
     sess : RPCSession
@@ -504,18 +522,18 @@ def connect(url, port, key="", session_timeout=0, session_constructor_args=None)
     .. code-block:: python
 
         client_via_proxy = rpc.connect(
-            proxy_server_url, proxy_server_port, proxy_server_key,
+            proxy_server_url, proxy_server_port, proxy_server_key, enable_logging
             session_constructor_args=[
-                "rpc.Connect", internal_url, internal_port, internal_key])
+                "rpc.Connect", internal_url, internal_port, internal_key, internal_logging])
 
     """
     try:
         if session_timeout:
-            key += " -timeout=%s" % str(session_timeout)
+            key += f" -timeout={session_timeout}"
         session_constructor_args = session_constructor_args if session_constructor_args else []
         if not isinstance(session_constructor_args, (list, tuple)):
             raise TypeError("Expect the session constructor to be a list or tuple")
-        sess = _ffi_api.Connect(url, port, key, *session_constructor_args)
+        sess = _ffi_api.Connect(url, port, key, enable_logging, *session_constructor_args)
     except NameError:
         raise RuntimeError("Please compile with USE_RPC=1")
     return RPCSession(sess)

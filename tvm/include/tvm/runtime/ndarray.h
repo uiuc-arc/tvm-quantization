@@ -42,14 +42,6 @@ namespace tvm {
 // alias DLDevice
 using Device = DLDevice;
 
-// A 'null' device type, does not correspond to any DLDeviceType enum.
-// TODO(mbs): This is to help us as we transition away from representing the 'homogenous' case
-// as a singleton target map indexed by the invalid DLDeviceType '0'.
-constexpr DLDeviceType kNullDeviceType = static_cast<DLDeviceType>(0);
-
-// An 'invalid' device type, does not correspond to any DLDeviceType enum.
-constexpr DLDeviceType kInvalidDeviceType = static_cast<DLDeviceType>(-1);
-
 namespace runtime {
 
 /*!
@@ -118,9 +110,10 @@ class NDArray : public ObjectRef {
   /*!
    * \brief Copy the data to another device.
    * \param dev The target device.
+   * \param mem_scope The memory scope of the target array.
    * \return The array under another device.
    */
-  inline NDArray CopyTo(const Device& dev) const;
+  inline NDArray CopyTo(const Device& dev, Optional<String> mem_scope = NullOpt) const;
   /*!
    * \brief Load NDArray from stream
    * \param stream The input data stream
@@ -156,6 +149,25 @@ class NDArray : public ObjectRef {
   TVM_DLL static NDArray Empty(ShapeTuple shape, DLDataType dtype, Device dev,
                                Optional<String> mem_scope = NullOpt);
   /*!
+   * \brief Create a NDArray backed by an external DLTensor without memory copying.
+   *
+   * If DLTensor is not contiguous or has bad aligned data, It fails.
+   * This allows us to create a NDArray using the memory
+   * allocated by an external source. Responsibility for memory
+   * retaining lies with the external source.
+   * \param dl_tensor The DLTensor for NDArray base.
+   * \return The created NDArray view.
+   */
+  TVM_DLL static NDArray FromExternalDLTensor(const DLTensor& dl_tensor);
+  /*!
+   * \brief Create new NDArray, data is copied from DLTensor.
+   *
+   * \param dl_tensor The DLTensor to copy from.
+   * \param dev device location of the created NDArray.
+   * \return The created NDArray view.
+   */
+  TVM_DLL static NDArray NewFromDLTensor(DLTensor* dl_tensor, const Device& dev);
+  /*!
    * \brief Create a NDArray backed by a dlpack tensor.
    *
    * This allows us to create a NDArray using the memory
@@ -178,8 +190,22 @@ class NDArray : public ObjectRef {
 
   TVM_DLL ShapeTuple Shape() const;
   TVM_DLL runtime::DataType DataType() const;
+  /*!
+   * \brief Check conditions for construction NDArray over DLTensor without copying.
+   * There are three conditions to check:
+   * 1. Destination device is the same as DLTensor device
+   * 2. Destination device id is the same as DLTensor device id
+   * 3. Memory in DLTensor is aligned as expected for NDArray
+   * \param tensor the DLTensor.
+   * \param dev destination device.
+   * \return true if all conditions are satisfied.
+   */
+  TVM_DLL static bool AbilityOfZeroCopyForDLTensor(DLTensor* tensor, const Device& dev);
   // internal namespace
   struct Internal;
+
+ private:
+  TVM_DLL static bool IsAligned(const DLTensor& tensor);
 
  protected:
   friend class TVMPODValue_;
@@ -249,7 +275,7 @@ class NDArray::ContainerBase {
  protected:
   /*!
    * \brief The shape container,
-   *  can be used used for shape data.
+   *  can be used for shape data.
    */
   ShapeTuple shape_;
 };
@@ -327,11 +353,20 @@ inline size_t GetDataSize(const DLTensor& arr) {
  * \param arr The input DLTensor.
  * \return The check result.
  */
-inline bool IsContiguous(const DLTensor& arr) {
+static inline bool IsContiguous(const DLTensor& arr) {
   if (arr.strides == nullptr) return true;
   int64_t expected_stride = 1;
   for (int32_t i = arr.ndim; i != 0; --i) {
     int32_t k = i - 1;
+    if (arr.shape[k] == 1) {
+      // Skip stride check if shape[k] is 1, where the dimension is contiguous
+      // regardless of the value of stride.
+      //
+      // For example, PyTorch will normalize stride to 1 if shape is 1 when exporting
+      // to DLPack.
+      // More context: https://github.com/pytorch/pytorch/pull/83158
+      continue;
+    }
     if (arr.strides[k] != expected_stride) return false;
     expected_stride *= arr.shape[k];
   }
@@ -364,10 +399,11 @@ inline void NDArray::CopyTo(const NDArray& other) const {
   CopyFromTo(&(get_mutable()->dl_tensor), &(other.get_mutable()->dl_tensor));
 }
 
-inline NDArray NDArray::CopyTo(const Device& dev) const {
+inline NDArray NDArray::CopyTo(const Device& dev, Optional<String> mem_scope) const {
   ICHECK(data_ != nullptr);
   const DLTensor* dptr = operator->();
-  NDArray ret = Empty(ShapeTuple(dptr->shape, dptr->shape + dptr->ndim), dptr->dtype, dev);
+  NDArray ret =
+      Empty(ShapeTuple(dptr->shape, dptr->shape + dptr->ndim), dptr->dtype, dev, mem_scope);
   this->CopyTo(ret);
   return ret;
 }

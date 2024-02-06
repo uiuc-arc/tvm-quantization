@@ -88,13 +88,13 @@ class MemoryAccessVerifier final : protected StmtExprVisitor {
     }
   }
 
-  void VisitExpr_(const LoadNode* op) final {
-    HandleLoadStoreToVariable(op->buffer_var);
+  void VisitExpr_(const BufferLoadNode* op) final {
+    HandleLoadStoreToVariable(op->buffer->data);
     return StmtExprVisitor::VisitExpr_(op);
   }
 
-  void VisitStmt_(const StoreNode* op) final {
-    HandleLoadStoreToVariable(op->buffer_var);
+  void VisitStmt_(const BufferStoreNode* op) final {
+    HandleLoadStoreToVariable(op->buffer->data);
     return StmtExprVisitor::VisitStmt_(op);
   }
   //@}
@@ -174,11 +174,11 @@ std::vector<String> VerifyMemory_(const PrimFunc& func) {
 
   VLOG(1) << "verifying memory for target '" << target.value()->str()
           << "' for primitive:" << std::endl
-          << PrettyPrint(func);
+          << func;
 
   if (func->GetAttr<Integer>(tvm::attr::kCallingConv, Integer(CallingConv::kDefault)) ==
       CallingConv::kDefault) {
-    MemoryAccessVerifier v(func, target.value()->kind->device_type);
+    MemoryAccessVerifier v(func, target.value()->GetTargetDeviceType());
     v.Run();
     return v.Errors();
   } else {
@@ -195,9 +195,8 @@ namespace transform {
 Pass VerifyMemory() {
   auto pass_func = [=](IRModule mod, PassContext ctx) {
     for (auto kv : mod->functions) {
-      if (auto* n = kv.second.as<PrimFuncNode>()) {
-        auto func = GetRef<PrimFunc>(n);
-        auto errs = VerifyMemory_(func);
+      if (auto func = kv.second.as<PrimFunc>()) {
+        auto errs = VerifyMemory_(func.value());
         if (errs.size() > 0) {
           std::stringstream s;
           for (auto& err : errs) {

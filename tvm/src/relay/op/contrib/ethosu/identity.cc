@@ -24,40 +24,13 @@
 #include <tvm/relay/op.h>
 
 #include "common.h"
+#include "op_attrs.h"
 
 namespace tvm {
 namespace relay {
 namespace op {
 namespace contrib {
 namespace ethosu {
-
-/*! \brief Attributes used by the NPU identity operator */
-struct EthosuIdentityAttrs : public tvm::AttrsNode<EthosuIdentityAttrs> {
-  double ifm_scale;
-  int ifm_zero_point;
-  double ofm_scale;
-  int ofm_zero_point;
-  String activation;
-
-  TVM_DECLARE_ATTRS(EthosuIdentityAttrs, "relay.attrs.EthosuIdentityAttrs") {
-    TVM_ATTR_FIELD(ifm_scale).describe("The quantization scale for the Input Feature Map tensor.");
-    TVM_ATTR_FIELD(ifm_zero_point)
-        .describe("The quantization zero point for the Input Feature Map tensor.");
-    TVM_ATTR_FIELD(ofm_scale).describe("The quantization scale for the Output Feature Map tensor.");
-    TVM_ATTR_FIELD(ofm_zero_point)
-        .describe("The quantization zero point for the Output Feature Map tensor.");
-    TVM_ATTR_FIELD(activation)
-        .describe(
-            "The activation function to use. "
-            "'NONE' - no activation function. "
-            "'TANH' - tanh activation function. "
-            "'SIGMOID' - sigmoid activation function. "
-            "'LUT' - use a look-up table to perform the activation function.")
-        .set_default("NONE");
-  }
-};
-
-TVM_REGISTER_NODE_TYPE(EthosuIdentityAttrs);
 
 bool EthosuIdentityRel(const Array<Type>& types, int num_inputs, const Attrs& attrs,
                        const TypeReporter& reporter) {
@@ -69,15 +42,11 @@ bool EthosuIdentityRel(const Array<Type>& types, int num_inputs, const Attrs& at
   if (ifm == nullptr) return false;
 
   const auto* param = attrs.as<EthosuIdentityAttrs>();
-
   ICHECK(param != nullptr) << "EthosuIdentityAttrs cannot be nullptr.";
 
-  if (ifm->dtype != DataType::UInt(8) && ifm->dtype != DataType::Int(8)) {
-    reporter->GetDiagCtx().EmitFatal(
-        Diagnostic::Error(reporter->GetSpan())
-        << "Invalid operator: Expected type(uint8) or type(int8) for ifm but was " << ifm->dtype);
-    return false;
-  }
+  const String operator_name = "ethosu_identity";
+
+  CheckDataType(reporter, ifm->dtype, {DataType::UInt(8), DataType::Int(8)}, operator_name, "ifm");
 
   if (ifm->shape.size() > 4) {
     reporter->GetDiagCtx().EmitFatal(
@@ -94,13 +63,14 @@ bool EthosuIdentityRel(const Array<Type>& types, int num_inputs, const Attrs& at
 }
 
 Expr MakeEthosuIdentity(Expr ifm, Expr lut, double ifm_scale, int ifm_zero_point, double ofm_scale,
-                        int ofm_zero_point, String activation) {
+                        int ofm_zero_point, String activation, String rounding_mode) {
   auto attrs = make_object<EthosuIdentityAttrs>();
   attrs->ifm_scale = ifm_scale;
   attrs->ifm_zero_point = ifm_zero_point;
   attrs->ofm_scale = ofm_scale;
   attrs->ofm_zero_point = ofm_zero_point;
   attrs->activation = std::move(activation);
+  attrs->rounding_mode = std::move(rounding_mode);
   static const Op& op = Op::Get("contrib.ethosu.identity");
   return Call(op, {ifm, lut}, Attrs(attrs), {});
 }

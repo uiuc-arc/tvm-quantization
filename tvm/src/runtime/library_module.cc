@@ -42,7 +42,12 @@ class LibraryModuleNode final : public ModuleNode {
 
   const char* type_key() const final { return "library"; }
 
-  PackedFunc GetFunction(const std::string& name, const ObjectPtr<Object>& sptr_to_self) final {
+  /*! \brief Get the property of the runtime module .*/
+  int GetPropertyMask() const final {
+    return ModulePropertyMask::kBinarySerializable | ModulePropertyMask::kRunnable;
+  };
+
+  PackedFunc GetFunction(const String& name, const ObjectPtr<Object>& sptr_to_self) final {
     TVMBackendPackedCFunc faddr;
     if (name == runtime::symbol::tvm_module_main) {
       const char* entry_name =
@@ -60,15 +65,6 @@ class LibraryModuleNode final : public ModuleNode {
  private:
   ObjectPtr<Library> lib_;
   PackedFuncWrapper packed_func_wrapper_;
-};
-
-/*!
- * \brief Helper classes to get into internal of a module.
- */
-class ModuleInternal {
- public:
-  // Get mutable reference of imports.
-  static std::vector<Module>* GetImportsAddr(ModuleNode* node) { return &(node->imports_); }
 };
 
 PackedFunc WrapPackedFunc(TVMBackendPackedCFunc faddr, const ObjectPtr<Object>& sptr_to_self) {
@@ -107,7 +103,8 @@ Module LoadModuleFromBinary(const std::string& type_key, dmlc::Stream* stream) {
   const PackedFunc* f = Registry::Get(fkey);
   if (f == nullptr) {
     std::string loaders = "";
-    for (auto name : Registry::ListNames()) {
+    for (auto reg_name : Registry::ListNames()) {
+      std::string name = reg_name;
       if (name.find(loadkey, 0) == 0) {
         if (loaders.size() > 0) {
           loaders += ", ";
@@ -115,8 +112,8 @@ Module LoadModuleFromBinary(const std::string& type_key, dmlc::Stream* stream) {
         loaders += name.substr(loadkey.size());
       }
     }
-    LOG(FATAL) << "Binary was created using " << type_key
-               << " but a loader of that name is not registered. Available loaders are " << loaders
+    LOG(FATAL) << "Binary was created using {" << type_key
+               << "} but a loader of that name is not registered. Available loaders are " << loaders
                << ". Perhaps you need to recompile with this runtime enabled.";
   }
 
@@ -221,10 +218,5 @@ Module CreateModuleFromLibrary(ObjectPtr<Library> lib, PackedFuncWrapper packed_
 
   return root_mod;
 }
-
-TVM_REGISTER_GLOBAL("runtime.module.loadfile_so").set_body([](TVMArgs args, TVMRetValue* rv) {
-  ObjectPtr<Library> n = CreateDSOLibraryObject(args[0]);
-  *rv = CreateModuleFromLibrary(n);
-});
 }  // namespace runtime
 }  // namespace tvm

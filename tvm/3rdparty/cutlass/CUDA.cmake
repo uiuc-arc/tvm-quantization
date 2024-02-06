@@ -1,23 +1,29 @@
-# Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 #
-# Redistribution and use in source and binary forms, with or without modification, are permitted
-# provided that the following conditions are met:
-#     * Redistributions of source code must retain the above copyright notice, this list of
-#       conditions and the following disclaimer.
-#     * Redistributions in binary form must reproduce the above copyright notice, this list of
-#       conditions and the following disclaimer in the documentation and/or other materials
-#       provided with the distribution.
-#     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
-#       to endorse or promote products derived from this software without specific prior written
-#       permission.
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
 #
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
-# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
-# FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
-# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
-# OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
-# STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 if(CUDA_COMPILER MATCHES "[Cc]lang")
@@ -74,7 +80,7 @@ find_library(
   lib64
   lib
   NO_DEFAULT_PATH
-  # We aren't going to search any system paths. We want to find the runtime
+  # We aren't going to search any system paths. We want to find the runtime 
   # in the CUDA toolkit we're building against.
   )
 
@@ -89,10 +95,10 @@ if(NOT TARGET cudart AND CUDART_LIBRARY)
     # from the PATH search.
   else()
     add_library(cudart SHARED IMPORTED GLOBAL)
-  endif()
+  endif()  
 
   add_library(nvidia::cudart ALIAS cudart)
-
+  
   set_property(
     TARGET cudart
     PROPERTY IMPORTED_LOCATION
@@ -120,7 +126,7 @@ find_library(
   lib64/stubs
   lib/stubs
   NO_DEFAULT_PATH
-  # We aren't going to search any system paths. We want to find the runtime
+  # We aren't going to search any system paths. We want to find the runtime 
   # in the CUDA toolkit we're building against.
   )
 
@@ -135,10 +141,10 @@ if(NOT TARGET cuda_driver AND CUDA_DRIVER_LIBRARY)
     # from the PATH search.
   else()
     add_library(cuda_driver SHARED IMPORTED GLOBAL)
-  endif()
+  endif()  
 
   add_library(nvidia::cuda_driver ALIAS cuda_driver)
-
+  
   set_property(
     TARGET cuda_driver
     PROPERTY IMPORTED_LOCATION
@@ -164,7 +170,7 @@ find_library(
   lib64
   lib
   NO_DEFAULT_PATH
-  # We aren't going to search any system paths. We want to find the runtime
+  # We aren't going to search any system paths. We want to find the runtime 
   # in the CUDA toolkit we're building against.
   )
 
@@ -179,10 +185,10 @@ if(NOT TARGET nvrtc AND NVRTC_LIBRARY)
     # from the PATH search.
   else()
     add_library(nvrtc SHARED IMPORTED GLOBAL)
-  endif()
-
+  endif()  
+  
   add_library(nvidia::nvrtc ALIAS nvrtc)
-
+  
   set_property(
     TARGET nvrtc
     PROPERTY IMPORTED_LOCATION
@@ -213,8 +219,7 @@ function(cutlass_correct_source_file_language_property)
   endif()
 endfunction()
 
-# If building with all kernels, set UNITY build on by default.
-if (CUTLASS_LIBRARY_KERNELS MATCHES "all")
+if (MSVC OR CUTLASS_LIBRARY_KERNELS MATCHES "all")
   set(CUTLASS_UNITY_BUILD_ENABLED_INIT ON)
 else()
   set(CUTLASS_UNITY_BUILD_ENABLED_INIT OFF)
@@ -242,7 +247,7 @@ function(cutlass_unify_source_files TARGET_ARGS_VAR)
 
     set(CUDA_FILE_ARGS)
     set(TARGET_SOURCE_ARGS)
-
+    
     foreach(ARG ${__UNPARSED_ARGUMENTS})
       if(${ARG} MATCHES ".*\.cu$")
         list(APPEND CUDA_FILE_ARGS ${ARG})
@@ -250,7 +255,7 @@ function(cutlass_unify_source_files TARGET_ARGS_VAR)
         list(APPEND TARGET_SOURCE_ARGS ${ARG})
       endif()
     endforeach()
-
+    
     list(LENGTH CUDA_FILE_ARGS NUM_CUDA_FILE_ARGS)
     while(NUM_CUDA_FILE_ARGS GREATER 0)
       list(SUBLIST CUDA_FILE_ARGS 0 ${__BATCH_SIZE} CUDA_FILE_BATCH)
@@ -282,7 +287,7 @@ function(cutlass_unify_source_files TARGET_ARGS_VAR)
 endfunction()
 function(cutlass_add_library NAME)
 
-  set(options)
+  set(options SKIP_GENCODE_FLAGS)
   set(oneValueArgs EXPORT_NAME)
   set(multiValueArgs)
   cmake_parse_arguments(_ "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
@@ -298,7 +303,9 @@ function(cutlass_add_library NAME)
   endif()
 
   cutlass_apply_standard_compile_options(${NAME})
+  if (NOT __SKIP_GENCODE_FLAGS)
   cutlass_apply_cuda_gencode_flags(${NAME})
+  endif()
 
   target_compile_features(
    ${NAME}

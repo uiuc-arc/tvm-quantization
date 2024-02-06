@@ -42,10 +42,15 @@ class UnsafeExprDetector : public ExprFunctor<bool(const PrimExpr& n)> {
     if (op->op.same_as(builtin::if_then_else())) {
       return VisitExpr(op->args[0]);
     } else if (op->op.same_as(builtin::address_of())) {
-      const LoadNode* l = op->args[0].as<LoadNode>();
-      return this->VisitExpr(l->index);
-    } else if (auto* ptr_op = op->op.as<OpNode>()) {
-      auto effect_kind = op_call_effect_[GetRef<Op>(ptr_op)];
+      const BufferLoadNode* load = op->args[0].as<BufferLoadNode>();
+      for (const auto& index : load->indices) {
+        if (VisitExpr(index)) {
+          return true;
+        }
+      }
+      return false;
+    } else if (auto opt = op->op.as<Op>()) {
+      auto effect_kind = op_call_effect_[opt.value()];
       if (effect_kind == CallEffectKind::kPure || effect_kind == CallEffectKind::kExprAnnotation) {
         for (PrimExpr e : op->args) {
           if (VisitExpr(e)) return true;
@@ -58,7 +63,7 @@ class UnsafeExprDetector : public ExprFunctor<bool(const PrimExpr& n)> {
       return true;
     }
   }
-  bool VisitExpr_(const LoadNode* op) {
+  bool VisitExpr_(const BufferLoadNode* op) {
     // Load is considered unsafe.
     return true;
   }

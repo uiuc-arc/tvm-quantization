@@ -6,9 +6,9 @@
 # to you under the Apache License, Version 2.0 (the
 # "License"); you may not use this file except in compliance
 # with the License.  You may obtain a copy of the License at
-# 
+#
 #   http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing,
 # software distributed under the License is distributed on an
 # "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
@@ -24,12 +24,11 @@ export PYXIR_HOME=/opt/pyxir
 mkdir "$PYXIR_HOME"
 
 # install libraries for building Vitis-AI on ubuntu
-apt-get update && apt-get install -y \
+apt-get update && apt-install-and-clear -y \
     graphviz \
     gnupg2 \
     gpg-agent \
-    gcc-aarch64-linux-gnu \
-    && rm -rf /var/lib/apt/lists/*
+    gcc-aarch64-linux-gnu
 
 
 . $VAI_ROOT/conda/etc/profile.d/conda.sh

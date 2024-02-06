@@ -90,7 +90,7 @@ def conv2d_NCHWc_int8(cfg, data, kernel, stride, padding, dilation, layout, out_
         batch, channels, height, width = get_const_tuple(data.shape)
         assert (
             channels % ic_block_factor == 0
-        ), "Number of input channels should be multiple of {}".format(ic_block_factor)
+        ), f"Number of input channels should be multiple of {ic_block_factor}"
         packed_data = te.compute(
             (batch, channels // ic_block_factor, height, width, ic_block_factor),
             lambda n, c, h, w, vc: data[n, c * ic_block_factor + vc, h, w],
@@ -100,7 +100,7 @@ def conv2d_NCHWc_int8(cfg, data, kernel, stride, padding, dilation, layout, out_
         out_channels, in_channels, kernel_h, kernel_w = get_const_tuple(kernel.shape)
         assert (
             out_channels % oc_block_factor == 0
-        ), "Number of output channels should be multiple of {}".format(oc_block_factor)
+        ), f"Number of output channels should be multiple of {oc_block_factor}"
         packed_kernel = te.compute(
             (
                 out_channels // oc_block_factor,
@@ -153,13 +153,15 @@ def conv2d_NCHWc_int8(cfg, data, kernel, stride, padding, dilation, layout, out_
     kh = te.reduce_axis((0, kernel_h), name="kh")
     kw = te.reduce_axis((0, kernel_w), name="kw")
 
+    packed_kernel_dtype = packed_kernel.dtype
+    packed_dtype = "int32" if packed_kernel_dtype == "int8" else "uint32"
     conv = te.compute(
         oshape,
         lambda n, oc_chunk, oh, ow, oc_block: te.sum(
             pad_data[
                 n, icc, oh * stride_h + kh * dilation_h, ow * stride_w + kw * dilation_w, icb
-            ].astype("int32")
-            * packed_kernel[oc_chunk, icc, kh, kw, oc_block, icb].astype("int32"),
+            ].astype(packed_dtype)
+            * packed_kernel[oc_chunk, icc, kh, kw, oc_block, icb].astype(packed_dtype),
             axis=[icc, kh, kw, icb],
         ),
     )
@@ -186,9 +188,6 @@ def conv2d_NCHWc_int8(cfg, data, kernel, stride, padding, dilation, layout, out_
     cfg.add_flop(num_flop)
 
     return output
-
-
-_dp4a = dp4a("shared", "shared", "local")
 
 
 @autotvm.register_topi_schedule("conv2d_NCHWc_int8.cuda")
@@ -311,7 +310,12 @@ def _schedule_conv2d_NCHWc_int8(cfg, s, output):
     cfg["reorder_inner"].apply(s, conv, [rci, ryi, rxi])
 
     _, rc_block = s[conv].split(rc_block, factor=4)
-    s[conv].tensorize(rc_block, _dp4a)
+    target = tvm.target.Target.current(allow_none=False)
+    do_tensorize = "+dotprod" in target.mattr or target.supports_integer_dot_product
+
+    if do_tensorize:
+        dtypes = (pad_data.dtype, packed_kernel.dtype)
+        s[conv].tensorize(rc_block, dp4a("shared", "shared", "local", dtypes))
 
     cache_loc = [rco, ryo, rxo][cfg["reorder_inner"].perm[-1]]
     s[AA].compute_at(s[conv], cache_loc)

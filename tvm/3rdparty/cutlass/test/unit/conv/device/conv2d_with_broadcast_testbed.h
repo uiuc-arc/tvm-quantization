@@ -1,24 +1,30 @@
 /***************************************************************************************************
- * Copyright (c) 2017-2021, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2017 - 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  *
- * Redistribution and use in source and binary forms, with or without modification, are permitted
- * provided that the following conditions are met:
- *     * Redistributions of source code must retain the above copyright notice, this list of
- *       conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above copyright notice, this list of
- *       conditions and the following disclaimer in the documentation and/or other materials
- *       provided with the distribution.
- *     * Neither the name of the NVIDIA CORPORATION nor the names of its contributors may be used
- *       to endorse or promote products derived from this software without specific prior written
- *       permission.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
- * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
- * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
@@ -30,6 +36,8 @@
     kernel.
 */
 #pragma once
+
+#include <fstream>
 
 #include "../../common/cutlass_unit_test.h"
 #include "cutlass/cutlass.h"
@@ -112,10 +120,12 @@ public:
   using EpilogueOutputOp = typename Conv2d::EpilogueOutputOp;
   using ElementZ = typename EpilogueOutputOp::ElementZ;
   using ElementT = typename EpilogueOutputOp::ElementT;
+  using ElementVector = typename EpilogueOutputOp::ElementVector;
 
   static cutlass::conv::Operator const kConvolutionalOperator = Conv2d::kConvolutionalOperator;
   static const bool kAddBroadcastFirst = AddBroadcastFirst;
   static const bool kStoreT = EpilogueOutputOp::kStoreT;
+
 public:
 
   /// Initialization
@@ -133,7 +143,7 @@ public:
   cutlass::HostTensor<ElementT, LayoutC> tensor_T_computed;
   cutlass::HostTensor<ElementT, LayoutC> tensor_T_reference;
   cutlass::HostTensor<ElementAccumulator, LayoutC> tensor_Y_reference;
-  cutlass::HostTensor<ElementC, LayoutC> tensor_Broadcast;                 // Input Broadcast
+  cutlass::HostTensor<ElementVector, LayoutC> tensor_Broadcast;            // Input Broadcast
 
 public:
 
@@ -244,7 +254,7 @@ public:
     // Determine SMEM requirements and waive if not satisfied
     //
 
-    int smem_size = int(sizeof(typename Conv2d::ImplicitGemmKernel::SharedStorage));
+    int smem_size = int(sizeof(typename Conv2d::UnderlyingKernel::SharedStorage));
 
     cudaDeviceProp properties;
     int device_idx;
@@ -260,7 +270,7 @@ public:
       throw std::runtime_error("cudaGetDeviceProperties() failed");
     }
 
-    if (properties.sharedMemPerMultiprocessor < smem_size) {
+    if (properties.sharedMemPerBlockOptin < smem_size) {
       return false;
     }
 
@@ -340,8 +350,10 @@ public:
     //
     // Reference check
     //
+
     // When kAddBroadcastFirst is true, add bias on the host
     ElementCompute beta_ref = kAddBroadcastFirst ? ElementCompute(0) : beta;
+
 #if CUTLASS_CONV_TEST_UNIT_REFERENCE_DEVICE_ENABLED
 
     cutlass::reference::device::Conv2d<
@@ -398,16 +410,18 @@ public:
   
             ElementZ z;
             ElementT t;
-	    ElementCompute accum = tensor_Y_reference.at({n, p, q, k});
+    
+            ElementCompute accum = tensor_Y_reference.at({n, p, q, k});
 	    ElementCompute bias = ElementCompute(tensor_Broadcast.at({0, 0, 0, k}));
+
 
             if (kAddBroadcastFirst) {
               reference_op(z, t, accum + bias,
                            beta * ElementCompute(tensor_C_reference.at({n, p, q, k})));
             } else {
               reference_op(z, t, accum, bias);
-            }
-
+            }   
+ 
             tensor_Z_reference.at({n, p, q, k}) = z;
             tensor_T_reference.at({n, p, q, k}) = t;
           }
@@ -417,7 +431,9 @@ public:
 
     if (kStoreT) {
       passed = cutlass::reference::host::TensorEquals(
-          tensor_T_computed.host_view(), tensor_T_reference.host_view());
+        tensor_T_computed.host_view(), 
+        tensor_T_reference.host_view());
+
       EXPECT_TRUE(passed);
     }
 
@@ -492,7 +508,8 @@ public:
 template <typename ImplicitGemm,
           typename ReferenceOp = Conv2dWithBroadcastReferenceOp<ImplicitGemm>,
           bool AddBroadcastFirst = false,
-	  bool TestSplitK = true>
+          bool TestSplitK = true 
+>
 bool TestAllConv2dWithBroadcast(
   const Conv2dProblemVector &conv_test_sizes = Conv2dProblemVector(),
   const Conv2dProblemVector &conv_blacklist_sizes = Conv2dProblemVector()) {
@@ -541,7 +558,7 @@ bool TestAllConv2dWithBroadcast(
       // CUTLASS DGRAD's *unity* stride specialization only support stride {1, 1} 
       if ((ImplicitGemm::kConvolutionalOperator == 
             cutlass::conv::Operator::kDgrad) && 
-          (ImplicitGemm::ImplicitGemmKernel::Mma::IteratorA::kStrideSupport == 
+          (ImplicitGemm::UnderlyingKernel::Mma::IteratorA::kStrideSupport == 
             cutlass::conv::StrideSupport::kUnity)) {
         if (!((conv_problem.stride_h == 1) && (conv_problem.stride_w == 1))) {
           continue;
@@ -552,7 +569,7 @@ bool TestAllConv2dWithBroadcast(
       // CUTLASS DGRAD's *strided* specialization only support stride >= {2, 2} 
       if ((ImplicitGemm::kConvolutionalOperator == 
             cutlass::conv::Operator::kDgrad) && 
-          (ImplicitGemm::ImplicitGemmKernel::Mma::IteratorA::kStrideSupport == 
+          (ImplicitGemm::UnderlyingKernel::Mma::IteratorA::kStrideSupport == 
             cutlass::conv::StrideSupport::kStrided)) {
          if (((conv_problem.stride_h == 1) && (conv_problem.stride_w == 1))) {
            continue;
@@ -589,7 +606,7 @@ bool TestAllConv2dWithBroadcast(
   // CUTLASS DGRAD's *strided* specialization does not support split-k mode 
   if ((ImplicitGemm::kConvolutionalOperator == 
           cutlass::conv::Operator::kDgrad) && 
-      (ImplicitGemm::ImplicitGemmKernel::Mma::IteratorA::kStrideSupport == 
+      (ImplicitGemm::UnderlyingKernel::Mma::IteratorA::kStrideSupport == 
         cutlass::conv::StrideSupport::kStrided)) {
 
     passed = testbed.run(

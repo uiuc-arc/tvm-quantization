@@ -30,13 +30,14 @@ These strings are efficient for serialization/matching and won't be too long.
 When we need the dag, we decode the string and call the function, which will return the dag.
 """
 
+import json
 import logging
 import pickle
-import json
 
 import tvm._ffi
 from tvm.runtime._ffi_node_api import LoadJSON, SaveJSON
-from .utils import serialize_args, deserialize_args, get_func_name
+
+from .utils import deserialize_args, get_func_name, serialize_args
 
 logger = logging.getLogger("auto_scheduler")
 
@@ -90,7 +91,7 @@ def register_workload(func_name, f=None, override=False):
     def register(myf):
         """internal register function"""
         if func_name in WORKLOAD_FUNC_REGISTRY and not override:
-            raise RuntimeError("%s has been registered already" % func_name)
+            raise RuntimeError(f"{func_name} has been registered already")
         WORKLOAD_FUNC_REGISTRY[func_name] = myf
         return myf
 
@@ -152,8 +153,8 @@ def make_workload_key(func, args):
 
     if not func_name in WORKLOAD_FUNC_REGISTRY:
         raise ValueError(
-            "%s is not registered. " % func,
-            "Please register it with @auto_scheduler.register_workload",
+            f"{func} is not registered. "
+            f"Please register it with @auto_scheduler.register_workload"
         )
 
     args = serialize_args(args)
@@ -194,7 +195,10 @@ def workload_key_to_tensors(workload_key):
     assert callable(value)
 
     args = deserialize_args(workload[1:])
-    return value(*args)
+    result = value(*args)
+    if isinstance(result, tuple):
+        result = list(result)
+    return result
 
 
 def serialize_workload_registry_entry(workload_key):

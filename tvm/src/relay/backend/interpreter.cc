@@ -31,6 +31,7 @@
 #include <tvm/relay/feature.h>
 #include <tvm/relay/interpreter.h>
 #include <tvm/relay/pattern_functor.h>
+#include <tvm/relay/qnn/transform.h>
 #include <tvm/relay/transform.h>
 #include <tvm/runtime/container/map.h>
 #include <tvm/runtime/device_api.h>
@@ -68,8 +69,8 @@ struct PairHash {
 // Analogue of FlattenTupleType for runtime ADT vs NDArray values.
 // TODO(mbs): Hoist somewhere sensible, maybe op/memory.h?
 void FlattenADTAux(const ObjectRef& object_ref, std::vector<NDArray>* out) {
-  if (const NDArray::ContainerType* ndarray = object_ref.as<NDArray::ContainerType>()) {
-    out->push_back(GetRef<NDArray>(ndarray));
+  if (auto ndarray = object_ref.as<NDArray>()) {
+    out->push_back(ndarray.value());
   } else if (const ADTObj* adt = object_ref.as<ADTObj>()) {
     for (size_t i = 0; i < adt->size; ++i) {
       FlattenADTAux((*adt)[i], out);
@@ -476,7 +477,7 @@ class Interpreter : public ExprFunctor<ObjectRef(const Expr& n)>,
 
     // TODO(mbs): Take this from the host_virtual_device.
     Device shape_device;
-    shape_device.device_type = static_cast<DLDeviceType>(prim_shape_target->kind->device_type);
+    shape_device.device_type = static_cast<DLDeviceType>(prim_shape_target->GetTargetDeviceType());
     shape_device.device_id = 0;
 
     // 'Compile' the TIR shape function to appropriate callable form.
@@ -706,7 +707,6 @@ class Interpreter : public ExprFunctor<ObjectRef(const Expr& n)>,
     if (device_copy_props.body.defined()) {
       // TODO(mbs): device_copy cleanup
       LOG(FATAL) << "The interpreter does not support device_copy";
-      return {};
     } else if (call_lowered_props.lowered_func.defined()) {
       // Special case: Call a lowered TIR function.
 
@@ -785,9 +785,8 @@ class Interpreter : public ExprFunctor<ObjectRef(const Expr& n)>,
       // Now we just evaluate and expect to find a closure.
       // TODO(@electriclilies): How should call_lowered behave with closures?
       ObjectRef fn_val = Eval(call_node->op);
-      if (const InterpreterClosureObj* closure_node = fn_val.as<InterpreterClosureObj>()) {
-        auto closure = GetRef<InterpreterClosure>(closure_node);
-        return Invoke(closure, args);
+      if (auto closure = fn_val.as<InterpreterClosure>()) {
+        return Invoke(closure.value(), args);
       } else if (const RecClosureObj* closure_node = fn_val.as<RecClosureObj>()) {
         return Invoke(closure_node->clos, args, closure_node->bind);
       } else {
@@ -799,8 +798,8 @@ class Interpreter : public ExprFunctor<ObjectRef(const Expr& n)>,
   }
 
   ObjectRef VisitExpr_(const LetNode* let) final {
-    if (auto func = let->value.as<FunctionNode>()) {
-      auto clo = MakeClosure(GetRef<Function>(func), let->var);
+    if (auto func = let->value.as<Function>()) {
+      auto clo = MakeClosure(func.value(), let->var);
       this->extend(let->var, clo);
     } else {
       auto value = Eval(let->value);
@@ -836,7 +835,6 @@ class Interpreter : public ExprFunctor<ObjectRef(const Expr& n)>,
       }
     } else {
       LOG(FATAL) << "type error, type system should have caught this";
-      return ObjectRef();
     }
   }
 
@@ -847,7 +845,6 @@ class Interpreter : public ExprFunctor<ObjectRef(const Expr& n)>,
       return ADT::Tuple(std::vector<ObjectRef>());
     } else {
       LOG(FATAL) << "type error, type system should have caught this";
-      return ObjectRef();
     }
   }
 
@@ -859,7 +856,6 @@ class Interpreter : public ExprFunctor<ObjectRef(const Expr& n)>,
       return rv->value;
     } else {
       LOG(FATAL) << "type error, type system should have caught this";
-      return ObjectRef();
     }
   }
 
@@ -871,7 +867,6 @@ class Interpreter : public ExprFunctor<ObjectRef(const Expr& n)>,
       }
     }
     LOG(FATAL) << "did not find any match";
-    return ObjectRef();
   }
 
   bool VisitPattern_(const PatternConstructorNode* op, const ObjectRef& v) final {
@@ -944,14 +939,13 @@ class Interpreter : public ExprFunctor<ObjectRef(const Expr& n)>,
  * rewritten \p mod and target-specific modules containing bindings for all TIR primitive
  * functions needed by the rewritten module.
  */
-IRModule Prepare(IRModule mod, CompilationConfig config) {
-  VirtualDevice host_virtual_device = config->host_virtual_device;
+IRModule Prepare(IRModule mod, const CompilationConfig& config) {
   // Run minimal transforms on module to establish invariants needed by interpreter.
   transform::Sequential seq(
-      {transform::SimplifyInference(),
+      {transform::SimplifyInference(), qnn::transform::Legalize(),
        // Figure out which devices should be used to execute.
        // TODO(mbs): Should ignore all existing annotations when constant folding
-       transform::PlanDevices(std::move(config)),
+       transform::PlanDevices(config),
        // FuseOps will mark wrapped calls to prim-ops with the 'Primitive'
        // attribute.
        transform::FuseOps(/*fuse_opt_level=*/0),
@@ -960,9 +954,7 @@ IRModule Prepare(IRModule mod, CompilationConfig config) {
        // eta expand to support constructors in argument position.
        transform::EtaExpand(
            /*expand_constructor=*/true, /*expand_global_var=*/false),
-       transform::InferType(),
-       tec::LowerTEPass(/*module_name=*/"intrp", [](BaseFunc func) { /* no-op */ },
-                        std::move(host_virtual_device))});
+       transform::InferType(), tec::LowerTE(/*module_name=*/"intrp", config)});
 
   transform::PassContext pass_ctx = transform::PassContext::Current();
   With<transform::PassContext> ctx(pass_ctx);
@@ -1019,11 +1011,9 @@ TypedPackedFunc<ObjectRef(Array<Expr>)> EvalFunction(IRModule mod, Expr expr, De
           << PrettyPrint(mod) << "and expression:" << std::endl
           << PrettyPrint(expr);
 
-  ICHECK_EQ(device.device_type, target->kind->device_type);
-  TargetMap targets;
-  targets.Set(device.device_type, target);
-  CompilationConfig config(transform::PassContext::Current(), targets,
-                           /*optional_host_target_arg=*/{});
+  ICHECK_EQ(device.device_type, target->GetTargetDeviceType());
+  Array<Target> raw_targets = {target};
+  CompilationConfig config(transform::PassContext::Current(), raw_targets);
 
   //
   // Step 1: Prepare mod.
@@ -1076,9 +1066,8 @@ TypedPackedFunc<ObjectRef(Array<Expr>)> EvalFunction(IRModule mod, Expr expr, De
   // Step 2: Evaluate target function to a closure.
   //
   ObjectRef object_ref = intrp->Eval(expr_to_eval);
-  if (const InterpreterClosureObj* closure_obj = object_ref.as<InterpreterClosureObj>()) {
-    InterpreterClosure closure = GetRef<InterpreterClosure>(closure_obj);
-    ICHECK(closure.defined());
+  if (auto opt = object_ref.as<InterpreterClosure>()) {
+    InterpreterClosure closure = opt.value();
     ICHECK(closure->func.defined());
 
     return TypedPackedFunc<ObjectRef(Array<Expr>)>([intrp, closure](Array<Expr> args) {
@@ -1103,22 +1092,20 @@ TypedPackedFunc<ObjectRef(Array<Expr>)> EvalFunction(IRModule mod, Expr expr, De
     });
   } else {
     LOG(FATAL) << "expecting expression to have function type and evaluate to a closure";
-    return nullptr;
   }
 }
 
 ObjectRef Eval(Expr expr, Map<GlobalTypeVar, TypeData> type_definitions,
-               std::unordered_set<String> import_set, Device device, Target target) {
-  ICHECK_EQ(device.device_type, target->kind->device_type);
-  TargetMap targets;
-  targets.Set(device.device_type, target);
-  CompilationConfig config(transform::PassContext::Current(), targets,
-                           /*optional_host_target_arg=*/{});
+               std::unordered_set<String> import_set, Device device, Target target,
+               Map<String, ObjectRef> attrs) {
+  ICHECK_EQ(device.device_type, target->GetTargetDeviceType());
+  Array<Target> raw_targets = {target};
+  CompilationConfig config(transform::PassContext::Current(), raw_targets);
 
   std::pair<IRModule, GlobalVar> mod_and_global =
       IRModule::FromExprInContext(expr, /*global_funcs=*/{}, type_definitions, import_set);
 
-  IRModule mod = Prepare(mod_and_global.first, config);
+  IRModule mod = Prepare(WithAttrs(mod_and_global.first, {attrs}), config);
 
   Interpreter intrp(mod, config, device);
   Expr expr_to_eval = mod->GetGlobalVar(mod_and_global.second->name_hint);

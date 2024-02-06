@@ -42,7 +42,7 @@ namespace tvm {
 namespace runtime {
 namespace vm {
 
-PackedFunc VirtualMachineDebug::GetFunction(const std::string& name,
+PackedFunc VirtualMachineDebug::GetFunction(const String& name,
                                             const ObjectPtr<Object>& sptr_to_self) {
   if (name == "profile") {
     return TypedPackedFunc<profiling::Report(String, Array<profiling::MetricCollector>)>(
@@ -58,9 +58,9 @@ PackedFunc VirtualMachineDebug::GetFunction(const std::string& name,
           // on remotes, we accept a nullptr for collectors.
           if (collectors.defined()) {
             std::vector<profiling::MetricCollector> cs(collectors.begin(), collectors.end());
-            prof_ = profiling::Profiler(devices, cs);
+            prof_ = profiling::Profiler(devices, cs, {{String("Executor"), String("VM")}});
           } else {
-            prof_ = profiling::Profiler(devices, {});
+            prof_ = profiling::Profiler(devices, {}, {{String("Executor"), String("VM")}});
           }
 
           auto invoke = VirtualMachine::GetFunction("invoke", sptr_to_self);
@@ -73,11 +73,11 @@ PackedFunc VirtualMachineDebug::GetFunction(const std::string& name,
           invoke(arg_name);
           prof_.operator*().Stop();
           auto report = prof_.operator*().Report();
-          prof_ = dmlc::optional<profiling::Profiler>();  // releases hardware counters
+          prof_ = std::nullopt;  // releases hardware counters
           return report;
         });
   } else if (name == "profile_rpc") {
-    // We cannot return a Report over RPC because TMV RPC mechanism only
+    // We cannot return a Report over RPC because TVM RPC mechanism only
     // supports a subset of Object classes. Instead we serialize it on the
     // remote (here) and deserialize it on the other end.
     return TypedPackedFunc<std::string(std::string)>([sptr_to_self, this](std::string arg_name) {
@@ -129,14 +129,26 @@ void VirtualMachineDebug::OpStartHook(Instruction instr) {
           {{"Argument Shapes",
             profiling::ShapeString(shape_tensor, instr.alloc_tensor_reg.dtype)}});
     } else if (instr.op == Opcode::AllocStorage) {
-      auto size = LoadScalarInt(instr.alloc_storage.allocation_size);
       std::ostringstream shape;
-      shape << DLDataType2String(instr.alloc_storage.dtype_hint) << "[" << size << "]";
+      if (instr.alloc_storage.ndim > 0) {
+        std::string shape_str = "[";
+        for (uint32_t i = 0; i < instr.alloc_storage.ndim; ++i) {
+          if (i > 0) {
+            shape_str += ", ";
+          }
+          shape_str += std::to_string(instr.alloc_storage.shape[i]);
+        }
+        shape_str += "]";
+        shape << DLDataType2String(instr.alloc_storage.dtype_hint) << shape_str;
+      } else {
+        auto size = LoadScalarInt(instr.alloc_storage.allocation_size);
+        shape << DLDataType2String(instr.alloc_storage.dtype_hint) << "[" << size << "]";
+      }
       Device dev = GetDevice(instr.alloc_storage.device_index);
       prof_.operator*().StartCall("VM::AllocStorage", dev,
                                   {{"VM::Argument Shapes", String(shape.str())}});
     } else {
-      prof_.operator*().StartCall("VM::UnknownOp", devices_[1], {});
+      prof_.operator*().StartCall("VM::UnknownOp", GetDevice(exec_->host_device_index), {});
     }
   }
 }

@@ -138,6 +138,7 @@ SECTIONS
   {
     . = ALIGN(16);
     *(ethosu_scratch)
+    *(output_data_sec)
     . = ALIGN (16);
     *(.rodata.tvm)
     . = ALIGN (16);
@@ -207,6 +208,15 @@ SECTIONS
    */
   __etext = ALIGN (4);
 
+  .sram :
+  {
+    . = ALIGN(16);
+    *(.bss.ethosu_fast_memory);
+    . = ALIGN(16);
+    *(.data.tvm);
+    . = ALIGN(16);
+  } > SRAM AT > SRAM
+
   .data : AT (__etext)
   {
     __data_start__ = .;
@@ -242,19 +252,12 @@ SECTIONS
 
   } > DTCM
 
-  .sram :
+  .bss.noinit (NOLOAD):
   {
     . = ALIGN(16);
-    *(.bss.ethosu_fast_memory);
+    *(.bss.noinit.*)
     . = ALIGN(16);
   } > SRAM AT > SRAM
-
-  .bss.NoInit :
-  {
-    . = ALIGN(16);
-    *(.bss.NoInit)
-    . = ALIGN(16);
-  } > DDR AT > DDR
 
   .bss :
   {

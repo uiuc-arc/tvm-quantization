@@ -97,38 +97,70 @@ class CustomDatatypesLowerer : public StmtExprMutator {
       allocate = stmt.as<AllocateNode>();
 
       return Allocate(new_buffer_var, new_allocate_type, allocate->extents, allocate->condition,
-                      allocate->body);
+                      allocate->body, allocate->annotations);
     } else {
       return StmtExprMutator::VisitStmt_(allocate);
     }
   }
 
-  PrimExpr VisitExpr_(const LoadNode* load) final {
-    bool to_be_lowered = datatype::Registry::Global()->GetTypeRegistered(load->dtype.code());
-    PrimExpr expr = StmtExprMutator::VisitExpr_(load);
-    load = expr.as<LoadNode>();
-    if (to_be_lowered) {
-      auto new_load_type = DataType::UInt(load->dtype.bits());
-      auto buffer_var = load->buffer_var;
-      auto it = var_remap_.find(buffer_var);
-      if (it != var_remap_.end()) {
-        buffer_var = it->second;
-      }
-      return Load(new_load_type, buffer_var, load->index, load->predicate);
-    }
-    return expr;
+  Stmt VisitStmt_(const DeclBufferNode* op) final {
+    auto node = Downcast<DeclBuffer>(StmtExprMutator::VisitStmt_(op));
+    return VisitBufferAccess(std::move(node));
   }
 
-  Stmt VisitStmt_(const StoreNode* op) final {
-    Stmt ret = StmtExprMutator::VisitStmt_(op);
-    op = ret.as<StoreNode>();
+  PrimExpr VisitExpr_(const BufferLoadNode* op) final {
+    auto node = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
+    auto modified = VisitBufferAccess(node);
 
-    auto it = var_remap_.find(op->buffer_var);
-    if (it != var_remap_.end()) {
-      return Store(it->second, op->value, op->index, op->predicate);
+    // Not needed for BufferStoreNode, so we can't just call
+    // LegalizeDtype() in VisitBufferAccess.
+    if (node.same_as(modified)) {
+      return std::move(node);
     } else {
-      return ret;
+      auto writer = modified.CopyOnWrite();
+      writer->LegalizeDType();
+      return std::move(modified);
     }
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode* op) final {
+    auto node = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+    return VisitBufferAccess(std::move(node));
+  }
+
+  template <typename Node>
+  Node VisitBufferAccess(Node node) {
+    Buffer new_buf = GetRemappedBuffer(node->buffer);
+    if (!new_buf.same_as(node->buffer)) {
+      auto writer = node.CopyOnWrite();
+      writer->buffer = new_buf;
+    }
+
+    return node;
+  }
+
+  Buffer GetRemappedBuffer(Buffer buf) {
+    auto key = buf;
+    auto cache_it = buf_remap_.find(key);
+    if (cache_it != buf_remap_.end()) {
+      return cache_it->second;
+    }
+
+    bool to_be_lowered = datatype::Registry::Global()->GetTypeRegistered(buf->dtype.code());
+
+    if (to_be_lowered) {
+      auto new_load_type = DataType::UInt(buf->dtype.bits());
+      auto writer = buf.CopyOnWrite();
+      writer->dtype = new_load_type;
+
+      auto var_it = var_remap_.find(buf->data);
+      if (var_it != var_remap_.end()) {
+        writer->data = var_it->second;
+      }
+    }
+
+    buf_remap_[key] = buf;
+    return buf;
   }
 
   Stmt VisitStmt_(const AttrStmtNode* op) final {
@@ -139,8 +171,8 @@ class CustomDatatypesLowerer : public StmtExprMutator {
     // remap these vars when needed
     // TODO(tvm-team): remove the rewriting once the buffer var
     // attrs are being refactored into the corresponding definition node
-    if (const auto* var_node = op->node.as<VarNode>()) {
-      auto it = var_remap_.find(GetRef<Var>(var_node));
+    if (auto var_node = op->node.as<Var>()) {
+      auto it = var_remap_.find(var_node.value());
       if (it != var_remap_.end()) {
         return AttrStmt(it->second, op->attr_key, op->value, op->body);
       }
@@ -200,6 +232,7 @@ class CustomDatatypesLowerer : public StmtExprMutator {
   std::string target_;
   // remap buffer vars
   std::unordered_map<Var, Var, ObjectPtrHash, ObjectPtrEqual> var_remap_;
+  std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual> buf_remap_;
 };
 
 namespace transform {

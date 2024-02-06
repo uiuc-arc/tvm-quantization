@@ -38,6 +38,10 @@ from .conv1d_transpose import *
 from .bnn import *
 from .qnn import *
 from .upsampling import *
+from .instance_norm import instance_norm
+from .layer_norm import layer_norm
+from .group_norm import group_norm
+from .rms_norm import rms_norm
 from .local_response_norm import *
 from .bitserial_conv2d import *
 from .bitserial_dense import *
@@ -51,3 +55,4 @@ from .space_to_depth import *
 from .space_to_batch_nd import *
 from .batch_to_space_nd import *
 from .loss import *
+from .lstm import *

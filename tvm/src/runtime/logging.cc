@@ -18,6 +18,8 @@
  */
 #include <tvm/runtime/logging.h>
 
+#include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -32,6 +34,13 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
+
+#if TVM_BACKTRACE_ON_SEGFAULT
+#include <signal.h>
+
+#include <csignal>
+#include <cstring>
+#endif
 
 namespace tvm {
 namespace runtime {
@@ -86,37 +95,138 @@ void BacktraceSyminfoCallback(void* data, uintptr_t pc, const char* symname, uin
 int BacktraceFullCallback(void* data, uintptr_t pc, const char* filename, int lineno,
                           const char* symbol) {
   auto stack_trace = reinterpret_cast<BacktraceInfo*>(data);
-  std::stringstream s;
 
   std::unique_ptr<std::string> symbol_str = std::make_unique<std::string>("<unknown>");
-  if (symbol != nullptr) {
+  if (symbol) {
     *symbol_str = DemangleName(symbol);
   } else {
     // see if syminfo gives anything
     backtrace_syminfo(_bt_state, pc, BacktraceSyminfoCallback, BacktraceErrorCallback,
                       symbol_str.get());
   }
-  s << *symbol_str;
+  symbol = symbol_str->data();
 
-  if (filename != nullptr) {
-    s << std::endl << "        at " << filename;
-    if (lineno != 0) {
-      s << ":" << lineno;
-    }
-  }
-  // Skip tvm::backtrace and tvm::LogFatal::~LogFatal at the beginning of the trace as they don't
-  // add anything useful to the backtrace.
-  if (!(stack_trace->lines.size() == 0 &&
-        (symbol_str->find("tvm::runtime::Backtrace", 0) == 0 ||
-         symbol_str->find("tvm::runtime::detail::LogFatal", 0) == 0))) {
-    stack_trace->lines.push_back(s.str());
-  }
-  // TVMFuncCall denotes the API boundary so we stop there. Exceptions should be caught there.
-  if (*symbol_str == "TVMFuncCall" || stack_trace->lines.size() >= stack_trace->max_size) {
+  // TVMFuncCall denotes the API boundary so we stop there. Exceptions
+  // should be caught there.  This is before any frame suppressions,
+  // as it would otherwise be suppressed.
+  bool should_stop_collecting =
+      (*symbol_str == "TVMFuncCall" || stack_trace->lines.size() >= stack_trace->max_size);
+  if (should_stop_collecting) {
     return 1;
   }
+
+  // Exclude frames that contain little useful information for most
+  // debugging purposes
+  bool should_exclude = [&]() -> bool {
+    if (filename) {
+      // Stack frames for TVM FFI
+      if (strstr(filename, "include/tvm/runtime/packed_func.h") ||
+          strstr(filename, "include/tvm/runtime/registry.h") ||
+          strstr(filename, "src/runtime/c_runtime_api.cc")) {
+        return true;
+      }
+      // Stack frames for nested tree recursion.
+      // tir/ir/stmt_functor.cc and tir/ir/expr_functor.cc define
+      // Expr/Stmt Visitor/Mutator, which should be suppressed, but
+      // also Substitute which should not be suppressed.  Therefore,
+      // they are suppressed based on the symbol name.
+      if (strstr(filename, "include/tvm/node/functor.h") ||        //
+          strstr(filename, "include/tvm/relax/expr_functor.h") ||  //
+          strstr(filename, "include/tvm/tir/stmt_functor.h") ||    //
+          strstr(filename, "include/tvm/tir/expr_functor.h") ||    //
+          strstr(filename, "include/tvm/node/reflection.h") ||     //
+          strstr(filename, "src/node/structural_equal.cc") ||      //
+          strstr(filename, "src/ir/transform.cc") ||               //
+          strstr(filename, "src/relax/ir/expr_functor.cc") ||      //
+          strstr(filename, "src/relax/ir/py_expr_functor.cc")) {
+        return true;
+      }
+      // Python interpreter stack frames
+      if (strstr(filename, "/python-") || strstr(filename, "/Python/ceval.c") ||
+          strstr(filename, "/Modules/_ctypes")) {
+        return true;
+      }
+      // C++ stdlib frames
+      if (strstr(filename, "include/c++/")) {
+        return true;
+      }
+    }
+    if (symbol) {
+      // C++ stdlib frames
+      if (strstr(symbol, "__libc_")) {
+        return true;
+      }
+      // Stack frames for nested tree visiting
+      if (strstr(symbol, "tvm::tir::StmtMutator::VisitStmt_") ||
+          strstr(symbol, "tvm::tir::ExprMutator::VisitExpr_") ||
+          strstr(symbol, "tvm::tir::IRTransformer::VisitExpr") ||
+          strstr(symbol, "tvm::tir::IRTransformer::VisitStmt") ||
+          strstr(symbol, "tvm::tir::IRTransformer::BaseVisitExpr") ||
+          strstr(symbol, "tvm::tir::IRTransformer::BaseVisitStmt")) {
+        return true;
+      }
+      // Python interpreter stack frames
+      if (strstr(symbol, "_Py") == symbol || strstr(symbol, "PyObject")) {
+        return true;
+      }
+    }
+
+    // libffi.so stack frames.  These may also show up as numeric
+    // addresses with no symbol name.  This could be improved in the
+    // future by using dladdr() to check whether an address is contained
+    // in libffi.so
+    if (filename == nullptr && strstr(symbol, "ffi_call_")) {
+      return true;
+    }
+
+    // Skip tvm::backtrace and tvm::LogFatal::~LogFatal at the beginning
+    // of the trace as they don't add anything useful to the backtrace.
+    if (stack_trace->lines.size() == 0 && (strstr(symbol, "tvm::runtime::Backtrace") ||
+                                           strstr(symbol, "tvm::runtime::detail::LogFatal"))) {
+      return true;
+    }
+
+    return false;
+  }();
+  if (should_exclude) {
+    return 0;
+  }
+
+  std::stringstream frame_str;
+  frame_str << *symbol_str;
+
+  if (filename) {
+    frame_str << std::endl << "        at " << filename;
+    if (lineno != 0) {
+      frame_str << ":" << lineno;
+    }
+  }
+  stack_trace->lines.push_back(frame_str.str());
+
   return 0;
 }
+
+#if TVM_BACKTRACE_ON_SEGFAULT
+void backtrace_handler(int sig) {
+  // Technically we shouldn't do any allocation in a signal handler, but
+  // Backtrace may allocate. What's the worst it could do? We're already
+  // crashing.
+  std::cerr << "!!!!!!! TVM encountered a Segfault !!!!!!!\n" << Backtrace() << std::endl;
+
+  // Re-raise signal with default handler
+  struct sigaction act;
+  std::memset(&act, 0, sizeof(struct sigaction));
+  act.sa_flags = SA_RESETHAND;
+  act.sa_handler = SIG_DFL;
+  sigaction(sig, &act, nullptr);
+  raise(sig);
+}
+
+__attribute__((constructor)) void install_signal_handler(void) {
+  // this may override already installed signal handlers
+  std::signal(SIGSEGV, backtrace_handler);
+}
+#endif
 }  // namespace
 
 std::string Backtrace() {
@@ -141,9 +251,11 @@ std::string Backtrace() {
     return "";
   }
   // libbacktrace eats memory if run on multiple threads at the same time, so we guard against it
-  static std::mutex m;
-  std::lock_guard<std::mutex> lock(m);
-  backtrace_full(_bt_state, 0, BacktraceFullCallback, BacktraceErrorCallback, &bt);
+  {
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    backtrace_full(_bt_state, 0, BacktraceFullCallback, BacktraceErrorCallback, &bt);
+  }
 
   std::ostringstream s;
   s << "Stack trace:\n";
@@ -183,12 +295,38 @@ namespace tvm {
 namespace runtime {
 namespace detail {
 
+const char* ::tvm::runtime::detail::LogMessage::level_strings_[] = {
+    ": Debug: ",    // TVM_LOG_LEVEL_DEBUG
+    ": ",           // TVM_LOG_LEVEL_INFO
+    ": Warning: ",  // TVM_LOG_LEVEL_WARNING
+    ": Error: ",    // TVM_LOG_LEVEL_ERROR
+};
+
 namespace {
 constexpr const char* kSrcPrefix = "/src/";
 // Note: Better would be std::char_traits<const char>::length(kSrcPrefix) but it is not
 // a constexpr on all compilation targets.
 constexpr const size_t kSrcPrefixLength = 5;
 constexpr const char* kDefaultKeyword = "DEFAULT";
+}  // namespace
+
+namespace {
+/*! \brief Convert __FILE__ to a vlog_level_map_ key, which strips any prefix ending iwth src/ */
+std::string FileToVLogMapKey(const std::string& filename) {
+  // Canonicalize the filename.
+  // TODO(mbs): Not Windows friendly.
+  size_t last_src = filename.rfind(kSrcPrefix, std::string::npos, kSrcPrefixLength);
+  if (last_src == std::string::npos) {
+    std::string no_slash_src{kSrcPrefix + 1};
+    if (filename.substr(0, no_slash_src.size()) == no_slash_src) {
+      return filename.substr(no_slash_src.size());
+    }
+  }
+  // Strip anything before the /src/ prefix, on the assumption that will yield the
+  // TVM project relative filename. If no such prefix fallback to filename without
+  // canonicalization.
+  return (last_src == std::string::npos) ? filename : filename.substr(last_src + kSrcPrefixLength);
+}
 }  // namespace
 
 /* static */
@@ -209,6 +347,15 @@ TvmLogDebugSettings TvmLogDebugSettings::ParseSpec(const char* opt_spec) {
     return settings;
   }
   std::istringstream spec_stream(spec);
+  auto tell_pos = [&](const std::string& last_read) {
+    int pos = spec_stream.tellg();
+    if (pos == -1) {
+      LOG(INFO) << "override pos: " << last_read;
+      // when pos == -1, failbit was set due to std::getline reaching EOF without seeing delimiter.
+      pos = spec.size() - last_read.size();
+    }
+    return pos;
+  };
   while (spec_stream) {
     std::string name;
     if (!std::getline(spec_stream, name, '=')) {
@@ -216,24 +363,28 @@ TvmLogDebugSettings TvmLogDebugSettings::ParseSpec(const char* opt_spec) {
       break;
     }
     if (name.empty()) {
-      LOG(FATAL) << "TVM_LOG_DEBUG ill-formed, empty name";
-      return settings;
+      LOG(FATAL) << "TVM_LOG_DEBUG ill-formed at position " << tell_pos(name) << ": empty filename";
     }
 
+    name = FileToVLogMapKey(name);
+
     std::string level;
-    if (!std::getline(spec_stream, level, ';')) {
-      LOG(FATAL) << "TVM_LOG_DEBUG ill-formed, expecting level";
+    if (!std::getline(spec_stream, level, ',')) {
+      LOG(FATAL) << "TVM_LOG_DEBUG ill-formed at position " << tell_pos(level)
+                 << ": expecting \"=<level>\" after \"" << name << "\"";
       return settings;
     }
     if (level.empty()) {
-      LOG(FATAL) << "TVM_LOG_DEBUG ill-formed, empty level";
+      LOG(FATAL) << "TVM_LOG_DEBUG ill-formed at position " << tell_pos(level)
+                 << ": empty level after \"" << name << "\"";
       return settings;
     }
     // Parse level, default to 0 if ill-formed which we don't detect.
     char* end_of_level = nullptr;
     int level_val = static_cast<int>(strtol(level.c_str(), &end_of_level, 10));
     if (end_of_level != level.c_str() + level.size()) {
-      LOG(FATAL) << "TVM_LOG_DEBUG ill-formed, invalid level";
+      LOG(FATAL) << "TVM_LOG_DEBUG ill-formed at position " << tell_pos(level)
+                 << ": invalid level: \"" << level << "\"";
       return settings;
     }
     LOG(INFO) << "TVM_LOG_DEBUG enables VLOG statements in '" << name << "' up to level " << level;
@@ -243,16 +394,8 @@ TvmLogDebugSettings TvmLogDebugSettings::ParseSpec(const char* opt_spec) {
 }
 
 bool TvmLogDebugSettings::VerboseEnabledImpl(const std::string& filename, int level) const {
-  // Canonicalize the filename.
-  // TODO(mbs): Not Windows friendly.
-  size_t last_src = filename.rfind(kSrcPrefix, std::string::npos, kSrcPrefixLength);
-  // Strip anything before the /src/ prefix, on the assumption that will yield the
-  // TVM project relative filename. If no such prefix fallback to filename without
-  // canonicalization.
-  std::string key =
-      last_src == std::string::npos ? filename : filename.substr(last_src + kSrcPrefixLength);
   // Check for exact match.
-  auto itr = vlog_level_map_.find(key);
+  auto itr = vlog_level_map_.find(FileToVLogMapKey(filename));
   if (itr != vlog_level_map_.end()) {
     return level <= itr->second;
   }
