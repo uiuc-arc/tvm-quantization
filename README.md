@@ -6,7 +6,7 @@ and try out its capability to automatically compile [quantized convolutions](htt
 ## Setup
 
 We will need to compile and install TVM, for which you can find instructions [here](https://tvm.apache.org/docs/install/from_source.html).
-This repo already contains the source of TVM v0.9 so there is *no need to download/clone TVM source* code again.
+This repo already contains the source of TVM v0.15 so there is *no need to download/clone TVM source* code again.
 In short:
 
 - Install dependencies of TVM as specified in the instructions.
