@@ -86,5 +86,6 @@ There are roughly the following few major steps:
 9. Run the compiled code on Raspberry Pi emulator using the open-source QEMU environment (https://www.qemu.org/).
    Report the execution times of the two models. 
    **Hint:** It is ok to run host OS on the emulator; you can alternatively do a bare-metal configuration via microTVM.
-   Consult existing online tutorials for how to run QEMU. For the Raspberry PI board, use the appropriate one from https://www.qemu.org/docs/master/system/arm/raspi.html
+   Consult existing online tutorials for how to run QEMU. For the Raspberry PI board, use the appropriate one from https://www.qemu.org/docs/master/system/arm/raspi.html .
+   If you encounter problems with TVM such that it cannot compile on the emulator, document it, and instead export the quantized model to PyTorch and run that framework on the emulator. 
     
