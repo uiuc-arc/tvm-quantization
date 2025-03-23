@@ -80,10 +80,11 @@ There are roughly the following few major steps:
    Try out `int8` -> `int4` -> `int2` -> `int1`; note which precisions work.
    When it doesn't work, note exactly which part is failing.
 
-7. Compile the float and 8-bit network versions to a Raspberry Pi executable (versions 4 or 5). Use TVM's cross-compilation capability
+7. Compile the float and 8-bit network versions to a Raspberry Pi executable (CPU-only). Use TVM's cross-compilation capability
    **Hint:** Consult TVM documentation for details how to cross-compile and deploy the model on Raspberry Pi and other embedded devices. 
 
 9. Run the compiled code on Raspberry Pi emulator using the open-source QEMU environment (https://www.qemu.org/).
    Report the execution times of the two models. 
-   **Hint:** It is ok to run host OS on the emulator; you can alternatively do a bare-metal configuration via microTVM. Consult existing online tutorials for how to run QEMU. 
+   **Hint:** It is ok to run host OS on the emulator; you can alternatively do a bare-metal configuration via microTVM.
+   Consult existing online tutorials for how to run QEMU. For the Raspberry PI board, use the appropriate one from https://www.qemu.org/docs/master/system/arm/raspi.html
     
